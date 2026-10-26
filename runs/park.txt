@@ -1,0 +1,19 @@
+create atespace: {"name":"park"}
+create actor-template: {"atespace":"park","name":"pi-durable-data"}
+== p1..p8 at once fill the 8 slots
+p1 http=200 10.493970s ate-parked-ms: 0 ate-resume-ms: 10308 ate-worker: w-127d32fc 
+p3 http=200 10.516380s ate-parked-ms: 0 ate-resume-ms: 10356 ate-worker: w-127d32fc 
+p2 http=200 10.500961s ate-parked-ms: 0 ate-resume-ms: 10338 ate-worker: w-127d32fc 
+p8 http=200 10.510216s ate-parked-ms: 0 ate-resume-ms: 10349 ate-worker: w-943163f8 
+p5 http=200 10.505823s ate-parked-ms: 0 ate-resume-ms: 10333 ate-worker: w-943163f8 
+p6 http=200 10.505597s ate-parked-ms: 0 ate-resume-ms: 10338 ate-worker: w-943163f8 
+p4 http=200 10.570353s ate-parked-ms: 0 ate-resume-ms: 10403 ate-worker: w-943163f8 
+p7 http=200 10.600029s ate-parked-ms: 0 ate-resume-ms: 10434 ate-worker: w-127d32fc 
+ID           ADDR               ACTORS   LEASE   HOSTED
+w-127d32fc   10.138.0.27:8080   4/4      live    park/p1,park/p2,park/p3,park/p7
+w-943163f8   10.138.0.26:8080   4/4      live    park/p4,park/p5,park/p6,park/p8
+== p9 parks; p1 is suspended 2 s into the wait
+suspended p1
+p9 http=200 5.606154s ate-parked-ms: 4313 ate-resume-ms: 5525 ate-worker: w-127d32fc 
+== p10 parks and nothing frees a slot
+p10 http=503 5.393748s 

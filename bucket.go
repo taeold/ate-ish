@@ -1,0 +1,178 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"strconv"
+
+	"golang.org/x/oauth2"
+	"golang.org/x/oauth2/google"
+)
+
+var (
+	errNotFound = errors.New("not found")
+	errConflict = errors.New("generation changed")
+)
+
+// bucket is the GCS JSON API, the few calls ate-node needs. Every record is a
+// JSON object written with ifGenerationMatch; generation 0 means "must not exist".
+type bucket struct {
+	name   string
+	client *http.Client
+}
+
+func newBucket(ctx context.Context, name string) (*bucket, error) {
+	ts, err := google.DefaultTokenSource(ctx, "https://www.googleapis.com/auth/cloud-platform")
+	if err != nil {
+		return nil, err
+	}
+	return &bucket{name: name, client: oauth2.NewClient(ctx, ts)}, nil
+}
+
+const gcs = "https://storage.googleapis.com"
+
+func (b *bucket) objectURL(name string) string {
+	return gcs + "/storage/v1/b/" + b.name + "/o/" + url.PathEscape(name)
+}
+
+func (b *bucket) do(req *http.Request) (*http.Response, error) {
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	switch resp.StatusCode {
+	case http.StatusOK, http.StatusNoContent:
+		return resp, nil
+	case http.StatusNotFound:
+		resp.Body.Close()
+		return nil, errNotFound
+	case http.StatusPreconditionFailed:
+		resp.Body.Close()
+		return nil, errConflict
+	}
+	defer resp.Body.Close()
+	msg, _ := io.ReadAll(resp.Body)
+	return nil, fmt.Errorf("gcs %s %s: %s: %s", req.Method, req.URL.Path, resp.Status, msg)
+}
+
+// get reads a JSON record and returns its generation.
+func (b *bucket) get(ctx context.Context, name string, v any) (int64, error) {
+	req, _ := http.NewRequestWithContext(ctx, "GET", b.objectURL(name)+"?alt=media", nil)
+	resp, err := b.do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if err := json.NewDecoder(resp.Body).Decode(v); err != nil {
+		return 0, fmt.Errorf("%s: %w", name, err)
+	}
+	return strconv.ParseInt(resp.Header.Get("x-goog-generation"), 10, 64)
+}
+
+// put writes a JSON record if its generation is still gen, and returns the new one.
+func (b *bucket) put(ctx context.Context, name string, v any, gen int64) (int64, error) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return 0, err
+	}
+	return b.upload(ctx, name, bytes.NewReader(data), gen)
+}
+
+func (b *bucket) upload(ctx context.Context, name string, body io.Reader, gen int64) (int64, error) {
+	q := url.Values{"uploadType": {"media"}, "name": {name}}
+	if gen >= 0 {
+		q.Set("ifGenerationMatch", strconv.FormatInt(gen, 10))
+	}
+	req, _ := http.NewRequestWithContext(ctx, "POST", gcs+"/upload/storage/v1/b/"+b.name+"/o?"+q.Encode(), body)
+	resp, err := b.do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	var obj struct {
+		Generation int64 `json:"generation,string"`
+	}
+	return obj.Generation, json.NewDecoder(resp.Body).Decode(&obj)
+}
+
+func (b *bucket) uploadFile(ctx context.Context, name, file string) error {
+	f, err := os.Open(file)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = b.upload(ctx, name, f, -1)
+	return err
+}
+
+func (b *bucket) downloadFile(ctx context.Context, name, file string) error {
+	req, _ := http.NewRequestWithContext(ctx, "GET", b.objectURL(name)+"?alt=media", nil)
+	resp, err := b.do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	f, err := os.Create(file)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
+}
+
+func (b *bucket) copy(ctx context.Context, src, dst string) error {
+	req, _ := http.NewRequestWithContext(ctx, "POST", b.objectURL(src)+"/copyTo/b/"+b.name+"/o/"+url.PathEscape(dst), nil)
+	resp, err := b.do(req)
+	if err != nil {
+		return err
+	}
+	return resp.Body.Close()
+}
+
+func (b *bucket) delete(ctx context.Context, name string) error {
+	req, _ := http.NewRequestWithContext(ctx, "DELETE", b.objectURL(name), nil)
+	resp, err := b.do(req)
+	if err != nil {
+		return err
+	}
+	return resp.Body.Close()
+}
+
+// list returns the names of the objects under prefix.
+func (b *bucket) list(ctx context.Context, prefix string) ([]string, error) {
+	var names []string
+	q := url.Values{"prefix": {prefix}, "fields": {"items(name),nextPageToken"}}
+	for {
+		req, _ := http.NewRequestWithContext(ctx, "GET", gcs+"/storage/v1/b/"+b.name+"/o?"+q.Encode(), nil)
+		resp, err := b.do(req)
+		if err != nil {
+			return nil, err
+		}
+		var page struct {
+			Items         []struct{ Name string }
+			NextPageToken string
+		}
+		err = json.NewDecoder(resp.Body).Decode(&page)
+		resp.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		for _, it := range page.Items {
+			names = append(names, it.Name)
+		}
+		if page.NextPageToken == "" {
+			return names, nil
+		}
+		q.Set("pageToken", page.NextPageToken)
+	}
+}

@@ -1,0 +1,99 @@
+$ ate create atespace ate-demo-pi
+  create atespace: {"name":"ate-demo-pi"}
+  [1031 ms]
+$ ate create actor-template -f template.yaml
+  create actor-template: {"atespace":"ate-demo-pi","name":"pi-durable-data"}
+  [935 ms]
+$ ate create actor demo-agent --template pi-durable-data -a ate-demo-pi
+  ATESPACE      NAME         TEMPLATE          STATE       WORKER   GENERATION   EGRESS POLICY   AGE
+  ate-demo-pi   demo-agent   pi-durable-data   suspended   <none>   0            false           0s
+  [989 ms]
+$ ate create egress-policy demo-agent -a ate-demo-pi -f demo/egress-policy-gateway.yaml
+  create egress-policy: {"rules":[{"https":{"hostnames":["ai-gateway.vercel.sh"],"effects":{"replaceHeaders":[{"header":"x-api-key","credentialUri":"ate-secret://secretmanager.googleapis.com/daniel-junk/ai-gateway-token"}]}}}]}
+  [1083 ms]
+$ curl -X POST $ATE_URL/submit -H 'ate-target-actor: ate-demo-pi/demo-agent' -d '{"prompt": "Create app.js with add(a, b) and a test.js that verifies it."}'
+  settled: {"conversationId":1,"type":"input","status":"done","entry":7,"id":8,"answer":17}
+  messages: 6, user prompts: ["Create app.js with add(a, b) and a test.js that verifies it."]
+  tool results: ["Successfully wrote to app.js","Successfully wrote to test.js"]
+  last answer: Perfect! I've created both files:
+
+**app.js** - Contains a simple `add(a, b)` function that returns the sum of two numbers and exports it as a module.
+
+**test.js** - Contains comprehensive tests for the `add()` function that verify:
+- Adding positive numbers (2 + 3 = 5)
+- Adding negative and positiv
+  ingress: ate-parked-ms: 0 ate-resume-ms: 8174 ate-worker: w-23b80fa4 
+  [15272 ms]
+$ ate suspend actor demo-agent -a ate-demo-pi
+  ATESPACE      NAME         TEMPLATE          STATE       WORKER   GENERATION   EGRESS POLICY   AGE
+  ate-demo-pi   demo-agent   pi-durable-data   suspended   <none>   1            true            18s
+  [1489 ms]
+$ ate create tag checkpoint-v1 --actor demo-agent -a ate-demo-pi
+  create tag: {"actor":"demo-agent","name":"checkpoint-v1"}
+  [966 ms]
+$ ate create actor demo-agent-fork --template pi-durable-data --tag checkpoint-v1 -a ate-demo-pi
+  ATESPACE      NAME              TEMPLATE          STATE       WORKER   GENERATION   EGRESS POLICY   AGE
+  ate-demo-pi   demo-agent-fork   pi-durable-data   suspended   <none>   0            false           0s
+  [1012 ms]
+$ ate create egress-policy demo-agent-fork -a ate-demo-pi -f demo/egress-policy-gateway.yaml
+  create egress-policy: {"rules":[{"https":{"hostnames":["ai-gateway.vercel.sh"],"effects":{"replaceHeaders":[{"header":"x-api-key","credentialUri":"ate-secret://secretmanager.googleapis.com/daniel-junk/ai-gateway-token"}]}}}]}
+  [1008 ms]
+$ curl -X POST $ATE_URL/submit -H 'ate-target-actor: ate-demo-pi/demo-agent' -d '{"prompt": "Add multiply(a, b) and structured logging to app.js."}'
+  settled: {"conversationId":1,"type":"input","status":"done","entry":18,"id":19,"answer":31}
+  messages: 13, user prompts: ["Create app.js with add(a, b) and a test.js that verifies it.","Add multiply(a, b) and structured logging to app.js."]
+  tool results: ["Successfully replaced 1 block(s) in test.js.","Successfully replaced 1 block(s) in test.js."]
+  last answer: Done! I've updated both files:
+
+**app.js** now includes:
+- A `multiply(a, b)` function that returns the product of two numbers
+- Structured logging that outputs JSON with timestamp, operation name, arguments, and result
+- Both functions export as an object with `{ add, multiply }`
+
+**test.js** now:
+
+  ingress: ate-parked-ms: 0 ate-resume-ms: 992 ate-worker: w-23b80fa4 
+  [10224 ms]
+$ curl -X POST $ATE_URL/submit -H 'ate-target-actor: ate-demo-pi/demo-agent-fork' -d '{"prompt": "Add divide(a, b) and edge-case tests to test.js."}'
+  settled: {"conversationId":1,"type":"input","status":"done","entry":18,"id":19,"answer":27}
+  messages: 11, user prompts: ["Create app.js with add(a, b) and a test.js that verifies it.","Add divide(a, b) and edge-case tests to test.js."]
+  tool results: ["Successfully replaced 1 block(s) in app.js.","Successfully replaced 1 block(s) in test.js."]
+  last answer: Done! I've updated both files:
+
+**app.js** - Now exports both `add()` and `divide()` functions. The `divide()` function:
+- Takes two parameters (a, b)
+- Throws an error if trying to divide by zero
+- Returns the quotient
+
+**test.js** - Now includes comprehensive tests:
+- **Basic divide tests**: 10 ÷ 
+  ingress: ate-parked-ms: 0 ate-resume-ms: 9113 ate-worker: w-7e547f3f 
+  [21062 ms]
+$ curl -X POST $ATE_URL/submit -H 'ate-target-actor: ate-demo-pi/demo-agent-fork' -d '{"prompt": "Run this exact command with the bash tool and reply with its output only: node -e "fetch('https://example.com').then(r => console.log('status', r.status), e => console.log('failed:', e.cause?.message || e.message))""}'
+  settled: {"conversationId":1,"type":"input","status":"done","entry":28,"id":29,"answer":35}
+  messages: 15, user prompts: ["Create app.js with add(a, b) and a test.js that verifies it.","Add divide(a, b) and edge-case tests to test.js.","Run this exact command with the bash tool and reply with its output only: node -e \"fetch('https://example.com').then(r => console.log('status', r.status), e => console.log('failed:', e.cause?.message || e.message))\""]
+  tool results: ["Successfully replaced 1 block(s) in test.js.","failed: Request was cancelled.\n"]
+  last answer: failed: Request was cancelled.
+  ingress: ate-parked-ms: 0 ate-resume-ms: 77 ate-worker: w-7e547f3f 
+  [2886 ms]
+$ curl -X POST $ATE_URL/submit -H 'ate-target-actor: ate-demo-pi/demo-agent-fork' -d '{"prompt": "Run this exact command with the bash tool and reply with its output only: NODE_USE_ENV_PROXY=0 node -e "fetch('https://example.com').then(r => console.log('status', r.status), e => console.log('failed:', e.cause?.message || e.message))""}'
+  settled: {"conversationId":1,"type":"input","status":"done","entry":36,"id":37,"answer":43}
+  messages: 19, user prompts: ["Create app.js with add(a, b) and a test.js that verifies it.","Add divide(a, b) and edge-case tests to test.js.","Run this exact command with the bash tool and reply with its output only: node -e \"fetch('https://example.com').then(r => console.log('status', r.status), e => console.log('failed:', e.cause?.message || e.message))\"","Run this exact command with the bash tool and reply with its output only: NODE_USE_ENV_PROXY=0 node -e \"fetch('https://example.com').then(r => console.log('status', r.status), e => console.log('failed:', e.cause?.message || e.message))\""]
+  tool results: ["failed: Request was cancelled.\n","status 200\n"]
+  last answer: status 200
+  ingress: ate-parked-ms: 0 ate-resume-ms: 89 ate-worker: w-7e547f3f 
+  [6020 ms]
+$ ate get actors -a ate-demo-pi
+  ATESPACE      NAME              TEMPLATE          STATE     WORKER       GENERATION   EGRESS POLICY   AGE
+  ate-demo-pi   demo-agent-fork   pi-durable-data   running   w-7e547f3f   1            true            43s
+  ate-demo-pi   demo-agent        pi-durable-data   running   w-23b80fa4   2            true            1m2s
+  [1178 ms]
+$ ate get tags -a ate-demo-pi
+  ATESPACE      NAME
+  ate-demo-pi   checkpoint-v1
+  [877 ms]
+$ ate get workers
+  ID           ADDR               ACTORS   LEASE   HOSTED
+  w-23b80fa4   10.138.0.23:8080   1/4      live    ate-demo-pi/demo-agent
+  w-7e547f3f   10.138.0.22:8080   1/4      live    ate-demo-pi/demo-agent-fork
+  [1102 ms]
+scale exit 0
