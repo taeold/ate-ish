@@ -52,8 +52,20 @@ key, gate both shapes, README, publish as taeold/ate-node.
   generation 2 to 3).
   Boot (sandbox run to wakeup probe) 741 to 747 ms, n=3; first-request
   resume at the ingress 1018 to 1128 ms, n=3; suspend 463 to 482 ms.
-- [ ] 6 README; PROGRESS.md to docs/
-- [ ] 7 commit as Daniel Lee, gh repo create taeold/ate-node --public
+- [x] 6 README; PROGRESS.md moved to docs/. demo/template*.yaml rebuilt
+  from pi-durable-substrate's template.yaml (changes: image, command
+  /actor/..., PORT and probe port 8080). The parsed fields match the gated
+  file; one actor from the final gateway template booted on the instance
+  (/readyz 200 in 1.06 s), atespace moved to archive/.
+- [x] 7 commit as Daniel Lee, gh repo create taeold/ate-ish --public
+
+Resources after run 2:
+- Running: Cloud Run instance ate-node (us-west1, role all) on
+  ate-ish/pi-durable@sha256:92dd34fed7d5, bucket gs://ate-node-daniel-junk
+  (ate-demo-pi from runs/play.txt; earlier runs under archive/).
+- Public: Artifact Registry repository ate-ish (us-central1).
+- Deleted: Artifact Registry repository ate-node, worker pool
+  ate-node-workers, service ate-node-ingress, gs://ate-node-scale-daniel-junk.
 
 Notes:
 - 2026-10-28: opencode-gemini-key still answers 401 "API key not valid"
@@ -62,7 +74,7 @@ Notes:
 ## Run 1 (2026-10-26)
 
 
-Spec: ../ate-node-SPEC.md. Region us-west1, project daniel-junk.
+Region us-west1, project daniel-junk. The project was called ate-node then.
 
 ## Decisions
 

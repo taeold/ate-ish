@@ -1,77 +1,52 @@
-# ate-node: a small Agent Substrate for Cloud Run
+# ate-ish
 
-ate-node runs [Agent Substrate](https://github.com/agent-substrate/substrate) actors on Cloud Run sandboxes with one program and one Cloud Storage bucket.
+ate-ish is a small [Agent Substrate](https://github.com/agent-substrate/substrate) for Cloud Run: one binary, one bucket, no cluster.
 
-It takes the same `template.yaml`, `egress-policy.yaml`, `ate-target-actor` header and CLI verbs as Substrate. It has no database, no ateapi and no gRPC. It trades latency and scale for that: it targets tens of workers and thousands of actors.
+```bash
+./deploy.sh play gemini-api-key
+```
 
----
+Run it from a clone of this repository. The command creates the bucket `gs://ate-node-$PROJECT`, gives the default compute service account access to the bucket and to the secret, builds the `ate` CLI into `bin/`, and creates the Cloud Run instance `ate-node` from the public image `us-central1-docker.pkg.dev/daniel-junk/ate-ish/pi-durable:latest`. It prints the `export` line for `ATE_URL` and `PATH`.
 
-## Quickstart
+Before you run it:
 
-Run everything on one [Cloud Run instance](https://docs.cloud.google.com/run/docs/instances/create-and-manage-instances).
-
-Prerequisites:
-
-- A billed GCP project and an authenticated Google Cloud CLI with `gcloud beta run instances`.
-- Go 1.25 or later and Docker, to build the image.
-- An Artifact Registry repository for the image (`REPO` in `deploy.sh`).
-- The default compute service account needs Storage Object Admin on the bucket and Secret Accessor on the model key secret. `./deploy.sh setup` grants both.
+- Store your Gemini API key in Secret Manager. The secret name is the argument to `deploy.sh`: `printf %s "$GEMINI_API_KEY" | gcloud secrets create gemini-api-key --data-file=-`.
+- Use a billed project, the Google Cloud CLI with `gcloud beta run instances`, and Go 1.27 or later. Cloud Run instances and sandboxes are in preview.
+- `deploy.sh` uses your gcloud project and the region us-west1. Set `PROJECT` and `REGION` to change them.
 - Your gcloud account needs permission to invoke the instance, such as the Cloud Run Invoker role.
-
-### 1. Create the bucket and build the image
-
-```bash
-git clone <this repository> ate-node && cd ate-node
-export PROJECT=your-project-id REGION=us-west1
-./deploy.sh setup   # bucket gs://ate-node-$PROJECT, IAM for the service account
-./deploy.sh image   # builds bin/ate (server, sandbox init and CLI in one binary) and pushes it
-```
-
-### 2. Create the instance
-
-```bash
-./deploy.sh play
-export ATE_URL=$(./deploy.sh url play)
-```
-
-This runs:
-
-```bash
-gcloud beta run instances create ate-node --image ... --sandbox-launcher \
-  --cpu 2 --memory 4Gi --port 8080 --set-env-vars ATE_ROLE=all,ATE_BUCKET=ate-node-$PROJECT,...
-```
-
-The instance returned in 16 s. The CLI is `bin/ate`. It calls `$ATE_URL` with `gcloud auth print-identity-token`, and Cloud Run IAM checks the token.
-
-### 3. Try it
-
-Follow the walkthrough below. `./gate.sh` runs all of it and prints each result with its time. `runs/play.txt` is the output of the last run.
 
 ## The pi-durable walkthrough
 
-This is the README of [pi-durable-substrate](https://github.com/taeold/pi-durable-substrate) with `kubectl ate` replaced by `ate` and the kind cluster replaced by the instance above.
+This is the README of [pi-durable-substrate](https://github.com/taeold/pi-durable-substrate) with `kubectl ate` replaced by `ate` and the kind cluster replaced by the instance from the quickstart. `./gate.sh` runs every step and fails if a turn or the egress check fails.
 
-The agent is a pi-durable coding agent. It keeps its conversation in SQLite under `/workspace`, so a suspended actor resumes with its history and files.
+The outputs below are from `runs/play.txt`. That run used the Vercel AI Gateway variant (see [Use Vercel AI Gateway instead](#use-vercel-ai-gateway-instead)), because the Gemini key in the test project is revoked. The Gemini path has not run on ate-ish.
 
-### Model key
+### How it works
 
-The demo's Gemini key was revoked on 2026-10-26, so the measured runs use Vercel AI Gateway. That change lives in its own files:
+`pi-durable` runs the coding agent loop and writes every conversation turn and tool checkpoint to a SQLite database at `/workspace/.pi/agent.sqlite`. ate-ish runs each agent as an actor in its own Cloud Run sandbox.
 
-| File | Change from the demo |
-|---|---|
-| `demo/gateway/server.ts` | `vercelAIGatewayProvider()` and model `anthropic/claude-haiku-4.5` instead of Google and Gemini. pi-ai 1.0.4 has no `claude-haiku-5.5` in its gateway catalog (the turn settles `unanswered` with reason `no_model`). It listens on `$PORT`. |
-| `demo/template-gateway.yaml` | That image, and `AI_GATEWAY_API_KEY=ate-placeholder-key`. |
-| `demo/egress-policy-gateway.yaml` | Host `ai-gateway.vercel.sh`, header `x-api-key` (what pi-ai sends, measured), secret `ate-secret://secretmanager.googleapis.com/<project>/ai-gateway-token`. |
+1. **Suspend and auto-resume.** `ate suspend actor` sends `SIGTERM` to the agent, waits for it to exit, tars the sandbox's writable layer with `sandbox tar`, and uploads the tar to the bucket as the actor's snapshot. When the next request arrives for that actor, the ingress asks a worker with a free slot to resume it. The worker starts a sandbox with `--import-tar` and waits for the wakeup probe before the ingress forwards the request.
+2. **Checkpoint and fork.** A tag is a copy of a suspended actor's snapshot. An actor created with `--tag` starts from a copy of the tag. Both actors start from the same history and files, then diverge.
+3. **Egress credential injection.** The sandbox runs with a placeholder `GEMINI_API_KEY`. Each actor's `HTTPS_PROXY` points at its own proxy in the worker. For `generativelanguage.googleapis.com`, the proxy replaces `x-goog-api-key` with the secret, so the key never enters the sandbox or its snapshots. `ATE_SECRET_MAP` maps the policy's `ate-secret://k8s.io/...` URI to the secret you passed to `deploy.sh`.
 
-`demo/template.yaml` and `demo/egress-policy.yaml` are the Gemini originals. The template uses Substrate HEAD's schema and port 8080, because a sandbox cannot publish a port below 1024. The policy's `ate-secret://k8s.io/...` URI maps to the Secret Manager secret `opencode-gemini-key` through `ATE_SECRET_MAP`. That path was not run.
+One binary has three roles, set by `ATE_ROLE`. The `worker` role runs actors. The `ingress` role routes requests by the `ate-target-actor` header and serves the admin API that the CLI calls. The `all` role is both, and the quickstart uses it. All state is in the bucket, and every record write is conditional on the generation read (`ifGenerationMatch`):
+
+```
+atespaces/<as>/atespace.json
+atespaces/<as>/templates/<t>.json      the template as given
+atespaces/<as>/actors/<a>.json         {template, status, owner, generation, egressPolicy, created}
+atespaces/<as>/snapshots/<a>.tar       the last snapshot
+atespaces/<as>/tags/<t>.tar
+workers/<id>.json                      lease: {addr, capacity, hosted, expires}
+```
 
 ### 1. Create the atespace, template and actor
 
 ```bash
 ate create atespace ate-demo-pi
-ate create actor-template -f demo/template-gateway.yaml
+ate create actor-template -f demo/template.yaml
 ate create actor demo-agent --template pi-durable-data -a ate-demo-pi
-ate create egress-policy demo-agent -a ate-demo-pi -f demo/egress-policy-gateway.yaml
+ate create egress-policy demo-agent -a ate-demo-pi -f demo/egress-policy.yaml
 ```
 
 ```
@@ -79,7 +54,9 @@ ATESPACE      NAME         TEMPLATE          STATE       WORKER   GENERATION   E
 ate-demo-pi   demo-agent   pi-durable-data   suspended   <none>   0            false           0s
 ```
 
-### 2. Turn 1
+`demo/egress-policy.yaml` is the file from pi-durable-substrate. `demo/template.yaml` is that repository's template with two changes. The command is `node /actor/server.ts`, because the agent is baked into the image at `/actor`. The agent listens on `PORT=8080` and the probe uses port 8080, because a sandbox cannot publish a port below 1024. The `image` field names the public image and is ignored.
+
+### 2. Run Turn 1
 
 ```bash
 curl -X POST $ATE_URL/submit \
@@ -92,23 +69,21 @@ curl -X POST $ATE_URL/submit \
 ```
 settled: {"conversationId":1,"type":"input","status":"done","entry":7,"id":8,"answer":17}
 tool results: ["Successfully wrote to app.js","Successfully wrote to test.js"]
-ingress: ate-parked-ms: 0 ate-resume-ms: 9768 ate-worker: w-bb302aae
+ingress: ate-parked-ms: 0 ate-resume-ms: 2971 ate-worker: w-e742006e
 ```
 
-The first request for a suspended actor places it on a worker and starts it. Here that took 9.8 s, because the worker pulled the image first.
+The first request for a suspended actor places it on a worker and starts it. The `ate-resume-ms` header is the time from the request reaching the ingress to the actor being ready.
 
-### 3. Suspend, tag and fork
+### 3. Suspend, tag a checkpoint, and fork
 
 ```bash
 ate suspend actor demo-agent -a ate-demo-pi
 ate create tag checkpoint-v1 --actor demo-agent -a ate-demo-pi
 ate create actor demo-agent-fork --template pi-durable-data --tag checkpoint-v1 -a ate-demo-pi
-ate create egress-policy demo-agent-fork -a ate-demo-pi -f demo/egress-policy-gateway.yaml
+ate create egress-policy demo-agent-fork -a ate-demo-pi -f demo/egress-policy.yaml
 ```
 
-Suspend sends SIGTERM, waits for the agent to exit, tars the sandbox's writable layer and uploads it as the actor's snapshot. A tag is a copy of that snapshot. A fork starts from a copy of the tag.
-
-### 4. Divergent turns
+### 4. Send divergent prompts to both branches
 
 ```bash
 curl ... -H "ate-target-actor: ate-demo-pi/demo-agent" -d '{"prompt": "Add multiply(a, b) and structured logging to app.js."}'
@@ -116,118 +91,134 @@ curl ... -H "ate-target-actor: ate-demo-pi/demo-agent-fork" -d '{"prompt": "Add 
 ```
 
 ```
-demo-agent       settled entry 18, prompts ["Create app.js ...", "Add multiply(a, b) and structured logging to app.js."]  resume 1720 ms
-demo-agent-fork  settled entry 18, prompts ["Create app.js ...", "Add divide(a, b) and edge-case tests to test.js."]     resume 1464 ms
+demo-agent       entry 18, prompts ["Create app.js ...", "Add multiply(a, b) and structured logging to app.js."]   resume 937 ms
+demo-agent-fork  entry 18, prompts ["Create app.js ...", "Add divide(a, b) and edge-case tests to test.js."]       resume 989 ms
 ```
 
-Both actors restored from the same turn 1 history and continued on their own branch.
+Both actors restored the Turn 1 history from the same snapshot and continued on their own branch.
 
-### 5. Egress
+### 5. Check egress
 
-The real key never enters the sandbox. The actor has the placeholder, and the worker's proxy replaces `x-api-key` on requests to `ai-gateway.vercel.sh`. Any other host is refused:
-
-```
-node -e "fetch('https://example.com')..."                       failed: Request was cancelled.   (proxy: allowed=false)
-NODE_USE_ENV_PROXY=0 node -e "fetch('https://example.com')..."  status 200
-```
-
-The second line is the limit described under [Limits](#limits). The actor image has no `curl`, so the check uses Node's `fetch`, run by the agent's bash tool.
-
-## How it works
-
-One binary, `ate`, has three roles, set by `ATE_ROLE`:
-
-- `worker` runs actors as sandboxes. It unpacks each template image once and starts `sandbox run --rootfs <image> --import-tar <snapshot> -p <port>:8080`. Inside, pid 1 is `ate init`. It reads the environment from a 0600 file (the launcher logs `-e` values), starts the container command, forwards SIGTERM, and stays alive so the sandbox can be tarred after the agent exits. Each actor gets a host port and an egress proxy port.
-- `ingress` routes requests by `ate-target-actor` and serves the admin API the CLI calls.
-- `all` is both, in one process. That is the quickstart.
-
-All state is in the bucket. Every record write is conditional on the generation read (`ifGenerationMatch`):
+`gate.sh` asks the fork's agent to run `node -e "fetch('https://example.com')..."` with its bash tool, once as is and once with `NODE_USE_ENV_PROXY=0`:
 
 ```
-atespaces/<as>/atespace.json
-atespaces/<as>/templates/<t>.json      the template as given
-atespaces/<as>/actors/<a>.json         {template, status, owner, generation, egressPolicy, created}
-atespaces/<as>/snapshots/<a>.tar       the last snapshot
-atespaces/<as>/tags/<t>.tar
-workers/<id>.json                      lease: {addr, capacity, hosted, expires}
+ok: through the proxy, example.com is refused: failed: Request was cancelled.
+ok: without the proxy, example.com answers: status 200
 ```
 
-The actor record is the only truth about placement. A request for an actor reads its record. If the actor runs on a worker with a live lease, the ingress proxies to it. Otherwise the ingress asks live workers with room, fewest actors first, to resume it. The worker that has a free slot claims the record with a conditional write (`running`, owner, generation + 1), then boots the actor. If no worker has room, the request waits up to 5 s for a slot and then gets `503 no worker has room for the actor`. The worker refuses proxied requests whose generation is not the one it runs.
+The second line is the limit described under [Limits](#limits). The image has no `curl`, so the check uses Node's `fetch`.
 
-A worker writes its lease every 10 s and after each change, at most once a second. On SIGTERM it suspends every actor and deletes its lease. In role `all`, a timer suspends actors idle for `ATE_IDLE_SECONDS` (600). `POST /admin/reap?idleSeconds=N` does the same on demand.
+### Use Vercel AI Gateway instead
 
-## Scale-out
+`demo/pi-durable/server-gateway.ts` is the same agent with `vercelAIGatewayProvider()` and the model `anthropic/claude-haiku-4.5`. The pi-durable image holds both servers, and the template picks one.
+
+1. Store your AI Gateway key in Secret Manager, for example as `ai-gateway-token`.
+2. Run `./deploy.sh play ai-gateway-token`.
+3. In `demo/egress-policy-gateway.yaml`, replace `daniel-junk/ai-gateway-token` with your project and secret.
+4. Use `demo/template-gateway.yaml` and `demo/egress-policy-gateway.yaml` in steps 1 and 3, or run `TEMPLATE=demo/template-gateway.yaml POLICY=demo/egress-policy-gateway.yaml ./gate.sh`.
+
+The gateway policy replaces `x-api-key` on `ai-gateway.vercel.sh`, which is the header pi-ai sends.
+
+## Build your own actor
+
+One deployment runs one actor template, and the actor is baked into the node image. A sandbox's root is the node container's filesystem, read only, under a writable overlay. Build your image from the base image and copy the actor to `/actor`:
+
+```Dockerfile
+FROM us-central1-docker.pkg.dev/daniel-junk/ate-ish/ate-ish:latest
+COPY . /actor
+```
+
+The base image is Debian trixie-slim with `ca-certificates` and `/usr/local/bin/ate`. Add the runtime your command needs. `demo/pi-durable/Dockerfile` copies `node` from `node:24-slim`.
+
+ate-ish reads these fields of `template.yaml`: `command`, `args`, `env`, `wakeupProbe`, `volumeMounts` and `volumes` (`durableDir` and the `systemInfo` trust bundle). It stores the other fields and ignores them. The `image` field is accepted and ignored.
+
+Deploy your image with `IMAGE=<your image> ./deploy.sh play <secret>`, then run `ate create actor-template -f template.yaml`.
+
+The images are public in Artifact Registry today. The intended distribution is GitHub Container Registry, with these commands:
 
 ```bash
-./deploy.sh scale     # worker pool ate-node-workers (2 x 4 slots) + service ate-node-ingress, Direct VPC
-export ATE_URL=$(./deploy.sh url scale)
-./gate.sh             # the walkthrough again: runs/scale.txt
-./park.sh             # 10 actors on 8 slots: runs/park.txt
+docker build --platform linux/amd64 -t ghcr.io/taeold/ate-ish:latest .
+docker build --platform linux/amd64 --build-arg BASE=ghcr.io/taeold/ate-ish:latest -t ghcr.io/taeold/ate-ish/pi-durable:latest demo/pi-durable
+docker push ghcr.io/taeold/ate-ish:latest
+docker push ghcr.io/taeold/ate-ish/pi-durable:latest
 ```
 
-The same image runs as a worker pool with `ATE_ROLE=worker` and as a Cloud Run service with `ATE_ROLE=ingress`. Workers register their Direct VPC address from the metadata server. The ingress reaches them over the VPC, and Cloud Run IAM protects the ingress. The scale shape uses its own bucket, `ate-node-scale-$PROJECT`, so it never places actors on the quickstart instance. The ingress runs with `--max-instances 1`, so concurrent placements of one actor collapse in one process.
+Cloud Run does not deploy from GHCR directly. Deploy from Artifact Registry, or from an Artifact Registry remote repository for `ghcr.io`.
 
-The walkthrough passed on this shape too. Turn 1 ran on one worker, and the fork restored on the other worker.
+## What Agent Substrate needs and what ate-ish needs
 
-Parking, from `runs/park.txt`:
+| Agent Substrate | ate-ish |
+|---|---|
+| A Kubernetes cluster, kind or GKE, with the `ate-system` components | One Cloud Run instance, or a Cloud Run worker pool and a service |
+| ate-api-server with Postgres for actor records | JSON records in one Cloud Storage bucket, written with `ifGenerationMatch` |
+| A `WorkerPool` of gVisor or microVM pods, run by atecontroller | Cloud Run sandboxes, started by the `ate` worker |
+| atelet and ateworker for snapshots, and a golden snapshot per template | `sandbox tar` of the writable layer, uploaded to the bucket |
+| atenet-router, an Envoy ext_proc, for `ate-target-actor` | The `ate` ingress, a Go reverse proxy |
+| atenet-egress and a credential provider | One HTTPS proxy per actor in the worker, with secrets from Secret Manager |
+| `kubectl-ate` over gRPC | `ate` over HTTP, with a gcloud identity token |
+| A template image per actor template, pulled by the worker | The actor in the node image |
 
-```
-== p1..p8 at once fill the 8 slots
-p1 http=200 10.49s ate-resume-ms: 10308 ate-worker: w-127d32fc
-...
-p7 http=200 10.60s ate-resume-ms: 10434 ate-worker: w-127d32fc
-== p9 parks; p1 is suspended 2 s into the wait
-p9 http=200 5.61s ate-parked-ms: 4313 ate-resume-ms: 5525 ate-worker: w-127d32fc
-== p10 parks and nothing frees a slot
-p10 http=503 5.39s
-actor park/p10: no worker has room for the actor
-```
+## Agent Substrate's demo templates
 
-p9 waited 4.3 s. The suspend request left the CLI 2 s in and took about 1.5 s with the token. The freed slot reached the worker's lease within a second, and the ingress checks every 250 ms.
+Only pi-durable has run on ate-ish. The other rows follow from the snapshot fidelity each template asks for in `substrate/demos`, because ate-ish delivers ROOTFS fidelity.
+
+| Demo | Result | Reason |
+|---|---|---|
+| pi-durable (pi-durable-substrate) | Pass | Its state is SQLite and files in `/workspace`. `runs/play.txt` and `runs/scale.txt`. |
+| `counter`, the file counter | Pass | The file is on a durable volume, and the writable layer keeps it. |
+| `counter`, the in-memory counter | Fail | It asks for MEMORY. The process restarts on resume, so the count starts at 0. |
+| `jupyter` | Fail | It asks for MEMORY. Kernel state is lost on resume. |
+| `parking` | Fail | It asks for MEMORY for its counter. `park.sh` runs the parking behavior with pi-durable. |
+| `egress` | Fail | It asks for MEMORY. It also expects transparent redirect and per-actor mTLS identity at a gateway. ate-ish uses `HTTPS_PROXY`. |
+| `multi-template` | Fail | It asks for MEMORY. It also puts two templates with two binaries on one pool. |
+| `sandbox` | Fail | It asks for MEMORY. Its client also calls ateapi over gRPC. |
+| `claude-code-multiplex` | Fail | Its three templates ask for MEMORY. It also drives actors through ateapi, not `ate-target-actor`. |
 
 ## Measured
 
-All runs were on 2026-10-26 in us-west1, with 2 vCPU and 4 GiB per worker. n is the number of runs.
+All runs were on 2026-10-28 in us-west1, on the published pi-durable image, with 2 vCPU and 4 GiB per worker. `runs/play.txt` is the walkthrough on the instance. `runs/scale.txt` is the walkthrough on the scale shape, an ingress service and two workers with four slots each (`./deploy.sh scale <secret>`). There, Turn 1 ran on one worker and the fork restored on the other. `runs/park.txt` is `./park.sh` on the scale shape. n is the number of runs.
 
 | Step | Measured | n |
 |---|---|---|
-| `instances create` | 16 s | 1 |
-| `instances update --image` (old container suspends its actors) | 94 and 128 s | 2 |
-| Image pull and unpack, first actor of an image on a worker (515 MB from us-central1) | 7.5 to 8.6 s | 5 |
-| Boot, image cached, one at a time (sandbox run to wakeup probe) | 0.76 to 1.03 s | 9 |
-| Boot, four at once on one worker | 2.08 to 2.32 s | 16 |
-| Suspend on the worker (stop, tar, upload of 120 to 140 KB, record) | 0.47 to 0.56 s alone, 0.70 to 0.82 s for eight at once | 15 |
-| Request to a suspended actor at the ingress (restore and boot) | 0.99 to 1.72 s | 8 |
-| Request to a running actor at the ingress (two GCS reads) | 45 to 107 ms | 18 |
-| Request to a running actor from a VM in us-west1, end to end | 123 to 166 ms | 10 |
-| `ate` CLI call (0.76 s of it is `gcloud auth print-identity-token`) | 0.88 to 1.19 s, suspend 1.49 to 1.63 s | 42 |
-| Turn at the client, any resume included (claude-haiku-4.5 through the egress proxy) | 2.9 to 21.1 s | 15 |
+| `instances create` (2026-10-26) | 16 s | 1 |
+| `deploy.sh play` on a running instance (`instances update --image`) | 92 and 103 s | 2 |
+| `deploy.sh scale` | 31 and 41 s | 2 |
+| Boot, first sandbox on a new container (sandbox run to wakeup probe) | 2.64 to 2.71 s | 3 |
+| Boot, later sandboxes one at a time | 0.70 to 0.95 s | 4 |
+| Boot, two at once on one worker | 1.15 to 1.22 s | 4 |
+| Boot, four at once on one worker | 2.33 to 2.36 s | 4 |
+| Suspend on the worker (stop, tar, upload of 122 to 164 KB, record) | 0.51 to 0.55 s | 5 |
+| Request to a suspended actor at the ingress, worker already booted once | 0.94 to 1.24 s | 3 |
+| Request to a running actor at the ingress (two GCS reads) | 47 to 77 ms | 4 |
+| `ate` CLI call, `gcloud auth print-identity-token` included | 0.95 to 1.18 s, suspend 1.61 and 1.62 s | 22 |
+| Turn at the client, resume included (claude-haiku-4.5 through the egress proxy) | 2.97 to 14.6 s | 10 |
 
-What bounds them. Booting is Node starting pi-durable inside gVisor, and four boots on two vCPUs take about twice as long each. Suspend and restore are dominated by GCS round trips to a same-region bucket. A request to a running actor pays two GCS reads at the ingress: the actor record and the owner's lease. The CLI pays a gcloud process for its token on every call.
+Parking, from `runs/park.txt`. p1 to p8 at once filled the 8 slots, and all answered 200 in 1.6 to 4.4 s. p9 waited 3.9 s for a slot, which opened when p1 was suspended 2 s into the wait, and answered 200 at 5.2 s. p10 waited 5 s, no slot opened, and it got `503 no worker has room for the actor` at 5.5 s.
 
-## Estimated cost
-
-These prices are an estimate. They use Cloud Run's instance-based list prices for tier 1 regions as I know them ($0.000018 per vCPU-second and $0.000002 per GiB-second). I did not confirm them on the pricing page for this README.
-
-| Shape | Always on | Per hour | Per month |
-|---|---|---|---|
-| Quickstart: one instance, 2 vCPU, 4 GiB | yes | about $0.16 | about $115 |
-| Scale-out: two workers like the instance, plus an ingress billed per request | workers yes | about $0.32 | about $230 |
-
-The bucket holds kilobytes of JSON and a 120 to 140 KB tar per actor. Model calls through the gateway cost about $0.002 per turn here. All runs for this README cost well under a dollar in model calls.
+What bounds them. Booting is Node starting pi-durable inside gVisor, and four boots on two vCPUs take about three times as long as one. The first boot on a new container is about 2 s slower than later ones. The likely cause is Cloud Run loading the image's files on first read, but that was not measured. Suspend and restore are mostly GCS round trips to a bucket in the same region. A request to a running actor pays two GCS reads at the ingress, for the actor record and for the owner's lease. The CLI starts a gcloud process for its token on every call. In the parking run, p2 and p7 reached the ingress 2.7 s after the other six, according to the Cloud Run request log, and the ingress placed them in 1.5 s.
 
 ## Limits
 
-- **Rootfs fidelity only.** A snapshot is the sandbox's writable layer. Memory and processes are not captured, so an actor restarts from its files on every resume.
-- **The workspace is RAM.** The launcher keeps the writable layer in memory (`--overlay2=root:memory`). A 20 MB workspace costs 20 MB of worker memory. Unpacked images and snapshot tars sit in the worker's in-memory `/tmp` too.
-- **Egress is enforced by convention.** A sandbox without `--allow-egress` cannot reach the worker (measured: connection refused at 169.254.8.1 and 172.20.0.1). So actors run with egress allowed, and `HTTPS_PROXY`, `HTTP_PROXY` and `NODE_USE_ENV_PROXY=1` point them at their proxy. A process that ignores those variables reaches the internet directly (`status 200` above). The metadata server was not reachable from a sandbox in either mode.
-- **Per-actor identity at the proxy is the listener port.** Another actor on the same worker could use a neighbor's port and its credentials.
-- **Actors can reach the worker's address.** ate-node refuses requests from the sandbox network (172.20.0.0/16) on its own port. Actor connections came from 172.20.0.N in every run.
-- **The launcher sets no per-sandbox CPU or memory limit.** `resources` in the template is stored and ignored. A worker counts actor slots (`ATE_CAPACITY`, 4).
-- **Hot actors cannot be split.** One actor runs on one worker.
-- **A worker that Cloud Run replaces loses actors** that did not finish suspending in the shutdown window. They come back from their last snapshot. Records survive anything, because the bucket is the truth.
-- **Instances cannot be stopped.** `restart` and `update` replace the container. The actors then suspend and resume on the next request.
-- **GCS takes about one write per second per object.** The first placement design wrote the actor record before asking a worker for a slot. Eight concurrent wakes then failed with `429 rateLimitExceeded` on the actor records. Workers now claim the record only after they reserve a slot.
+- **ROOTFS fidelity only.** A snapshot is the sandbox's writable layer. Memory and processes are not in it, so an actor runs its command from the start on every resume.
+- **The workspace is RAM on the worker.** The launcher keeps the writable layer in memory (`--overlay2=root:memory`). A 20 MB workspace uses 20 MB of worker memory, and the snapshot tar is in the worker's in-memory `/tmp` during a suspend.
+- **Egress is enforced by convention.** A sandbox without `--allow-egress` cannot reach the worker, so it cannot reach its proxy (measured: connection refused at 169.254.8.1 and 172.20.0.1). Actors therefore run with egress allowed, and `HTTPS_PROXY`, `HTTP_PROXY` and `NODE_USE_ENV_PROXY=1` point them at their proxy. The proxy refuses hosts that are not in the policy (`failed: Request was cancelled.`). A process that ignores those variables reaches the internet directly (`status 200`). `gate.sh` asserts both results on every run.
+- **The proxy knows an actor by its listener port.** Another actor on the same worker can use a neighbor's port and its credentials.
+- **One ingress instance.** The scale shape runs the ingress with `--max-instances 1`, so concurrent placements of one actor share one process.
+- **One template per deployment.** Every actor runs from the node image. Two templates can share a deployment only if the image holds both, as `demo/pi-durable` does for its two servers.
+- **A worker has 10 s to drain when Cloud Run replaces it.** On `SIGTERM` the worker suspends every actor and deletes its lease. An actor whose suspend does not finish in 10 s comes back from its last snapshot.
+- **No per-sandbox CPU or memory limit.** The launcher sets none. `resources` in the template is stored and ignored, and a worker counts slots (`ATE_CAPACITY`, 4).
+- **Update a stopped instance after you start it.** On a stopped instance, `instances update --image` changes the spec but does not import the image, and `instances start` runs the previous image (measured once).
+
+## Estimated cost
+
+These prices are estimates from Cloud Run's instance-based list prices for tier 1 regions, $0.000018 per vCPU-second and $0.000002 per GiB-second. They are not confirmed against the pricing page or a bill.
+
+| Shape | Always on | Per hour | Per month |
+|---|---|---|---|
+| Quickstart, one instance with 2 vCPU and 4 GiB | yes | about $0.16 | about $115 |
+| Scale shape, two such workers and an ingress billed per request | workers yes | about $0.32 | about $230 |
+
+The bucket holds a few KB of JSON and one 120 to 170 KB tar per actor. A Turn through the gateway with claude-haiku-4.5 cost about $0.002 in the 2026-10-26 runs.
 
 ## Cleanup
 
@@ -235,4 +226,5 @@ The bucket holds kilobytes of JSON and a 120 to 140 KB tar per actor. Model call
 ./deploy.sh down play
 ./deploy.sh down scale    # only if you deployed it
 gcloud storage rm -r gs://ate-node-$PROJECT gs://ate-node-scale-$PROJECT
+gcloud secrets delete gemini-api-key
 ```
