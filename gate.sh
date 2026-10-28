@@ -64,9 +64,24 @@ ate create egress-policy demo-agent-fork -a "$AS" -f "$POLICY"
 turn demo-agent "Add multiply(a, b) and structured logging to app.js."
 turn demo-agent-fork "Add divide(a, b) and edge-case tests to test.js."
 
+# expect PATTERN WHAT: the last tool output of the last turn matches PATTERN.
+expect() {
+  local got
+  got=$(jq -r '[.view.messages[] | select(.role == "toolResult") | .content[0].text // ""][-1]' "$work/out.json")
+  if ! grep -q "$1" <<<"$got"; then
+    echo "  FAILED: $2: $got"
+    exit 1
+  fi
+  echo "  ok: $2: $got"
+}
+
+# Enforcement by convention: the proxy refuses an unlisted host, and a
+# process that ignores the proxy variables reaches it directly.
 fetch="node -e \"fetch('https://example.com').then(r => console.log('status', r.status), e => console.log('failed:', e.cause?.message || e.message))\""
 turn demo-agent-fork "Run this exact command with the bash tool and reply with its output only: $fetch"
+expect '^failed:' "through the proxy, example.com is refused"
 turn demo-agent-fork "Run this exact command with the bash tool and reply with its output only: NODE_USE_ENV_PROXY=0 $fetch"
+expect '^status 200' "without the proxy, example.com answers"
 
 ate get actors -a "$AS"
 ate get tags -a "$AS"

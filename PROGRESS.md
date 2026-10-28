@@ -6,7 +6,22 @@ Brief: single-template model, review fixes a-f, public images, BYO Gemini
 key, gate both shapes, README, publish as taeold/ate-node.
 
 - [x] 1 single-template model (commit; gated with step 2)
-- [ ] 2 review fixes a-f (commit)
+- [x] 2 review fixes a-f (commit; live checks of b and d pending the deploy)
+  a real: Host header must name the CONNECT host (local check: without the
+    fix a Host: www.google.com request reached Cloudflare; with it the proxy
+    answers 403).
+  b real: record write first, then the tag copy; a failed copy deletes the
+    new record.
+  c real: a failed stop, tar or upload keeps the sandbox and the running
+    record and returns the error.
+  d real: worker.release re-reads on 412, waits out 429, 5 tries. Ingress:
+    a running record whose owner's live lease does not list the actor goes
+    to placement, owner asked first. The proxied 409 itself cannot be
+    retried once the body went to the worker, so the ingress reads the
+    owner's lease. ate suspend on such a record marks it suspended.
+  e real: a resume for a hosted copy waits for it, then refuses 503 if
+    stopping, 409 if the record no longer names it (and stops that copy).
+  f real: gate.sh asserts both fetch results from the bash tool output.
 - [ ] 3 Artifact Registry repo ate-node (public), images ate-node, pi-durable
 - [ ] 4 model key: Gemini primary in README, Gateway variant under demo/
 - [ ] 5 gate: play (ate-node, us-west1) and scale + park, scale deleted

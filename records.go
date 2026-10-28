@@ -1,6 +1,9 @@
 package main
 
-import "time"
+import (
+	"slices"
+	"time"
+)
 
 // The bucket layout. The actor record is the only truth about placement.
 func atespaceKey(as string) string    { return "atespaces/" + as + "/atespace.json" }
@@ -35,6 +38,9 @@ type Lease struct {
 }
 
 func (l *Lease) live() bool { return l != nil && time.Now().Before(l.Expires) }
+
+// hosts says whether the worker's live lease lists the actor ("as/name").
+func (l *Lease) hosts(key string) bool { return l.live() && slices.Contains(l.Hosted, key) }
 
 // Template is the part of substrate's ActorTemplate that ate-node reads.
 // Other fields are stored and ignored.

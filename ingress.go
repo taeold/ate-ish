@@ -73,13 +73,13 @@ func (in *ingress) locate(ctx context.Context, as, name string) *placement {
 	if _, err := in.bucket.get(ctx, actorKey(as, name), &rec); err != nil {
 		return &placement{err: err}
 	}
+	key := as + "/" + name
 	if rec.Status == running {
 		lease, err := in.lease(ctx, rec.Owner)
-		if err != nil || lease.live() {
+		if err != nil || lease.hosts(key) {
 			return &placement{actor: rec, lease: lease, err: err}
 		}
 	}
-	key := as + "/" + name
 	in.mu.Lock()
 	p, ok := in.placing[key]
 	if !ok {
@@ -104,7 +104,9 @@ func (in *ingress) locate(ctx context.Context, as, name string) *placement {
 
 // place asks live workers with room, fewest actors first, to resume the
 // actor. The worker that has a free slot claims the record. With no room it
-// retries for 5 s.
+// retries for 5 s. A running record whose owner's lease does not list the
+// actor counts as suspended: the owner is asked first, and either still runs
+// that copy or claims the actor again.
 func (in *ingress) place(ctx context.Context, as, name string, p *placement) error {
 	start := time.Now()
 	var parkedSince time.Time
@@ -116,7 +118,7 @@ func (in *ingress) place(ctx context.Context, as, name string, p *placement) err
 		}
 		if rec.Status == running {
 			lease, err := in.lease(ctx, rec.Owner)
-			if err != nil || lease.live() {
+			if err != nil || lease.hosts(as+"/"+name) {
 				p.actor, p.lease = rec, lease
 				return err
 			}
@@ -127,6 +129,9 @@ func (in *ingress) place(ctx context.Context, as, name string, p *placement) err
 		}
 		ids := slices.Collect(maps.Keys(leases))
 		slices.SortFunc(ids, func(a, b string) int { return len(leases[a].Hosted) - len(leases[b].Hosted) })
+		if i := slices.Index(ids, rec.Owner); i > 0 {
+			ids = slices.Insert(slices.Delete(ids, i, i+1), 0, rec.Owner)
+		}
 		conflict := false
 		for _, id := range ids {
 			l := leases[id]
@@ -228,9 +233,12 @@ func (in *ingress) suspend(ctx context.Context, as, name string) error {
 		return err
 	}
 	if lease.live() {
-		return in.call(ctx, lease.Addr, "/suspend", map[string]string{"as": as, "actor": name}, nil)
+		err := in.call(ctx, lease.Addr, "/suspend", map[string]string{"as": as, "actor": name}, nil)
+		if !errors.Is(err, errConflict) {
+			return err
+		}
 	}
-	// The owner is gone: the last snapshot is what remains.
+	// The owner is gone or does not host the actor: the last snapshot is what remains.
 	rec.Status, rec.Owner = suspended, ""
 	_, err = in.bucket.put(ctx, actorKey(as, name), rec, gen)
 	return err
@@ -258,13 +266,18 @@ func (in *ingress) routes(mux *http.ServeMux) {
 		as, a := r.PathValue("as"), r.PathValue("a")
 		rec := Actor{Template: req.Template, Status: suspended, Created: time.Now()}
 		_, err := b.get(r.Context(), templateKey(as, req.Template), &Template{})
-		if err == nil && req.Tag != "" {
-			err = b.copy(r.Context(), tagKey(as, req.Tag), snapshotKey(as, a))
-		}
 		if err == nil {
 			_, err = b.put(r.Context(), actorKey(as, a), rec, 0)
+			err = existsErr(err)
 		}
-		reply(rw, named(a, rec), existsErr(err))
+		// The tag becomes the new actor's snapshot only after its record exists,
+		// so an existing actor's snapshot is never overwritten.
+		if err == nil && req.Tag != "" {
+			if err = b.copy(r.Context(), tagKey(as, req.Tag), snapshotKey(as, a)); err != nil {
+				b.delete(r.Context(), actorKey(as, a))
+			}
+		}
+		reply(rw, named(a, rec), err)
 	})
 	mux.HandleFunc("PUT /admin/atespaces/{as}/actors/{a}/egress-policy", func(rw http.ResponseWriter, r *http.Request) {
 		var policy EgressPolicy

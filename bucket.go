@@ -17,8 +17,9 @@ import (
 )
 
 var (
-	errNotFound = errors.New("not found")
-	errConflict = errors.New("generation changed")
+	errNotFound    = errors.New("not found")
+	errConflict    = errors.New("generation changed")
+	errRateLimited = errors.New("rate limited")
 )
 
 // bucket is the GCS JSON API, the few calls ate-node needs. Every record is a
@@ -56,6 +57,9 @@ func (b *bucket) do(req *http.Request) (*http.Response, error) {
 	case http.StatusPreconditionFailed:
 		resp.Body.Close()
 		return nil, errConflict
+	case http.StatusTooManyRequests:
+		resp.Body.Close()
+		return nil, errRateLimited
 	}
 	defer resp.Body.Close()
 	msg, _ := io.ReadAll(resp.Body)

@@ -17,6 +17,7 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"slices"
 	"strings"
@@ -117,6 +118,12 @@ func (p *egressProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	for {
 		req, err := http.ReadRequest(in)
 		if err != nil {
+			return
+		}
+		// The secret goes to the CONNECT host only, so the Host header must name it too.
+		if got := (&url.URL{Host: req.Host}).Hostname(); got != host {
+			slog.Warn("egress", "actor", p.actor, "host", host, "hostHeader", req.Host, "allowed", false)
+			fmt.Fprint(tlsConn, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
 			return
 		}
 		req.URL.Scheme, req.URL.Host, req.RequestURI = "https", r.Host, ""

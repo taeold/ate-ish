@@ -23,6 +23,7 @@ import (
 
 var (
 	errFull      = errors.New("worker has no free slot")
+	errStopping  = errors.New("actor is stopping on this worker")
 	errNotHosted = errors.New("actor is not running on this worker")
 )
 
@@ -140,14 +141,18 @@ func (w *worker) find(key string) *hosted {
 
 // resume runs an actor in a free slot and returns the generation it runs.
 // A full worker refuses before it writes anything. A second call for an actor
-// the worker already runs waits for the first.
+// the worker already runs waits for the first, and succeeds only if that copy
+// is still the one the record names.
 func (w *worker) resume(ctx context.Context, as, name string, recordGen int64) (int64, error) {
 	w.mu.Lock()
 	h := w.find(as + "/" + name)
 	if h != nil {
 		w.mu.Unlock()
 		<-h.ready
-		return h.gen, h.err
+		if h.err != nil {
+			return 0, h.err
+		}
+		return h.gen, w.current(ctx, h)
 	}
 	slot := slices.Index(w.slots, nil)
 	if slot < 0 {
@@ -169,6 +174,27 @@ func (w *worker) resume(ctx context.Context, as, name string, recordGen int64) (
 	return h.gen, h.err
 }
 
+// current refuses a copy that is stopping or that the record no longer names,
+// and stops a copy the record no longer names.
+func (w *worker) current(ctx context.Context, h *hosted) error {
+	w.mu.Lock()
+	stopping := h.stopping
+	w.mu.Unlock()
+	if stopping {
+		return fmt.Errorf("%w: %s", errStopping, h.key())
+	}
+	var rec Actor
+	if _, err := w.bucket.get(ctx, actorKey(h.as, h.name), &rec); err != nil {
+		return err
+	}
+	if rec.Owner != w.id || rec.Generation != h.gen {
+		go w.suspend(context.Background(), h.key())
+		return fmt.Errorf("%w: the record of %s names generation %d on %s, this copy is %d",
+			errConflict, h.key(), rec.Generation, rec.Owner, h.gen)
+	}
+	return nil
+}
+
 // start claims the actor with a conditional write of its record, then boots
 // it. If the boot fails, the record goes back to suspended.
 func (w *worker) start(ctx context.Context, h *hosted, recordGen int64) error {
@@ -182,16 +208,38 @@ func (w *worker) start(ctx context.Context, h *hosted, recordGen int64) error {
 		return fmt.Errorf("%w: the record of %s changed", errConflict, h.key())
 	}
 	rec.Status, rec.Owner, rec.Generation = running, w.id, rec.Generation+1
-	if gen, err = w.bucket.put(ctx, key, rec, gen); err != nil {
+	if _, err = w.bucket.put(ctx, key, rec, gen); err != nil {
 		return err
 	}
 	h.gen = rec.Generation
 	if err := w.boot(ctx, h, rec); err != nil {
-		rec.Status, rec.Owner = suspended, ""
-		_, rerr := w.bucket.put(ctx, key, rec, gen)
-		return errors.Join(err, rerr)
+		return errors.Join(err, w.release(ctx, h))
 	}
 	return nil
+}
+
+// release marks the record suspended if it still names this copy. It re-reads
+// on 412 and waits out 429, so the record does not stay running on a worker
+// that no longer hosts the actor.
+func (w *worker) release(ctx context.Context, h *hosted) error {
+	var err error
+	for range 5 {
+		var rec Actor
+		var gen int64
+		if gen, err = w.bucket.get(ctx, actorKey(h.as, h.name), &rec); err != nil {
+			return err
+		}
+		if rec.Owner != w.id || rec.Generation != h.gen {
+			return nil
+		}
+		rec.Status, rec.Owner = suspended, ""
+		_, err = w.bucket.put(ctx, actorKey(h.as, h.name), rec, gen)
+		if !errors.Is(err, errConflict) && !errors.Is(err, errRateLimited) {
+			return err
+		}
+		time.Sleep(time.Second)
+	}
+	return err
 }
 
 func (w *worker) boot(ctx context.Context, h *hosted, rec Actor) error {
@@ -309,14 +357,19 @@ func tail(file string) string {
 }
 
 // suspend stops an actor, uploads its rootfs as the snapshot, and marks the
-// record suspended.
+// record suspended. If the stop, tar or upload fails, the actor keeps its
+// sandbox and its running record, so a later suspend can try again.
 func (w *worker) suspend(ctx context.Context, key string) error {
 	t0 := time.Now()
 	w.mu.Lock()
 	h := w.find(key)
-	if h == nil || h.stopping {
+	if h == nil {
 		w.mu.Unlock()
 		return errNotHosted
+	}
+	if h.stopping {
+		w.mu.Unlock()
+		return fmt.Errorf("%w: %s", errStopping, key)
 	}
 	h.stopping = true
 	w.mu.Unlock()
@@ -336,28 +389,31 @@ func (w *worker) suspend(ctx context.Context, key string) error {
 		err = sandbox(ctx, "tar", h.sandbox, "--file", tar)
 	}
 	tarred := time.Since(t0)
-	// Upload only while the record still names this placement, so a
-	// superseded copy never overwrites the snapshot of the new one.
+	// Upload only while the record still names this copy, so a superseded
+	// copy never overwrites the snapshot of the new one.
 	var rec Actor
-	gen, rerr := w.bucket.get(ctx, actorKey(h.as, h.name), &rec)
-	mine := rerr == nil && rec.Owner == w.id && rec.Generation == h.gen
-	if err == nil && mine {
+	if err == nil {
+		_, err = w.bucket.get(ctx, actorKey(h.as, h.name), &rec)
+	}
+	if err == nil && rec.Owner == w.id && rec.Generation == h.gen {
 		err = w.bucket.uploadFile(ctx, snapshotKey(h.as, h.name), tar)
 	}
 	uploaded := time.Since(t0)
 	size := fileSize(tar)
-	err = errors.Join(err, sandbox(ctx, "delete", h.sandbox, "--force"), h.egress.Close())
 	os.Remove(tar)
-	os.RemoveAll(dir)
-	if mine {
-		rec.Status, rec.Owner = suspended, ""
-		_, rerr = w.bucket.put(ctx, actorKey(h.as, h.name), rec, gen)
+	if err != nil {
+		w.mu.Lock()
+		h.stopping = false
+		w.mu.Unlock()
+		slog.Error("suspend failed, actor kept", "actor", key, "generation", h.gen, "err", err)
+		return err
 	}
+	err = errors.Join(w.release(ctx, h), sandbox(ctx, "delete", h.sandbox, "--force"), h.egress.Close())
+	os.RemoveAll(dir)
 	w.mu.Lock()
 	w.slots[h.slot] = nil
 	w.mu.Unlock()
 	w.dirty.Store(true)
-	err = errors.Join(err, rerr)
 	slog.Info("actor suspended", "actor", key, "generation", h.gen, "stop_ms", stopped.Milliseconds(),
 		"tar_ms", (tarred - stopped).Milliseconds(), "upload_ms", (uploaded - tarred).Milliseconds(),
 		"total_ms", time.Since(t0).Milliseconds(), "bytes", size, "err", err)
@@ -495,7 +551,7 @@ func env(name, def string) string {
 // reply writes v as JSON, or err with a status that names its kind.
 func reply(rw http.ResponseWriter, v any, err error) {
 	switch {
-	case errors.Is(err, errFull), errors.Is(err, errNoRoom):
+	case errors.Is(err, errFull), errors.Is(err, errStopping), errors.Is(err, errNoRoom):
 		http.Error(rw, err.Error(), http.StatusServiceUnavailable)
 	case errors.Is(err, errNotHosted), errors.Is(err, errConflict), errors.Is(err, errExists):
 		http.Error(rw, err.Error(), http.StatusConflict)
