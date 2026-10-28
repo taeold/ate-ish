@@ -47,8 +47,8 @@ type Template struct {
 	Volumes    []Volume    `json:"volumes"`
 }
 
+// Container's image field is ignored: actors run from the node image.
 type Container struct {
-	Image   string   `json:"image"`
 	Command []string `json:"command"`
 	Args    []string `json:"args"`
 	Env     []struct {

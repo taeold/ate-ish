@@ -1,2 +1,4 @@
-*
-!bin/ate
+bin/
+.git/
+demo/
+runs/

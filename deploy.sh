@@ -1,69 +1,73 @@
 #!/usr/bin/env bash
-# Builds and deploys ate-node.
+# Deploys ate-node.
 #
-#   ./deploy.sh setup         bucket and IAM for the service account
-#   ./deploy.sh image         build bin/ate and push the image
-#   ./deploy.sh play          one Cloud Run instance, ATE_ROLE=all
-#   ./deploy.sh scale         ingress service + worker pool, over Direct VPC
+#   ./deploy.sh play SECRET    one Cloud Run instance, ATE_ROLE=all
+#   ./deploy.sh scale SECRET   ingress service + worker pool, over Direct VPC
+#   ./deploy.sh images         build and push the base and pi-durable images to $REPO
 #   ./deploy.sh url play|scale
 #   ./deploy.sh down play|scale
+#
+# SECRET is the Secret Manager secret that holds the model key.
 set -euo pipefail
 cd "$(dirname "$0")"
 
-PROJECT=${PROJECT:-daniel-junk}
+PROJECT=${PROJECT:-$(gcloud config get project)}
 REGION=${REGION:-us-west1}
+REPO=${REPO:-us-central1-docker.pkg.dev/daniel-junk/ate-node}
+IMAGE=${IMAGE:-$REPO/pi-durable:latest}
 # Each shape has its own bucket, so neither places actors on the other's workers.
 BUCKET=${BUCKET:-ate-node-$PROJECT}
 [[ ${1:-} == scale || ${2:-} == scale ]] && BUCKET=${SCALE_BUCKET:-ate-node-scale-$PROJECT}
-REPO=${REPO:-us-central1-docker.pkg.dev/$PROJECT/cloud-run-source-deploy/ate-node}
 WORKERS=${WORKERS:-2}
 CAPACITY=${CAPACITY:-4}
-# The demo's k8s-style credentialUri, mapped to a Secret Manager secret.
-SECRET_MAP=${SECRET_MAP:-ate-secret://k8s.io/default/ate-demo-pi/llm-credentials/gemini-api-key=$PROJECT/opencode-gemini-key}
-ENV="ATE_BUCKET=$BUCKET,ATE_CAPACITY=$CAPACITY,ATE_SECRET_MAP=$SECRET_MAP"
+SECRET=${2:-}
+# demo/egress-policy.yaml names the key with substrate's k8s credentialUri; this maps it to SECRET.
+ENV="ATE_BUCKET=$BUCKET,ATE_CAPACITY=$CAPACITY,ATE_SECRET_MAP=ate-secret://k8s.io/default/ate-demo-pi/llm-credentials/gemini-api-key=$PROJECT/$SECRET"
 GC=(--project "$PROJECT" --region "$REGION" --quiet)
 
 sa() {
   echo "${SA:-$(gcloud iam service-accounts list --project "$PROJECT" --filter 'email~-compute@developer' --format 'value(email)')}"
 }
 
-digest() {
-  echo "$REPO@$(gcloud artifacts docker images describe "$REPO:latest" --format 'value(image_summary.digest)')"
-}
-
-case ${1:-} in
-setup)
+# setup creates the bucket, lets the service account use it and the secret, and builds the CLI.
+setup() {
+  : "${SECRET:?usage: ./deploy.sh $1 SECRET}"
   gcloud storage buckets describe "gs://$BUCKET" >/dev/null 2>&1 ||
     gcloud storage buckets create "gs://$BUCKET" --project "$PROJECT" --location "$REGION" --uniform-bucket-level-access
   gcloud storage buckets add-iam-policy-binding "gs://$BUCKET" --member "serviceAccount:$(sa)" --role roles/storage.objectAdmin >/dev/null
-  for s in opencode-gemini-key ai-gateway-token; do
-    gcloud secrets add-iam-policy-binding "$s" --project "$PROJECT" --member "serviceAccount:$(sa)" --role roles/secretmanager.secretAccessor >/dev/null
-  done
-  ;;
-image)
-  CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o bin/ate .
-  docker build -q --platform linux/amd64 -t "$REPO:latest" . >/dev/null
-  docker push -q "$REPO:latest" >/dev/null
-  digest
-  ;;
+  gcloud secrets add-iam-policy-binding "$SECRET" --project "$PROJECT" --member "serviceAccount:$(sa)" --role roles/secretmanager.secretAccessor >/dev/null
+  go build -o bin/ate .
+}
+
+case ${1:-} in
 play)
+  setup play
   if gcloud beta run instances describe ate-node "${GC[@]}" >/dev/null 2>&1; then
-    gcloud beta run instances update ate-node "${GC[@]}" --image "$(digest)"
-    exit
+    gcloud beta run instances update ate-node "${GC[@]}" --image "$IMAGE" --update-env-vars "ATE_ROLE=all,$ENV"
+  else
+    gcloud beta run instances create ate-node "${GC[@]}" --image "$IMAGE" --service-account "$(sa)" \
+      --sandbox-launcher --cpu 2 --memory 4Gi --port 8080 --set-env-vars "ATE_ROLE=all,$ENV"
   fi
-  gcloud beta run instances create ate-node "${GC[@]}" --image "$(digest)" --service-account "$(sa)" \
-    --sandbox-launcher --cpu 2 --memory 4Gi --port 8080 --set-env-vars "ATE_ROLE=all,$ENV"
+  echo "export ATE_URL=$("$0" url play) PATH=$PWD/bin:\$PATH"
   ;;
 scale)
-  gcloud beta run worker-pools deploy ate-node-workers "${GC[@]}" --image "$(digest)" --service-account "$(sa)" \
+  setup scale
+  gcloud beta run worker-pools deploy ate-node-workers "${GC[@]}" --image "$IMAGE" --service-account "$(sa)" \
     --sandbox-launcher --cpu 2 --memory 4Gi --instances "$WORKERS" \
     --network default --subnet default --vpc-egress private-ranges-only \
     --set-env-vars "ATE_ROLE=worker,$ENV"
   # One ingress instance, so placements of an actor collapse in one process.
-  gcloud run deploy ate-node-ingress "${GC[@]}" --image "$(digest)" --service-account "$(sa)" \
+  gcloud run deploy ate-node-ingress "${GC[@]}" --image "$IMAGE" --service-account "$(sa)" \
     --cpu 1 --memory 512Mi --max-instances 1 --concurrency 1000 --timeout 3600 --no-allow-unauthenticated \
     --network default --subnet default --vpc-egress private-ranges-only \
     --set-env-vars "ATE_ROLE=ingress,$ENV"
+  echo "export ATE_URL=$("$0" url scale) PATH=$PWD/bin:\$PATH"
+  ;;
+images)
+  docker build -q --platform linux/amd64 -t "$REPO/ate-node:latest" .
+  docker build -q --platform linux/amd64 --build-arg "BASE=$REPO/ate-node:latest" -t "$REPO/pi-durable:latest" demo/pi-durable
+  docker push -q "$REPO/ate-node:latest"
+  docker push -q "$REPO/pi-durable:latest"
   ;;
 url)
   case ${2:-} in

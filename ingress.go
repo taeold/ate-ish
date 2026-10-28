@@ -245,8 +245,8 @@ func (in *ingress) routes(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /admin/atespaces/{as}/templates/{t}", func(rw http.ResponseWriter, r *http.Request) {
 		raw, _ := io.ReadAll(r.Body)
 		var t Template
-		if err := json.Unmarshal(raw, &t); err != nil || len(t.Containers) != 1 {
-			http.Error(rw, fmt.Sprintf("a template needs exactly one container: %v", err), http.StatusBadRequest)
+		if err := json.Unmarshal(raw, &t); err != nil || len(t.Containers) != 1 || len(t.Containers[0].Command) == 0 {
+			http.Error(rw, fmt.Sprintf("a template needs exactly one container with a command: %v", err), http.StatusBadRequest)
 			return
 		}
 		_, err := b.put(r.Context(), templateKey(r.PathValue("as"), r.PathValue("t")), json.RawMessage(raw), 0)

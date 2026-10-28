@@ -1,5 +1,25 @@
 # ate-node progress
 
+## Run 2 (2026-10-28): from proof of concept to public repo
+
+Brief: single-template model, review fixes a-f, public images, BYO Gemini
+key, gate both shapes, README, publish as taeold/ate-node.
+
+- [x] 1 single-template model (commit; gated with step 2)
+- [ ] 2 review fixes a-f (commit)
+- [ ] 3 Artifact Registry repo ate-node (public), images ate-node, pi-durable
+- [ ] 4 model key: Gemini primary in README, Gateway variant under demo/
+- [ ] 5 gate: play (ate-node, us-west1) and scale + park, scale deleted
+- [ ] 6 README; PROGRESS.md to docs/
+- [ ] 7 commit as Daniel Lee, gh repo create taeold/ate-node --public
+
+Notes:
+- 2026-10-28: opencode-gemini-key still answers 401 "API key not valid"
+  (one curl to v1beta/models). Gates run on the Gateway variant.
+
+## Run 1 (2026-10-26)
+
+
 Spec: ../ate-node-SPEC.md. Region us-west1, project daniel-junk.
 
 ## Decisions

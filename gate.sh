@@ -7,8 +7,8 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 AS=${AS:-ate-demo-pi}
-TEMPLATE=${TEMPLATE:-demo/template-gateway.yaml}
-POLICY=${POLICY:-demo/egress-policy-gateway.yaml}
+TEMPLATE=${TEMPLATE:-demo/template.yaml}
+POLICY=${POLICY:-demo/egress-policy.yaml}
 : "${ATE_URL:?set ATE_URL}"
 export ATE_URL
 work=$(mktemp -d)

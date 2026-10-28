@@ -6,10 +6,10 @@ workerSelector:
     workload: pi-durable
 containers:
 - name: pi-durable
-  image: us-central1-docker.pkg.dev/daniel-junk/cloud-run-source-deploy/ate-lite-pi-durable-actor@sha256:b2b6ba2a2ba3c2a67c9fa36f8b063a02e7c40ec33b080cda27a3b858d5fe2818
+  image: us-central1-docker.pkg.dev/daniel-junk/ate-node/pi-durable:latest  # ignored: actors run from the node image
   command:
   - node
-  - /app/server.ts
+  - /actor/server.ts
   env:
   - name: PORT
     value: "8080"
@@ -32,8 +32,7 @@ resources:
     cpuMillicores: 1000
     memoryBytes: 536870912
 snapshotConfig:
-  preferredFidelity: SNAPSHOT_FIDELITY_VOLUMES
-  storageLocation: gs://ate-node-daniel-junk/
+  preferredFidelity: SNAPSHOT_FIDELITY_ROOTFS
 volumes:
 - name: workspace
   durableDir: {}

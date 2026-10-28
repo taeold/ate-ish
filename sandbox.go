@@ -12,16 +12,8 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
-
-	"github.com/google/go-containerregistry/pkg/authn"
-	"github.com/google/go-containerregistry/pkg/name"
-	v1 "github.com/google/go-containerregistry/pkg/v1"
-	"github.com/google/go-containerregistry/pkg/v1/google"
-	"github.com/google/go-containerregistry/pkg/v1/mutate"
-	"github.com/google/go-containerregistry/pkg/v1/remote"
 )
 
 const sandboxBin = "/usr/local/gcp/bin/sandbox"
@@ -41,70 +33,8 @@ func sandbox(ctx context.Context, args ...string) error {
 	return nil
 }
 
-type image struct {
-	rootfs string
-	config v1.Config
-}
-
-// images unpacks each template image once into a directory for --rootfs.
-type images struct {
-	dir      string
-	mu       sync.Mutex
-	unpacked map[string]image
-}
-
-func (im *images) get(ctx context.Context, ref string) (image, error) {
-	im.mu.Lock()
-	defer im.mu.Unlock()
-	if img, ok := im.unpacked[ref]; ok {
-		return img, nil
-	}
-	start := time.Now()
-	r, err := name.ParseReference(ref)
-	if err != nil {
-		return image{}, err
-	}
-	remoteImg, err := remote.Image(r, remote.WithContext(ctx),
-		remote.WithAuthFromKeychain(authn.NewMultiKeychain(google.Keychain, authn.DefaultKeychain)),
-		remote.WithPlatform(v1.Platform{OS: "linux", Architecture: "amd64"}))
-	if err != nil {
-		return image{}, fmt.Errorf("fetching %s: %w", ref, err)
-	}
-	digest, err := remoteImg.Digest()
-	if err != nil {
-		return image{}, err
-	}
-	cf, err := remoteImg.ConfigFile()
-	if err != nil {
-		return image{}, err
-	}
-	img := image{rootfs: filepath.Join(im.dir, digest.Hex), config: cf.Config}
-	if err := os.RemoveAll(img.rootfs); err != nil {
-		return image{}, err
-	}
-	if err := os.MkdirAll(img.rootfs, 0o755); err != nil {
-		return image{}, err
-	}
-	// mutate.Extract flattens the layers and applies whiteouts, as crane export
-	// does. GNU tar keeps owners, modes and links.
-	flat := mutate.Extract(remoteImg)
-	defer flat.Close()
-	untar := exec.CommandContext(ctx, "tar", "-x", "-p", "--numeric-owner", "-C", img.rootfs)
-	untar.Stdin = flat
-	if out, err := untar.CombinedOutput(); err != nil {
-		return image{}, fmt.Errorf("unpacking %s: %w: %s", ref, err, out)
-	}
-	slog.Info("unpacked image", "ref", ref, "ms", time.Since(start).Milliseconds())
-	im.unpacked[ref] = img
-	return img, nil
-}
-
-// Paths inside the sandbox. The ate binary is mounted at initDir and the
-// actor's host directory at actorDir.
-const (
-	initDir  = "/.ate"
-	actorDir = "/.ate-actor"
-)
+// actorDir is where the actor's host directory is mounted inside the sandbox.
+const actorDir = "/.ate-actor"
 
 // initSpec reaches init through a 0600 file in the actor directory, because
 // the launcher logs every `sandbox run` command line, -e values included.
@@ -112,7 +42,6 @@ type initSpec struct {
 	Command []string `json:"command"`
 	Env     []string `json:"env"`
 	Dirs    []string `json:"dirs"`
-	Workdir string   `json:"workdir"`
 }
 
 // runInit is pid 1 in the sandbox. It starts the actor, forwards SIGTERM,
@@ -147,7 +76,6 @@ func runInit() error {
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGTERM)
 	child := exec.Command(spec.Command[0], spec.Command[1:]...)
-	child.Dir = spec.Workdir
 	child.Stdout, child.Stderr = log, log
 	if err := child.Start(); err != nil {
 		fmt.Fprintf(log, "ate init: %v\n", err)

@@ -33,8 +33,8 @@ type worker struct {
 	addr   string
 	hostIP string // the worker's address as actors see it
 	dir    string
+	exe    string // this binary; the sandbox sees the same path, so it runs as init
 	bucket *bucket
-	images *images
 	ca     *egressCA
 	secret *secrets
 
@@ -67,24 +67,19 @@ func newWorker(ctx context.Context, b *bucket, addr string, capacity int) (*work
 	if err != nil {
 		return nil, err
 	}
-	w := &worker{
-		id: "w-" + randomHex(4), addr: addr, hostIP: env("ATE_HOST_IP", "169.254.8.1"), dir: "/tmp/ate",
-		bucket: b, images: &images{dir: "/tmp/ate/images", unpacked: map[string]image{}},
-		ca: ca, secret: &secrets{client: b.client, cache: map[string]string{}},
-		slots: make([]*hosted, capacity),
-	}
-	// The launcher refuses bind mounts from system paths, so init runs from a copy.
-	self, err := os.ReadFile("/proc/self/exe")
+	exe, err := os.Executable()
 	if err != nil {
 		return nil, err
 	}
-	for _, d := range []string{"bin", "actors", "snapshots", "images"} {
+	w := &worker{
+		id: "w-" + randomHex(4), addr: addr, hostIP: env("ATE_HOST_IP", "169.254.8.1"), dir: "/tmp/ate", exe: exe,
+		bucket: b, ca: ca, secret: &secrets{client: b.client, cache: map[string]string{}},
+		slots: make([]*hosted, capacity),
+	}
+	for _, d := range []string{"actors", "snapshots"} {
 		if err := os.MkdirAll(filepath.Join(w.dir, d), 0o755); err != nil {
 			return nil, err
 		}
-	}
-	if err := os.WriteFile(filepath.Join(w.dir, "bin", "ate"), self, 0o755); err != nil {
-		return nil, err
 	}
 	if err := w.writeLease(ctx); err != nil {
 		return nil, err
@@ -206,25 +201,17 @@ func (w *worker) boot(ctx context.Context, h *hosted, rec Actor) error {
 		return fmt.Errorf("template %s: %w", rec.Template, err)
 	}
 	c := tmpl.Containers[0]
-	img, err := w.images.get(ctx, c.Image)
-	if err != nil {
-		return err
-	}
-	pulled := time.Since(t0)
-
 	dir := filepath.Join(w.dir, "actors", h.sandbox)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	args := []string{"run", h.sandbox, "--detach", "--write", "--allow-egress", "--rootfs", img.rootfs,
+	// No --rootfs: the actor's root is this container's own filesystem, read
+	// only, under a writable overlay.
+	args := []string{"run", h.sandbox, "--detach", "--write", "--allow-egress",
 		"-p", fmt.Sprintf("%d:%d", appPort(h.slot), c.WakeupProbe.HTTPGet.Port),
-		"--mount", "type=bind,source=" + filepath.Join(w.dir, "bin") + ",destination=" + initDir,
 		"--mount", "type=bind,source=" + dir + ",destination=" + actorDir}
 
-	spec := initSpec{Workdir: img.config.WorkingDir, Command: slices.Concat(c.Command, c.Args)}
-	if len(c.Command) == 0 {
-		spec.Command = slices.Concat(img.config.Entrypoint, img.config.Cmd)
-	}
+	spec := initSpec{Command: slices.Concat(c.Command, c.Args)}
 	for _, m := range c.VolumeMounts {
 		i := slices.IndexFunc(tmpl.Volumes, func(v Volume) bool { return v.Name == m.Name })
 		if i < 0 {
@@ -250,7 +237,7 @@ func (w *worker) boot(ctx context.Context, h *hosted, rec Actor) error {
 	}
 
 	proxy := fmt.Sprintf("http://%s:%d", w.hostIP, 11000+h.slot)
-	spec.Env = slices.Concat([]string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}, img.config.Env)
+	spec.Env = []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
 	for _, e := range c.Env {
 		spec.Env = append(spec.Env, e.Name+"="+e.Value)
 	}
@@ -274,10 +261,11 @@ func (w *worker) boot(ctx context.Context, h *hosted, rec Actor) error {
 	downloaded := time.Since(t0)
 
 	p := &egressProxy{actor: h.key(), policy: rec.EgressPolicy, ca: w.ca, secrets: w.secret}
+	var err error
 	if h.egress, err = p.listen(fmt.Sprintf("%s:%d", w.hostIP, 11000+h.slot)); err != nil {
 		return err
 	}
-	if err := sandbox(ctx, append(args, "--", initDir+"/ate", "init")...); err != nil {
+	if err := sandbox(ctx, append(args, "--", w.exe, "init")...); err != nil {
 		h.egress.Close()
 		return err
 	}
@@ -287,7 +275,7 @@ func (w *worker) boot(ctx context.Context, h *hosted, rec Actor) error {
 		return err
 	}
 	slog.Info("actor started", "actor", h.key(), "generation", h.gen, "sandbox", h.sandbox, "slot", h.slot,
-		"image_ms", pulled.Milliseconds(), "snapshot_ms", (downloaded - pulled).Milliseconds(),
+		"snapshot_ms", downloaded.Milliseconds(),
 		"boot_ms", (time.Since(t0) - downloaded).Milliseconds(), "restored", slices.Contains(args, "--import-tar"))
 	return nil
 }
@@ -339,7 +327,7 @@ func (w *worker) suspend(ctx context.Context, key string) error {
 
 	dir := filepath.Join(w.dir, "actors", h.sandbox)
 	tar := filepath.Join(w.dir, "snapshots", h.sandbox+".tar")
-	err := sandbox(ctx, "exec", h.sandbox, "--", initDir+"/ate", "stop")
+	err := sandbox(ctx, "exec", h.sandbox, "--", w.exe, "stop")
 	if err == nil {
 		err = waitExit(dir, 8*time.Second)
 	}

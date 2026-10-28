@@ -6,10 +6,11 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 AS=${AS:-park}
+TEMPLATE=${TEMPLATE:-demo/template.yaml}
 : "${ATE_URL:?set ATE_URL}"
 export ATE_URL
 TOKEN=$(gcloud auth print-identity-token)
-sed "s|atespace: ate-demo-pi|atespace: $AS|" demo/template-gateway.yaml > "/tmp/$AS-template.yaml"
+sed "s|atespace: ate-demo-pi|atespace: $AS|" "$TEMPLATE" > "/tmp/$AS-template.yaml"
 
 # wake ACTOR: one GET /readyz through the ingress.
 wake() {
