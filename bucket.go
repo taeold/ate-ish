@@ -22,7 +22,7 @@ var (
 	errRateLimited = errors.New("rate limited")
 )
 
-// bucket is the GCS JSON API, the few calls ate-node needs. Every record is a
+// bucket is the GCS JSON API, the few calls ate-ish needs. Every record is a
 // JSON object written with ifGenerationMatch; generation 0 means "must not exist".
 type bucket struct {
 	name   string

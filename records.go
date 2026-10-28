@@ -42,7 +42,7 @@ func (l *Lease) live() bool { return l != nil && time.Now().Before(l.Expires) }
 // hosts says whether the worker's live lease lists the actor ("as/name").
 func (l *Lease) hosts(key string) bool { return l.live() && slices.Contains(l.Hosted, key) }
 
-// Template is the part of substrate's ActorTemplate that ate-node reads.
+// Template is the part of substrate's ActorTemplate that ate-ish reads.
 // Other fields are stored and ignored.
 type Template struct {
 	Metadata struct {

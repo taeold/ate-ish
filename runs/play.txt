@@ -1,100 +1,101 @@
 $ ate create atespace ate-demo-pi
   create atespace: {"name":"ate-demo-pi"}
-  [955 ms]
-$ ate create actor-template -f template.yaml
+  [1020 ms]
+$ ate create actor-template -f /tmp/tmp.aROrwKmJH4/template.yaml
   create actor-template: {"atespace":"ate-demo-pi","name":"pi-durable-data"}
-  [938 ms]
+  [1071 ms]
 $ ate create actor demo-agent --template pi-durable-data -a ate-demo-pi
   ATESPACE      NAME         TEMPLATE          STATE       WORKER   GENERATION   EGRESS POLICY   AGE
   ate-demo-pi   demo-agent   pi-durable-data   suspended   <none>   0            false           0s
-  [987 ms]
+  [1075 ms]
 $ ate create egress-policy demo-agent -a ate-demo-pi -f demo/egress-policy-gateway.yaml
   create egress-policy: {"rules":[{"https":{"hostnames":["ai-gateway.vercel.sh"],"effects":{"replaceHeaders":[{"header":"x-api-key","credentialUri":"ate-secret://secretmanager.googleapis.com/daniel-junk/ai-gateway-token"}]}}}]}
-  [1186 ms]
+  [1118 ms]
 $ curl -X POST $ATE_URL/submit -H 'ate-target-actor: ate-demo-pi/demo-agent' -d '{"prompt": "Create app.js with add(a, b) and a test.js that verifies it."}'
   settled: {"conversationId":1,"type":"input","status":"done","entry":7,"id":8,"answer":17}
   messages: 6, user prompts: ["Create app.js with add(a, b) and a test.js that verifies it."]
   tool results: ["Successfully wrote to app.js","Successfully wrote to test.js"]
   last answer: Perfect! I've created both files:
 
-**app.js** - Contains the `add(a, b)` function that returns the sum of two numbers.
+**app.js** - Contains a simple `add(a, b)` function that takes two numbers and returns their sum.
 
-**test.js** - Contains comprehensive tests that verify the `add()` function with various test cases including:
-- Positive numbers
-- Zeros
-- Negative numbers
-- Mixed positive and ne
-  ingress: ate-parked-ms: 0 ate-resume-ms: 9768 ate-worker: w-bb302aae 
-  [15819 ms]
+**test.js** - Imports the `add` function and runs 5 test cases to verify it works correctly:
+- `add(2, 3)` → 5
+- `add(-1, 1)` → 0
+- `add(10, -5)` → 5
+- `add(0, 0)` → 
+  ingress: ate-parked-ms: 0 ate-resume-ms: 2971 ate-worker: w-e742006e 
+  [9305 ms]
 $ ate suspend actor demo-agent -a ate-demo-pi
   ATESPACE      NAME         TEMPLATE          STATE       WORKER   GENERATION   EGRESS POLICY   AGE
-  ate-demo-pi   demo-agent   pi-durable-data   suspended   <none>   1            true            19s
-  [1628 ms]
+  ate-demo-pi   demo-agent   pi-durable-data   suspended   <none>   1            true            12s
+  [1620 ms]
 $ ate create tag checkpoint-v1 --actor demo-agent -a ate-demo-pi
   create tag: {"actor":"demo-agent","name":"checkpoint-v1"}
-  [953 ms]
+  [1162 ms]
 $ ate create actor demo-agent-fork --template pi-durable-data --tag checkpoint-v1 -a ate-demo-pi
   ATESPACE      NAME              TEMPLATE          STATE       WORKER   GENERATION   EGRESS POLICY   AGE
   ate-demo-pi   demo-agent-fork   pi-durable-data   suspended   <none>   0            false           0s
-  [1072 ms]
+  [1109 ms]
 $ ate create egress-policy demo-agent-fork -a ate-demo-pi -f demo/egress-policy-gateway.yaml
   create egress-policy: {"rules":[{"https":{"hostnames":["ai-gateway.vercel.sh"],"effects":{"replaceHeaders":[{"header":"x-api-key","credentialUri":"ate-secret://secretmanager.googleapis.com/daniel-junk/ai-gateway-token"}]}}}]}
-  [960 ms]
+  [1131 ms]
 $ curl -X POST $ATE_URL/submit -H 'ate-target-actor: ate-demo-pi/demo-agent' -d '{"prompt": "Add multiply(a, b) and structured logging to app.js."}'
-  settled: {"conversationId":1,"type":"input","status":"done","entry":18,"id":19,"answer":31}
-  messages: 13, user prompts: ["Create app.js with add(a, b) and a test.js that verifies it.","Add multiply(a, b) and structured logging to app.js."]
-  tool results: ["Successfully replaced 1 block(s) in test.js.","Successfully replaced 1 block(s) in test.js."]
-  last answer: Perfect! I've updated both files:
+  settled: {"conversationId":1,"type":"input","status":"done","entry":18,"id":19,"answer":29}
+  messages: 12, user prompts: ["Create app.js with add(a, b) and a test.js that verifies it.","Add multiply(a, b) and structured logging to app.js."]
+  tool results: ["Successfully replaced 1 block(s) in app.js.","Successfully replaced 1 block(s) in test.js."]
+  last answer: Done! I've updated both files:
 
 **app.js** now includes:
-- `multiply(a, b)` function that returns the product of two numbers
-- Structured logging utility that outputs JSON logs with:
-  - ISO timestamp
-  - Log level (INFO)
-  - Message
-  - Data (function parameters and results)
-- Both `add()` and `
-  ingress: ate-parked-ms: 0 ate-resume-ms: 1720 ate-worker: w-bb302aae 
-  [14728 ms]
+- A structured logging utility with `info()` and `error()` methods that output JSON formatted logs
+- The original `add(a, b)` function with logging
+- A new `multiply(a, b)` function with logging
+- Exports both functions and the logger
+
+**test.
+  ingress: ate-parked-ms: 0 ate-resume-ms: 937 ate-worker: w-e742006e 
+  [12314 ms]
 $ curl -X POST $ATE_URL/submit -H 'ate-target-actor: ate-demo-pi/demo-agent-fork' -d '{"prompt": "Add divide(a, b) and edge-case tests to test.js."}'
   settled: {"conversationId":1,"type":"input","status":"done","entry":18,"id":19,"answer":27}
   messages: 11, user prompts: ["Create app.js with add(a, b) and a test.js that verifies it.","Add divide(a, b) and edge-case tests to test.js."]
   tool results: ["Successfully replaced 1 block(s) in app.js.","Successfully replaced 1 block(s) in test.js."]
-  last answer: Perfect! I've updated both files:
+  last answer: Done! I've updated both files:
 
-**app.js** - Now exports both `add()` and `divide()` functions. The `divide()` function includes error handling for division by zero.
+**app.js** - Now exports both `add` and `divide` functions. The `divide` function throws an error when dividing by zero.
 
 **test.js** - Now includes:
-- All original `add()` tests
-- Comprehensive `divide()` tests including edge cases:
-  - Regular divisi
-  ingress: ate-parked-ms: 0 ate-resume-ms: 1464 ate-worker: w-bb302aae 
-  [13342 ms]
+- Original 5 `add()` tests
+- 4 basic `divide()` tests (10/2, 7/2, -10/2, 0/5)
+- 5 edge-case tests for `divide()`:
+  - 
+  ingress: ate-parked-ms: 0 ate-resume-ms: 989 ate-worker: w-e742006e 
+  [13397 ms]
 $ curl -X POST $ATE_URL/submit -H 'ate-target-actor: ate-demo-pi/demo-agent-fork' -d '{"prompt": "Run this exact command with the bash tool and reply with its output only: node -e "fetch('https://example.com').then(r => console.log('status', r.status), e => console.log('failed:', e.cause?.message || e.message))""}'
   settled: {"conversationId":1,"type":"input","status":"done","entry":28,"id":29,"answer":35}
   messages: 15, user prompts: ["Create app.js with add(a, b) and a test.js that verifies it.","Add divide(a, b) and edge-case tests to test.js.","Run this exact command with the bash tool and reply with its output only: node -e \"fetch('https://example.com').then(r => console.log('status', r.status), e => console.log('failed:', e.cause?.message || e.message))\""]
   tool results: ["Successfully replaced 1 block(s) in test.js.","failed: Request was cancelled.\n"]
   last answer: failed: Request was cancelled.
-  ingress: ate-parked-ms: 0 ate-resume-ms: 73 ate-worker: w-bb302aae 
-  [3148 ms]
+  ingress: ate-parked-ms: 0 ate-resume-ms: 77 ate-worker: w-e742006e 
+  [2965 ms]
+  ok: through the proxy, example.com is refused: failed: Request was cancelled.
 $ curl -X POST $ATE_URL/submit -H 'ate-target-actor: ate-demo-pi/demo-agent-fork' -d '{"prompt": "Run this exact command with the bash tool and reply with its output only: NODE_USE_ENV_PROXY=0 node -e "fetch('https://example.com').then(r => console.log('status', r.status), e => console.log('failed:', e.cause?.message || e.message))""}'
   settled: {"conversationId":1,"type":"input","status":"done","entry":36,"id":37,"answer":43}
   messages: 19, user prompts: ["Create app.js with add(a, b) and a test.js that verifies it.","Add divide(a, b) and edge-case tests to test.js.","Run this exact command with the bash tool and reply with its output only: node -e \"fetch('https://example.com').then(r => console.log('status', r.status), e => console.log('failed:', e.cause?.message || e.message))\"","Run this exact command with the bash tool and reply with its output only: NODE_USE_ENV_PROXY=0 node -e \"fetch('https://example.com').then(r => console.log('status', r.status), e => console.log('failed:', e.cause?.message || e.message))\""]
   tool results: ["failed: Request was cancelled.\n","status 200\n"]
   last answer: status 200
-  ingress: ate-parked-ms: 0 ate-resume-ms: 54 ate-worker: w-bb302aae 
-  [6245 ms]
+  ingress: ate-parked-ms: 0 ate-resume-ms: 47 ate-worker: w-e742006e 
+  [5971 ms]
+  ok: without the proxy, example.com answers: status 200
 $ ate get actors -a ate-demo-pi
   ATESPACE      NAME              TEMPLATE          STATE     WORKER       GENERATION   EGRESS POLICY   AGE
-  ate-demo-pi   demo-agent-fork   pi-durable-data   running   w-bb302aae   1            true            40s
-  ate-demo-pi   demo-agent        pi-durable-data   running   w-bb302aae   2            true            1m0s
-  [1026 ms]
+  ate-demo-pi   demo-agent-fork   pi-durable-data   running   w-e742006e   1            true            37s
+  ate-demo-pi   demo-agent        pi-durable-data   running   w-e742006e   2            true            51s
+  [1050 ms]
 $ ate get tags -a ate-demo-pi
   ATESPACE      NAME
   ate-demo-pi   checkpoint-v1
-  [920 ms]
+  [952 ms]
 $ ate get workers
   ID           ADDR             ACTORS   LEASE   HOSTED
-  w-bb302aae   127.0.0.1:8080   2/4      live    ate-demo-pi/demo-agent,ate-demo-pi/demo-agent-fork
-  [1183 ms]
-play exit 0
+  w-e742006e   127.0.0.1:8080   2/4      live    ate-demo-pi/demo-agent,ate-demo-pi/demo-agent-fork
+  [974 ms]

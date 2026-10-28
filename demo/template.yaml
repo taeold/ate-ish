@@ -6,7 +6,7 @@ workerSelector:
     workload: pi-durable
 containers:
 - name: pi-durable
-  image: us-central1-docker.pkg.dev/daniel-junk/ate-node/pi-durable:latest  # ignored: actors run from the node image
+  image: us-central1-docker.pkg.dev/daniel-junk/ate-ish/pi-durable:latest  # ignored: actors run from the node image
   command:
   - node
   - /actor/server.ts

@@ -1,19 +1,19 @@
 create atespace: {"name":"park"}
 create actor-template: {"atespace":"park","name":"pi-durable-data"}
 == p1..p8 at once fill the 8 slots
-p1 http=200 10.493970s ate-parked-ms: 0 ate-resume-ms: 10308 ate-worker: w-127d32fc 
-p3 http=200 10.516380s ate-parked-ms: 0 ate-resume-ms: 10356 ate-worker: w-127d32fc 
-p2 http=200 10.500961s ate-parked-ms: 0 ate-resume-ms: 10338 ate-worker: w-127d32fc 
-p8 http=200 10.510216s ate-parked-ms: 0 ate-resume-ms: 10349 ate-worker: w-943163f8 
-p5 http=200 10.505823s ate-parked-ms: 0 ate-resume-ms: 10333 ate-worker: w-943163f8 
-p6 http=200 10.505597s ate-parked-ms: 0 ate-resume-ms: 10338 ate-worker: w-943163f8 
-p4 http=200 10.570353s ate-parked-ms: 0 ate-resume-ms: 10403 ate-worker: w-943163f8 
-p7 http=200 10.600029s ate-parked-ms: 0 ate-resume-ms: 10434 ate-worker: w-127d32fc 
+p4 http=200 1.632855s ate-parked-ms: 0 ate-resume-ms: 1425 ate-worker: w-43e1e8bb 
+p3 http=200 1.643223s ate-parked-ms: 0 ate-resume-ms: 1436 ate-worker: w-43e1e8bb 
+p1 http=200 2.854426s ate-parked-ms: 0 ate-resume-ms: 2681 ate-worker: w-42db59ba 
+p6 http=200 2.857348s ate-parked-ms: 0 ate-resume-ms: 2729 ate-worker: w-42db59ba 
+p5 http=200 2.854662s ate-parked-ms: 0 ate-resume-ms: 2724 ate-worker: w-42db59ba 
+p8 http=200 2.852718s ate-parked-ms: 0 ate-resume-ms: 2663 ate-worker: w-42db59ba 
+p7 http=200 4.336533s ate-parked-ms: 0 ate-resume-ms: 1466 ate-worker: w-43e1e8bb 
+p2 http=200 4.389007s ate-parked-ms: 0 ate-resume-ms: 1516 ate-worker: w-43e1e8bb 
 ID           ADDR               ACTORS   LEASE   HOSTED
-w-127d32fc   10.138.0.27:8080   4/4      live    park/p1,park/p2,park/p3,park/p7
-w-943163f8   10.138.0.26:8080   4/4      live    park/p4,park/p5,park/p6,park/p8
+w-42db59ba   10.138.0.21:8080   4/4      live    park/p1,park/p5,park/p6,park/p8
+w-43e1e8bb   10.138.0.20:8080   4/4      live    park/p2,park/p3,park/p4,park/p7
 == p9 parks; p1 is suspended 2 s into the wait
 suspended p1
-p9 http=200 5.606154s ate-parked-ms: 4313 ate-resume-ms: 5525 ate-worker: w-127d32fc 
+p9 http=200 5.180755s ate-parked-ms: 3890 ate-resume-ms: 5102 ate-worker: w-42db59ba 
 == p10 parks and nothing frees a slot
-p10 http=503 5.393748s 
+p10 http=503 5.474083s 

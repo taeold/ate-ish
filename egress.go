@@ -102,7 +102,7 @@ func (p *egressProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	headers, ok := p.allowed(host)
 	slog.Info("egress", "actor", p.actor, "remote", r.RemoteAddr, "method", r.Method, "host", host, "allowed", ok)
 	if !ok || r.Method != http.MethodConnect {
-		http.Error(w, "ate-node egress: "+host+" is not in the egress policy of "+p.actor, http.StatusForbidden)
+		http.Error(w, "ate-ish egress: "+host+" is not in the egress policy of "+p.actor, http.StatusForbidden)
 		return
 	}
 	conn, _, err := http.NewResponseController(w).Hijack()

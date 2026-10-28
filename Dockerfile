@@ -1,4 +1,4 @@
-# The ate-node base image: the ate binary on Debian. Actor images build FROM it.
+# The ate-ish base image: the ate binary on Debian. Actor images build FROM it.
 FROM golang:1.27-trixie AS build
 WORKDIR /src
 COPY go.mod go.sum ./

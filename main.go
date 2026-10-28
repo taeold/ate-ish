@@ -1,4 +1,4 @@
-// ate-node is a small Agent Substrate for Cloud Run: one program, one bucket.
+// ate-ish is a small Agent Substrate for Cloud Run: one program, one bucket.
 //
 //	ate serve   the server; ATE_ROLE=all|ingress|worker
 //	ate init    pid 1 inside an actor's sandbox
@@ -83,7 +83,7 @@ func serve() error {
 		// Actors run with egress allowed, so they can reach this port too.
 		if ip, _, _ := net.SplitHostPort(r.RemoteAddr); actorNet.Contains(net.ParseIP(ip)) {
 			slog.Warn("refused a request from an actor", "remote", r.RemoteAddr, "path", r.URL.Path)
-			http.Error(rw, "actors cannot call ate-node", http.StatusForbidden)
+			http.Error(rw, "actors cannot call ate-ish", http.StatusForbidden)
 			return
 		}
 		if in != nil && r.Header.Get("ate-target-actor") != "" {

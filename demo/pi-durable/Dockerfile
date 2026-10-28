@@ -1,5 +1,5 @@
-# The pi-durable agent as an ate-node image: the node image is the actor.
-ARG BASE=us-central1-docker.pkg.dev/daniel-junk/ate-node/ate-node:latest
+# The pi-durable agent as an ate-ish image: the node image is the actor.
+ARG BASE=us-central1-docker.pkg.dev/daniel-junk/ate-ish/ate-ish:latest
 
 FROM node:24-slim AS agent
 WORKDIR /actor

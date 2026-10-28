@@ -22,9 +22,36 @@ key, gate both shapes, README, publish as taeold/ate-node.
   e real: a resume for a hosted copy waits for it, then refuses 503 if
     stopping, 409 if the record no longer names it (and stops that copy).
   f real: gate.sh asserts both fetch results from the bash tool output.
-- [ ] 3 Artifact Registry repo ate-node (public), images ate-node, pi-durable
-- [ ] 4 model key: Gemini primary in README, Gateway variant under demo/
-- [ ] 5 gate: play (ate-node, us-west1) and scale + park, scale deleted
+- [x] 3 images. Renamed mid-run to ate-ish (coordinator): public repo
+  us-central1-docker.pkg.dev/daniel-junk/ate-ish (allUsers reader), images
+  ate-ish@sha256:bb25d41b6733... and pi-durable@sha256:92dd34fed7d5...;
+  anonymous manifest GETs answer 200. The first repo, ate-node, is deleted.
+- [x] 4 model key: Gemini primary (demo/template.yaml), Gateway variant
+  (demo/template-gateway.yaml) in the same pi-durable image; gates on Gateway
+- [x] 5 gate: play (ate-node, us-west1) and scale + park, scale deleted.
+  Final runs on pi-durable@sha256:92dd34fed7d5: runs/play.txt, runs/scale.txt,
+  runs/park.txt, all exit 0. Scale: turn 1 on w-42db59ba, the fork restored
+  on w-43e1e8bb. Park: p1..p8 200 in 1.6 to 4.4 s (p2 and p7 reached the
+  ingress 2.7 s after the other six per the Cloud Run request log, then
+  placed in 1.5 s); p9 parked 3.9 s, 200 at 5.2 s; p10 503 at 5.5 s.
+  Boot: first sandbox on a fresh container 2.6 s (n=3, 2635/2641 ms, and
+  2.97 s resume on play); later boots alone 0.74 to 0.95 s (n=6); four at
+  once on one worker 2.33 to 2.36 s (n=4); suspend 0.46 to 0.55 s (n=8);
+  snapshots 122 to 164 KB. Worker pool, ingress service and
+  gs://ate-node-scale-daniel-junk deleted. Instance ate-node left running.
+  play: green (runs/play.txt). Found: the instance had been stopped
+  (StopInstance by taeold@gmail.com, 2026-10-27). `instances update --image`
+  on a stopped instance changes the spec but does not import the image, and
+  `start` then runs the last imported one (old code answered the probe
+  template with no command). An update while running imported it (92 s).
+  The first gate run on the old code is discarded; old atespaces moved to
+  gs://ate-node-daniel-junk/archive/2026-10-28/.
+  Live: b (create --tag on an existing actor: 409, its snapshot generation
+  and md5 unchanged); d (record set to running on the live worker that did
+  not host it: the request placed it on that worker, 200 in 3.5 s,
+  generation 2 to 3).
+  Boot (sandbox run to wakeup probe) 741 to 747 ms, n=3; first-request
+  resume at the ingress 1018 to 1128 ms, n=3; suspend 463 to 482 ms.
 - [ ] 6 README; PROGRESS.md to docs/
 - [ ] 7 commit as Daniel Lee, gh repo create taeold/ate-node --public
 

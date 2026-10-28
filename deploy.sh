@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Deploys ate-node.
+# Deploys ate-ish.
 #
 #   ./deploy.sh play SECRET    one Cloud Run instance, ATE_ROLE=all
 #   ./deploy.sh scale SECRET   ingress service + worker pool, over Direct VPC
@@ -13,7 +13,7 @@ cd "$(dirname "$0")"
 
 PROJECT=${PROJECT:-$(gcloud config get project)}
 REGION=${REGION:-us-west1}
-REPO=${REPO:-us-central1-docker.pkg.dev/daniel-junk/ate-node}
+REPO=${REPO:-us-central1-docker.pkg.dev/daniel-junk/ate-ish}
 IMAGE=${IMAGE:-$REPO/pi-durable:latest}
 # Each shape has its own bucket, so neither places actors on the other's workers.
 BUCKET=${BUCKET:-ate-node-$PROJECT}
@@ -64,9 +64,9 @@ scale)
   echo "export ATE_URL=$("$0" url scale) PATH=$PWD/bin:\$PATH"
   ;;
 images)
-  docker build -q --platform linux/amd64 -t "$REPO/ate-node:latest" .
-  docker build -q --platform linux/amd64 --build-arg "BASE=$REPO/ate-node:latest" -t "$REPO/pi-durable:latest" demo/pi-durable
-  docker push -q "$REPO/ate-node:latest"
+  docker build -q --platform linux/amd64 -t "$REPO/ate-ish:latest" .
+  docker build -q --platform linux/amd64 --build-arg "BASE=$REPO/ate-ish:latest" -t "$REPO/pi-durable:latest" demo/pi-durable
+  docker push -q "$REPO/ate-ish:latest"
   docker push -q "$REPO/pi-durable:latest"
   ;;
 url)

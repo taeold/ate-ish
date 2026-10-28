@@ -1,4 +1,4 @@
-module github.com/taeold/ate-node
+module github.com/taeold/ate-ish
 
 go 1.27.1
 
