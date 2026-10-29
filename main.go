@@ -1,9 +1,9 @@
 // ate-ish is a small Agent Substrate for Cloud Run: one program, one bucket.
 //
-//	ate serve   the server; ATE_ROLE=all|ingress|worker
-//	ate init    pid 1 inside an actor's sandbox
-//	ate stop    sends SIGTERM to pid 1 inside the sandbox
-//	ate ...     the CLI (create, get, suspend, delete)
+//	ate-ish serve   the server; ATE_ROLE=all|ingress|worker
+//	ate-ish init    pid 1 inside an actor's sandbox
+//	ate-ish stop    sends SIGTERM to pid 1 inside the sandbox
+//	ate-ish ...     the CLI (create, get, suspend, delete)
 package main
 
 import (
@@ -37,7 +37,7 @@ func main() {
 		err = runCLI(os.Args[1:])
 	}
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "ate:", err)
+		fmt.Fprintln(os.Stderr, "ate-ish:", err)
 		os.Exit(1)
 	}
 }

@@ -17,11 +17,11 @@ sed "s|atespace: ate-demo-pi|atespace: $AS|" "$TEMPLATE" > "$work/template.yaml"
 
 ms() { echo $(( ($(date +%s%N) - $1) / 1000000 )); }
 
-ate() {
-  echo "\$ ate $*"
+ate-ish() {
+  echo "\$ ate-ish $*"
   local t0
   t0=$(date +%s%N)
-  bin/ate "$@" | sed 's/^/  /'
+  bin/ate-ish "$@" | sed 's/^/  /'
   echo "  [$(ms "$t0") ms]"
 }
 
@@ -50,16 +50,16 @@ turn() {
   echo "  [$took ms]"
 }
 
-ate create atespace "$AS"
-ate create actor-template -f "$work/template.yaml"
-ate create actor demo-agent --template pi-durable-data -a "$AS"
-ate create egress-policy demo-agent -a "$AS" -f "$POLICY"
+ate-ish create atespace "$AS"
+ate-ish create actor-template -f "$work/template.yaml"
+ate-ish create actor demo-agent --template pi-durable-data -a "$AS"
+ate-ish create egress-policy demo-agent -a "$AS" -f "$POLICY"
 turn demo-agent "Create app.js with add(a, b) and a test.js that verifies it."
 
-ate suspend actor demo-agent -a "$AS"
-ate create tag checkpoint-v1 --actor demo-agent -a "$AS"
-ate create actor demo-agent-fork --template pi-durable-data --tag checkpoint-v1 -a "$AS"
-ate create egress-policy demo-agent-fork -a "$AS" -f "$POLICY"
+ate-ish suspend actor demo-agent -a "$AS"
+ate-ish create tag checkpoint-v1 --actor demo-agent -a "$AS"
+ate-ish create actor demo-agent-fork --template pi-durable-data --tag checkpoint-v1 -a "$AS"
+ate-ish create egress-policy demo-agent-fork -a "$AS" -f "$POLICY"
 
 turn demo-agent "Add multiply(a, b) and structured logging to app.js."
 turn demo-agent-fork "Add divide(a, b) and edge-case tests to test.js."
@@ -83,6 +83,6 @@ expect '^failed:' "through the proxy, example.com is refused"
 turn demo-agent-fork "Run this exact command with the bash tool and reply with its output only: NODE_USE_ENV_PROXY=0 $fetch"
 expect '^status 200' "without the proxy, example.com answers"
 
-ate get actors -a "$AS"
-ate get tags -a "$AS"
-ate get workers
+ate-ish get actors -a "$AS"
+ate-ish get tags -a "$AS"
+ate-ish get workers

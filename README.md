@@ -6,7 +6,7 @@ ate-ish is a small [Agent Substrate](https://github.com/agent-substrate/substrat
 ./deploy.sh play gemini-api-key
 ```
 
-Run it from a clone of this repository. The command creates the bucket `gs://ate-node-$PROJECT`, gives the default compute service account access to the bucket and to the secret, builds the `ate` CLI into `bin/`, and creates the Cloud Run instance `ate-node` from the public image `us-central1-docker.pkg.dev/daniel-junk/ate-ish/pi-durable:latest`. It prints the `export` line for `ATE_URL` and `PATH`.
+Run it from a clone of this repository. The command creates the bucket `gs://ate-node-$PROJECT`, gives the default compute service account access to the bucket and to the secret, builds the `ate-ish` CLI into `bin/`, and creates the Cloud Run instance `ate-node` from the public image `us-central1-docker.pkg.dev/daniel-junk/ate-ish/pi-durable:latest`. It prints the `export` line for `ATE_URL` and `PATH`.
 
 Before you run it:
 
@@ -17,7 +17,7 @@ Before you run it:
 
 ## The pi-durable walkthrough
 
-This is the README of [pi-durable-substrate](https://github.com/taeold/pi-durable-substrate) with `kubectl ate` replaced by `ate` and the kind cluster replaced by the instance from the quickstart. `./gate.sh` runs every step and fails if a turn or the egress check fails.
+This is the README of [pi-durable-substrate](https://github.com/taeold/pi-durable-substrate) with `kubectl ate X` replaced by `ate-ish X` and the kind cluster replaced by the instance from the quickstart. `./gate.sh` runs every step and fails if a turn or the egress check fails.
 
 The outputs below are from `runs/play.txt`. That run used the Vercel AI Gateway variant (see [Use Vercel AI Gateway instead](#use-vercel-ai-gateway-instead)), because the Gemini key in the test project is revoked. The Gemini path has not run on ate-ish.
 
@@ -25,7 +25,7 @@ The outputs below are from `runs/play.txt`. That run used the Vercel AI Gateway 
 
 `pi-durable` runs the coding agent loop and writes every conversation turn and tool checkpoint to a SQLite database at `/workspace/.pi/agent.sqlite`. ate-ish runs each agent as an actor in its own Cloud Run sandbox.
 
-1. **Suspend and auto-resume.** `ate suspend actor` sends `SIGTERM` to the agent, waits for it to exit, tars the sandbox's writable layer with `sandbox tar`, and uploads the tar to the bucket as the actor's snapshot. When the next request arrives for that actor, the ingress asks a worker with a free slot to resume it. The worker starts a sandbox with `--import-tar` and waits for the wakeup probe before the ingress forwards the request.
+1. **Suspend and auto-resume.** `ate-ish suspend actor` sends `SIGTERM` to the agent, waits for it to exit, tars the sandbox's writable layer with `sandbox tar`, and uploads the tar to the bucket as the actor's snapshot. When the next request arrives for that actor, the ingress asks a worker with a free slot to resume it. The worker starts a sandbox with `--import-tar` and waits for the wakeup probe before the ingress forwards the request.
 2. **Checkpoint and fork.** A tag is a copy of a suspended actor's snapshot. An actor created with `--tag` starts from a copy of the tag. Both actors start from the same history and files, then diverge.
 3. **Egress credential injection.** The sandbox runs with a placeholder `GEMINI_API_KEY`. Each actor's `HTTPS_PROXY` points at its own proxy in the worker. For `generativelanguage.googleapis.com`, the proxy replaces `x-goog-api-key` with the secret, so the key never enters the sandbox or its snapshots. `ATE_SECRET_MAP` maps the policy's `ate-secret://k8s.io/...` URI to the secret you passed to `deploy.sh`.
 
@@ -43,10 +43,10 @@ workers/<id>.json                      lease: {addr, capacity, hosted, expires}
 ### 1. Create the atespace, template and actor
 
 ```bash
-ate create atespace ate-demo-pi
-ate create actor-template -f demo/template.yaml
-ate create actor demo-agent --template pi-durable-data -a ate-demo-pi
-ate create egress-policy demo-agent -a ate-demo-pi -f demo/egress-policy.yaml
+ate-ish create atespace ate-demo-pi
+ate-ish create actor-template -f demo/template.yaml
+ate-ish create actor demo-agent --template pi-durable-data -a ate-demo-pi
+ate-ish create egress-policy demo-agent -a ate-demo-pi -f demo/egress-policy.yaml
 ```
 
 ```
@@ -77,10 +77,10 @@ The first request for a suspended actor places it on a worker and starts it. The
 ### 3. Suspend, tag a checkpoint, and fork
 
 ```bash
-ate suspend actor demo-agent -a ate-demo-pi
-ate create tag checkpoint-v1 --actor demo-agent -a ate-demo-pi
-ate create actor demo-agent-fork --template pi-durable-data --tag checkpoint-v1 -a ate-demo-pi
-ate create egress-policy demo-agent-fork -a ate-demo-pi -f demo/egress-policy.yaml
+ate-ish suspend actor demo-agent -a ate-demo-pi
+ate-ish create tag checkpoint-v1 --actor demo-agent -a ate-demo-pi
+ate-ish create actor demo-agent-fork --template pi-durable-data --tag checkpoint-v1 -a ate-demo-pi
+ate-ish create egress-policy demo-agent-fork -a ate-demo-pi -f demo/egress-policy.yaml
 ```
 
 ### 4. Send divergent prompts to both branches
@@ -128,7 +128,7 @@ FROM us-central1-docker.pkg.dev/daniel-junk/ate-ish/ate-ish:latest
 COPY . /actor
 ```
 
-The base image is Debian trixie-slim with `ca-certificates` and `/usr/local/bin/ate`. Add the runtime your command needs. `demo/pi-durable/Dockerfile` copies `node` from `node:24-slim`.
+The base image is Debian trixie-slim with `ca-certificates` and `/usr/local/bin/ate-ish`. Add the runtime your command needs. `demo/pi-durable/Dockerfile` copies `node` from `node:24-slim`.
 
 ate-ish reads these fields of `template.yaml`: `command`, `args`, `env`, `wakeupProbe`, `volumeMounts` and `volumes` (`durableDir` and the `systemInfo` trust bundle). It stores the other fields and ignores them. The `image` field is accepted and ignored.
 
@@ -136,11 +136,11 @@ To start from an image you already have, add the binary and the entrypoint. The 
 
 ```Dockerfile
 FROM <your image>
-COPY --from=us-central1-docker.pkg.dev/daniel-junk/ate-ish/ate-ish:latest /usr/local/bin/ate /usr/local/bin/ate
-ENTRYPOINT ["/usr/local/bin/ate", "serve"]
+COPY --from=us-central1-docker.pkg.dev/daniel-junk/ate-ish/ate-ish:latest /usr/local/bin/ate-ish /usr/local/bin/ate-ish
+ENTRYPOINT ["/usr/local/bin/ate-ish", "serve"]
 ```
 
-Deploy your image with `IMAGE=<your image> ./deploy.sh play <secret>`, then run `ate create actor-template -f template.yaml`.
+Deploy your image with `IMAGE=<your image> ./deploy.sh play <secret>`, then run `ate-ish create actor-template -f template.yaml`.
 
 The images are public in Artifact Registry today. The intended distribution is GitHub Container Registry, with these commands:
 
@@ -155,11 +155,11 @@ Cloud Run does not deploy from GHCR directly. Deploy from Artifact Registry, or 
 
 ## Running the Agent Substrate demos
 
-[taeold/coding-agents-on-substrate](https://github.com/taeold/coding-agents-on-substrate) has three coding agents written for Agent Substrate on kind. Each one runs on ate-ish from the demo's own image with `ate` added. `demo/coding-agents/<demo>/` holds a Dockerfile and a template for each demo. The demos' `egress-policy.yaml` files are used unchanged. `demo/coding-agents/journey.sh <demo>` runs a demo's README walkthrough and prints each step with its time. The results below are from `runs/coding-agents-*.txt`, recorded on 2026-10-29 in us-west1 with one instance per demo.
+[taeold/coding-agents-on-substrate](https://github.com/taeold/coding-agents-on-substrate) has three coding agents written for Agent Substrate on kind. Each one runs on ate-ish from the demo's own image with `ate-ish` added. `demo/coding-agents/<demo>/` holds a Dockerfile and a template for each demo. The demos' `egress-policy.yaml` files are used unchanged. `demo/coding-agents/journey.sh <demo>` runs a demo's README walkthrough and prints each step with its time. The results below are from `runs/coding-agents-*.txt`, recorded on 2026-10-29 in us-west1 with one instance per demo.
 
 Every demo needs three changes:
 
-- The Dockerfile starts from the demo's image, copies `/usr/local/bin/ate` from the base image, and sets `ENTRYPOINT ["/usr/local/bin/ate", "serve"]`. `ate` carries its own root certificates, because the demo images are built on `node:24-slim`, which has none.
+- The Dockerfile starts from the demo's image, copies `/usr/local/bin/ate-ish` from the base image, and sets `ENTRYPOINT ["/usr/local/bin/ate-ish", "serve"]`. `ate-ish` carries its own root certificates, because the demo images are built on `node:24-slim`, which has none.
 - The template sets `command`. The demos' templates leave the command to the image's `CMD`, and ate-ish does not read the image's configuration.
 - The server listens on port 8080 and the wakeup probe uses port 8080, because a sandbox cannot bind a port below 1024 (see [Limits](#limits)).
 
@@ -180,7 +180,7 @@ docker build --platform linux/amd64 -t $REPO/coding-agents-libfx demo/coding-age
 docker push $REPO/coding-agents-libfx
 ```
 
-The walkthroughs below are the demos' READMEs with `kubectl ate` replaced by `ate` and `localhost:8000` replaced by `$ATE_URL`. Each request needs an identity token:
+The walkthroughs below are the demos' READMEs with `kubectl ate X` replaced by `ate-ish X` and `localhost:8000` replaced by `$ATE_URL`. Each request needs an identity token:
 
 ```bash
 TOKEN=$(gcloud auth print-identity-token)
@@ -192,7 +192,7 @@ TOKEN=$(gcloud auth print-identity-token)
 
 | File | Change |
 |---|---|
-| `demo/coding-agents/pi-durable/Dockerfile` | `FROM coding-agents/pi-durable`, the `ate` binary and the entrypoint. One `sed` changes `server.listen(80, ...)` in `/app/server.ts` to `server.listen(Number(process.env.PORT ?? 80), ...)`. |
+| `demo/coding-agents/pi-durable/Dockerfile` | `FROM coding-agents/pi-durable`, the `ate-ish` binary and the entrypoint. One `sed` changes `server.listen(80, ...)` in `/app/server.ts` to `server.listen(Number(process.env.PORT ?? 80), ...)`. |
 | `demo/coding-agents/pi-durable/template.yaml` | `command: [node, /app/server.ts]`, `PORT=8080`, and wakeup probe port 8080. |
 | `egress-policy.yaml` | None. |
 | Secret | The Gemini key in Secret Manager. `deploy.sh` maps the policy's `credentialUri` to it by default. |
@@ -202,19 +202,19 @@ INSTANCE=ate-node-pi-durable IMAGE=us-central1-docker.pkg.dev/daniel-junk/ate-is
   ./deploy.sh play gemini-api-key
 export ATE_URL=$(INSTANCE=ate-node-pi-durable ./deploy.sh url play) PATH=$PWD/bin:$PATH
 
-ate create atespace ate-demo-pi
-ate create actor-template -f demo/coding-agents/pi-durable/template.yaml
-ate create actor demo-agent --template pi-durable-data -a ate-demo-pi
-ate create egress-policy demo-agent -a ate-demo-pi -f $DEMOS/pi-durable/egress-policy.yaml
+ate-ish create atespace ate-demo-pi
+ate-ish create actor-template -f demo/coding-agents/pi-durable/template.yaml
+ate-ish create actor demo-agent --template pi-durable-data -a ate-demo-pi
+ate-ish create egress-policy demo-agent -a ate-demo-pi -f $DEMOS/pi-durable/egress-policy.yaml
 
 curl -sS -H "Authorization: Bearer $TOKEN" -H "ate-target-actor: ate-demo-pi/demo-agent" $ATE_URL/submit \
   -H "Content-Type: application/json" \
   -d '{"prompt": "Create app.js with add(a, b) and a test.js that verifies it."}'
 
-ate suspend actor demo-agent -a ate-demo-pi
-ate create tag checkpoint-v1 --actor demo-agent -a ate-demo-pi
-ate create actor demo-agent-fork --template pi-durable-data --tag checkpoint-v1 -a ate-demo-pi
-ate create egress-policy demo-agent-fork -a ate-demo-pi -f $DEMOS/pi-durable/egress-policy.yaml
+ate-ish suspend actor demo-agent -a ate-demo-pi
+ate-ish create tag checkpoint-v1 --actor demo-agent -a ate-demo-pi
+ate-ish create actor demo-agent-fork --template pi-durable-data --tag checkpoint-v1 -a ate-demo-pi
+ate-ish create egress-policy demo-agent-fork -a ate-demo-pi -f $DEMOS/pi-durable/egress-policy.yaml
 
 curl -sS -H "Authorization: Bearer $TOKEN" -H "ate-target-actor: ate-demo-pi/demo-agent" $ATE_URL/submit \
   -H "Content-Type: application/json" -d '{"prompt": "Add multiply(a, b) and structured logging to app.js."}'
@@ -243,7 +243,7 @@ The demo's README does not exercise an interrupted turn, and this run did not ei
 
 | File | Change |
 |---|---|
-| `demo/coding-agents/libfx/Dockerfile` | `FROM coding-agents/libfx`, the `ate` binary and the entrypoint, and the same `sed` on `/app/server.ts` as pi-durable. |
+| `demo/coding-agents/libfx/Dockerfile` | `FROM coding-agents/libfx`, the `ate-ish` binary and the entrypoint, and the same `sed` on `/app/server.ts` as pi-durable. |
 | `demo/coding-agents/libfx/template.yaml` | `command: [node, /app/server.ts]`, `PORT=8080`, and wakeup probe port 8080. |
 | `egress-policy.yaml` | None. |
 | Secret | The policy replaces the `authorization` header, and the demo stores `Bearer $AI_GATEWAY_API_KEY` in its secret. Store the same value in Secret Manager. |
@@ -255,19 +255,19 @@ INSTANCE=ate-node-libfx IMAGE=us-central1-docker.pkg.dev/daniel-junk/ate-ish/cod
   ./deploy.sh play ai-gateway-bearer
 export ATE_URL=$(INSTANCE=ate-node-libfx ./deploy.sh url play) PATH=$PWD/bin:$PATH
 
-ate create atespace ate-demo-fx
-ate create actor-template -f demo/coding-agents/libfx/template.yaml
-ate create actor demo-agent --template fx-durable-data -a ate-demo-fx
-ate create egress-policy demo-agent -a ate-demo-fx -f $DEMOS/libfx/egress-policy.yaml
+ate-ish create atespace ate-demo-fx
+ate-ish create actor-template -f demo/coding-agents/libfx/template.yaml
+ate-ish create actor demo-agent --template fx-durable-data -a ate-demo-fx
+ate-ish create egress-policy demo-agent -a ate-demo-fx -f $DEMOS/libfx/egress-policy.yaml
 
 curl -sS -N -H "Authorization: Bearer $TOKEN" -H "ate-target-actor: ate-demo-fx/demo-agent" $ATE_URL/submit \
   -H "Content-Type: application/json" \
   -d '{"prompt": "Create app.js with add(a, b) and a test.js that verifies it."}'
 
-ate suspend actor demo-agent -a ate-demo-fx
-ate create tag checkpoint-v1 --actor demo-agent -a ate-demo-fx
-ate create actor demo-agent-fork --template fx-durable-data --tag checkpoint-v1 -a ate-demo-fx
-ate create egress-policy demo-agent-fork -a ate-demo-fx -f $DEMOS/libfx/egress-policy.yaml
+ate-ish suspend actor demo-agent -a ate-demo-fx
+ate-ish create tag checkpoint-v1 --actor demo-agent -a ate-demo-fx
+ate-ish create actor demo-agent-fork --template fx-durable-data --tag checkpoint-v1 -a ate-demo-fx
+ate-ish create egress-policy demo-agent-fork -a ate-demo-fx -f $DEMOS/libfx/egress-policy.yaml
 
 curl -sS -N -H "Authorization: Bearer $TOKEN" -H "ate-target-actor: ate-demo-fx/demo-agent" $ATE_URL/submit \
   -H "Content-Type: application/json" -d '{"prompt": "Add multiply(a, b) and structured logging to app.js."}'
@@ -292,7 +292,7 @@ Results from `runs/coding-agents-libfx.txt`:
 
 Both branches continued from cursor 41 after the shared Turn 1. The model calls went through the egress proxy, because the sandbox holds only the placeholder key and the turns answered. A turn's time includes every model call and tool run in it, and the split was not measured. The demo's README does not exercise an interrupted turn, and this run did not either.
 
-In the suspend check, a new actor forked from `checkpoint-v1` suspended in 1.5 s after a `/readyz` request. The same actor, woken again by `/events?cursor=0` that curl dropped after 5 s, did not exit within 8 s of `SIGTERM`, and `ate delete actor` failed the same way. The demo's `SIGTERM` handler closes the agent and then the HTTP server, and the dropped stream is likely still open at the actor (see [Limits](#limits)). Which of the two calls waits was not measured.
+In the suspend check, a new actor forked from `checkpoint-v1` suspended in 1.5 s after a `/readyz` request. The same actor, woken again by `/events?cursor=0` that curl dropped after 5 s, did not exit within 8 s of `SIGTERM`, and `ate-ish delete actor` failed the same way. The demo's `SIGTERM` handler closes the agent and then the HTTP server, and the dropped stream is likely still open at the actor (see [Limits](#limits)). Which of the two calls waits was not measured.
 
 ### cursor-agent-sdk
 
@@ -300,7 +300,7 @@ In the suspend check, a new actor forked from `checkpoint-v1` suspended in 1.5 s
 
 | File | Change |
 |---|---|
-| `demo/coding-agents/cursor-agent-sdk/Dockerfile` | `FROM coding-agents/cursor-agent-sdk`, the `ate` binary and the entrypoint. |
+| `demo/coding-agents/cursor-agent-sdk/Dockerfile` | `FROM coding-agents/cursor-agent-sdk`, the `ate-ish` binary and the entrypoint. |
 | `demo/coding-agents/cursor-agent-sdk/template.yaml` | `command` and `args` from the image's `CMD` with `--port 8080`, and wakeup probe port 8080. |
 | `egress-policy.yaml` | None. |
 | Secret | None. The demo puts the real `CURSOR_API_KEY` in the template, because its egress policy injects nothing. Replace the placeholder `crsr_000...` in the template with your key. |
@@ -310,10 +310,10 @@ INSTANCE=ate-node-cursor-agent-sdk IMAGE=us-central1-docker.pkg.dev/daniel-junk/
   ./deploy.sh play
 export ATE_URL=$(INSTANCE=ate-node-cursor-agent-sdk ./deploy.sh url play) PATH=$PWD/bin:$PATH
 
-ate create atespace ate-demo-cursor
-ate create actor-template -f demo/coding-agents/cursor-agent-sdk/template.yaml
-ate create actor demo-agent --template cursor-agent -a ate-demo-cursor
-ate create egress-policy demo-agent -a ate-demo-cursor -f $DEMOS/cursor-agent-sdk/egress-policy.yaml
+ate-ish create atespace ate-demo-cursor
+ate-ish create actor-template -f demo/coding-agents/cursor-agent-sdk/template.yaml
+ate-ish create actor demo-agent --template cursor-agent -a ate-demo-cursor
+ate-ish create egress-policy demo-agent -a ate-demo-cursor -f $DEMOS/cursor-agent-sdk/egress-policy.yaml
 
 curl -sS -H "Authorization: Bearer $TOKEN" -H "ate-target-actor: ate-demo-cursor/demo-agent" $ATE_URL/v1/session \
   -H "Content-Type: application/json" \
@@ -321,15 +321,15 @@ curl -sS -H "Authorization: Bearer $TOKEN" -H "ate-target-actor: ate-demo-cursor
 curl -sS -N -H "Authorization: Bearer $TOKEN" -H "ate-target-actor: ate-demo-cursor/demo-agent" \
   "$ATE_URL/v1/session/<sessionId>/stream?startIndex=0"
 
-ate suspend actor demo-agent -a ate-demo-cursor
+ate-ish suspend actor demo-agent -a ate-demo-cursor
 curl -sS -H "Authorization: Bearer $TOKEN" -H "ate-target-actor: ate-demo-cursor/demo-agent" "$ATE_URL/v1/session/<sessionId>" \
   -H "Content-Type: application/json" \
   -d '{"continuationToken": "<token>", "message": "Change hello.js so it also prints the current year, run it again, and tell me what it printed."}'
 
-ate suspend actor demo-agent -a ate-demo-cursor
-ate create tag checkpoint-v1 --actor demo-agent -a ate-demo-cursor
-ate create actor demo-agent-fork --template cursor-agent --tag checkpoint-v1 -a ate-demo-cursor
-ate create egress-policy demo-agent-fork -a ate-demo-cursor -f $DEMOS/cursor-agent-sdk/egress-policy.yaml
+ate-ish suspend actor demo-agent -a ate-demo-cursor
+ate-ish create tag checkpoint-v1 --actor demo-agent -a ate-demo-cursor
+ate-ish create actor demo-agent-fork --template cursor-agent --tag checkpoint-v1 -a ate-demo-cursor
+ate-ish create egress-policy demo-agent-fork -a ate-demo-cursor -f $DEMOS/cursor-agent-sdk/egress-policy.yaml
 
 curl -sS -H "Authorization: Bearer $TOKEN" -H "ate-target-actor: ate-demo-cursor/demo-agent" "$ATE_URL/v1/session/<sessionId>" \
   -H "Content-Type: application/json" -d '{"continuationToken": "<token>", "message": "Add add(a, b), call it with 2 and 3"}'
@@ -356,11 +356,11 @@ The SDK's requests reached `api2.cursor.sh` and `api.cursor.com` through the egr
 |---|---|
 | A Kubernetes cluster, kind or GKE, with the `ate-system` components | One Cloud Run instance, or a Cloud Run worker pool and a service |
 | ate-api-server with Postgres for actor records | JSON records in one Cloud Storage bucket, written with `ifGenerationMatch` |
-| A `WorkerPool` of gVisor or microVM pods, run by atecontroller | Cloud Run sandboxes, started by the `ate` worker |
+| A `WorkerPool` of gVisor or microVM pods, run by atecontroller | Cloud Run sandboxes, started by the `ate-ish` worker |
 | atelet and ateworker for snapshots, and a golden snapshot per template | `sandbox tar` of the writable layer, uploaded to the bucket |
-| atenet-router, an Envoy ext_proc, for `ate-target-actor` | The `ate` ingress, a Go reverse proxy |
+| atenet-router, an Envoy ext_proc, for `ate-target-actor` | The `ate-ish` ingress, a Go reverse proxy |
 | atenet-egress and a credential provider | One HTTPS proxy per actor in the worker, with secrets from Secret Manager |
-| `kubectl-ate` over gRPC | `ate` over HTTP, with a gcloud identity token |
+| `kubectl-ate` over gRPC | `ate-ish` over HTTP, with a gcloud identity token |
 | A template image per actor template, pulled by the worker | The actor in the node image |
 
 ## Agent Substrate's demo templates
@@ -395,7 +395,7 @@ All runs were on 2026-10-28 in us-west1, on the published pi-durable image, with
 | Suspend on the worker (stop, tar, upload of 122 to 164 KB, record) | 0.51 to 0.55 s | 5 |
 | Request to a suspended actor at the ingress, worker already booted once | 0.94 to 1.24 s | 3 |
 | Request to a running actor at the ingress (two GCS reads) | 47 to 77 ms | 4 |
-| `ate` CLI call, `gcloud auth print-identity-token` included | 0.95 to 1.18 s, suspend 1.61 and 1.62 s | 22 |
+| `ate-ish` CLI call, `gcloud auth print-identity-token` included | 0.95 to 1.18 s, suspend 1.61 and 1.62 s | 22 |
 | Turn at the client, resume included (claude-haiku-4.5 through the egress proxy) | 2.97 to 14.6 s | 10 |
 
 Parking, from `runs/park.txt`. p1 to p8 at once filled the 8 slots, and all answered 200 in 1.6 to 4.4 s. p9 waited 3.9 s for a slot, which opened when p1 was suspended 2 s into the wait, and answered 200 at 5.2 s. p10 waited 5 s, no slot opened, and it got `503 no worker has room for the actor` at 5.5 s.
@@ -406,7 +406,7 @@ What bounds them. Booting is Node starting pi-durable inside gVisor, and four bo
 
 - **No ports below 1024.** In a sandbox, root holds `CAP_NET_BIND_SERVICE` and binding port 80 or 1023 still fails with `EACCES`. Ports 1024 and 8080 bind. gVisor's `/proc` has no `net/ipv4/ip_unprivileged_port_start` to lower (measured on 2026-10-29 with the probe port published as 80 and as 8080). An actor listens on port 1024 or above, and its wakeup probe names that port.
 - **A request stays open after its client leaves.** A probe actor held a streaming response open. After curl dropped the connection, the actor saw no `close` event in 30 s. The request ended when the actor was deleted, about 80 s after curl left, and Cloud Run then logged `Truncated response body`. The cause is likely Cloud Run's front end not closing the request to the container, but that was not confirmed. An actor that waits for its open connections on `SIGTERM` then does not exit, as libfx does after `/events`.
-- **No forced stop.** If an actor does not exit within 8 s of `SIGTERM`, suspend fails and the actor keeps running. `ate delete actor` suspends first, so it fails the same way, and the actor keeps its slot until the worker stops.
+- **No forced stop.** If an actor does not exit within 8 s of `SIGTERM`, suspend fails and the actor keeps running. `ate-ish delete actor` suspends first, so it fails the same way, and the actor keeps its slot until the worker stops.
 - **ROOTFS fidelity only.** A snapshot is the sandbox's writable layer. Memory and processes are not in it, so an actor runs its command from the start on every resume.
 - **The workspace is RAM on the worker.** The launcher keeps the writable layer in memory (`--overlay2=root:memory`). A 20 MB workspace uses 20 MB of worker memory, and the snapshot tar is in the worker's in-memory `/tmp` during a suspend.
 - **Egress is enforced by convention.** A sandbox without `--allow-egress` cannot reach the worker, so it cannot reach its proxy (measured: connection refused at 169.254.8.1 and 172.20.0.1). Actors therefore run with egress allowed, and `HTTPS_PROXY`, `HTTP_PROXY` and `NODE_USE_ENV_PROXY=1` point them at their proxy. The proxy refuses hosts that are not in the policy (`failed: Request was cancelled.`). A process that ignores those variables reaches the internet directly (`status 200`). `gate.sh` asserts both results on every run.

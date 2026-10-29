@@ -17,16 +17,16 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
-const usage = `usage: ate VERB KIND [NAME] [flags]     (server: $ATE_URL, auth: gcloud identity token)
-  ate create atespace NAME
-  ate create actor-template -f FILE
-  ate create actor NAME --template T [--tag TAG] -a ATESPACE
-  ate create tag NAME --actor ACTOR -a ATESPACE
-  ate create egress-policy ACTOR -f FILE -a ATESPACE
-  ate suspend actor NAME -a ATESPACE
-  ate delete actor NAME -a ATESPACE
-  ate get actors|tags -a ATESPACE
-  ate get workers`
+const usage = `usage: ate-ish VERB KIND [NAME] [flags]     (server: $ATE_URL, auth: gcloud identity token)
+  ate-ish create atespace NAME
+  ate-ish create actor-template -f FILE
+  ate-ish create actor NAME --template T [--tag TAG] -a ATESPACE
+  ate-ish create tag NAME --actor ACTOR -a ATESPACE
+  ate-ish create egress-policy ACTOR -f FILE -a ATESPACE
+  ate-ish suspend actor NAME -a ATESPACE
+  ate-ish delete actor NAME -a ATESPACE
+  ate-ish get actors|tags -a ATESPACE
+  ate-ish get workers`
 
 type actorRow struct {
 	Name, Template, Status, Owner string
@@ -36,7 +36,7 @@ type actorRow struct {
 }
 
 func runCLI(args []string) error {
-	fs := pflag.NewFlagSet("ate", pflag.ContinueOnError)
+	fs := pflag.NewFlagSet("ate-ish", pflag.ContinueOnError)
 	atespace := fs.StringP("atespace", "a", "", "atespace")
 	file := fs.StringP("file", "f", "", "YAML file")
 	template := fs.String("template", "", "actor template")

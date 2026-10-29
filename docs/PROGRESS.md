@@ -1,5 +1,48 @@
 # ate-node progress
 
+## Run 4 (2026-10-29): the binary and CLI are ate-ish
+
+Brief: rename the binary and command from `ate` to `ate-ish` (subcommands,
+ATE_ env vars, ate-target-actor and resource names unchanged); rebuild and
+push the five images; redeploy ate-node; gate on the Gateway variant.
+
+- [x] rename: `go build -o bin/ate-ish`, /usr/local/bin/ate-ish in the base
+  and the three coding-agents Dockerfiles, gate.sh, park.sh, journey.sh,
+  usage text and error prefix in cli.go, main.go and sandbox.go, README.
+  `bin/ate-ish nope` prints `ate-ish: unknown command "nope"` and the usage.
+- [x] images, each with the same ate-ish binary (sha256 2a40dadf0668...):
+  ate-ish@sha256:9888dc2baa55, pi-durable@sha256:0f91e316a00f,
+  coding-agents-pi-durable@sha256:e74f09112bf5,
+  coding-agents-libfx@sha256:f245d3776b82,
+  coding-agents-cursor-agent-sdk@sha256:7611ced9ff99. The pi-durable rebuild
+  pulled node:24-slim again: node v24.22.2 (was v24.22.1).
+- [x] ate-node updated while running to pi-durable@sha256:0f91e316a00f
+  (93 s, "Imported container image"). Worker log: sandboxes run
+  `/usr/local/bin/ate-ish init`.
+- gate (Gateway variant, AS=ate-demo-pi-rename): red, exit 5. The four setup
+  commands passed; the first turn settled unanswered/model_error "Request
+  timed out." after about 55 s. A second turn did the same. No `egress` line
+  in the worker log, Gateway balance unchanged (13.852), and a direct curl
+  to the Gateway with the same token answered 200 in 1.9 s.
+- Cause: a sandbox can no longer reach its own container. Probe actor (node
+  net.connect, 4 to 5 s timeout) from inside a sandbox: 169.254.8.1:8080,
+  169.254.8.1:<egress port>, 169.254.9.1:8080, 169.254.169.1:8080,
+  172.20.0.1:8080 all time out; 1.1.1.1:443 connects in 7 ms. The container
+  holds 169.254.8.1/16 and 169.254.9.1/24 (from a debug image that printed
+  its interfaces), and the egress listener on 169.254.8.1 opened without
+  error. Same result on the previous image pi-durable@sha256:92dd34fed7d5
+  (old binary, node v24.22.1) after a redeploy, so the rename did not cause
+  it. The run 3 walkthroughs, committed at 00:56 UTC the same day, reached the
+  proxy, so Cloud Run changed between 00:56 and 16:29 UTC (inferred). Every actor that needs
+  egress through the proxy fails until the egress path changes; ingress to
+  actors still works.
+- [x] infra path on the final image with probe actors: create, resume
+  (794 ms), tag, fork from the tag (542 ms), suspend, delete all passed.
+- cleanup: probe and gate actors deleted, their atespaces removed from the
+  bucket, debug image ate-ish-debug deleted. ate-node left running on
+  pi-durable@sha256:0f91e316a00f.
+- review: no independent reviewer ran.
+
 ## Run 3 (2026-10-29): the coding-agents-on-substrate demos on ate-ish
 
 Brief: port 80 test; per-demo minimal delta under demo/coding-agents/<name>/;

@@ -21,11 +21,11 @@ trap 'rm -rf "$work"' EXIT
 
 ms() { echo $(( ($(date +%s%N) - $1) / 1000000 )); }
 
-ate() {
-  echo "\$ ate $*"
+ate-ish() {
+  echo "\$ ate-ish $*"
   local t0
   t0=$(date +%s%N)
-  bin/ate "$@" 2>&1 | sed 's/^/  /' || true
+  bin/ate-ish "$@" 2>&1 | sed 's/^/  /' || true
   echo "  [$(ms "$t0") ms]"
 }
 
@@ -84,10 +84,10 @@ events() {
   echo "  text: $(jq -rj 'select(.type == "text_delta") | .delta' "$work/out" 2>/dev/null | head -c 300)"
 }
 
-ate create atespace "$AS"
-ate create actor-template -f "$TEMPLATE"
-ate create actor demo-agent --template "$T" -a "$AS"
-ate create egress-policy demo-agent -a "$AS" -f "$POLICY"
+ate-ish create atespace "$AS"
+ate-ish create actor-template -f "$TEMPLATE"
+ate-ish create actor demo-agent --template "$T" -a "$AS"
+ate-ish create egress-policy demo-agent -a "$AS" -f "$POLICY"
 
 if [[ $DEMO == cursor-agent-sdk ]]; then
   turn demo-agent "Create hello.js that prints hi, run it with node, and report the output."
@@ -99,7 +99,7 @@ if [[ $DEMO == cursor-agent-sdk ]]; then
     echo "  body: $(head -c 2000 "$work/out")"
     footer
   fi
-  ate suspend actor demo-agent -a "$AS"
+  ate-ish suspend actor demo-agent -a "$AS"
   if [[ -n $session ]]; then
     turn demo-agent "Change hello.js so it also prints the current year, run it again, and tell me what it printed." "$session" "$token"
     token=$(jq -r '.continuationToken // empty' "$work/out" 2>/dev/null || true)
@@ -108,10 +108,10 @@ else
   turn demo-agent "Create app.js with add(a, b) and a test.js that verifies it."
 fi
 
-ate suspend actor demo-agent -a "$AS"
-ate create tag checkpoint-v1 --actor demo-agent -a "$AS"
-ate create actor demo-agent-fork --template "$T" --tag checkpoint-v1 -a "$AS"
-ate create egress-policy demo-agent-fork -a "$AS" -f "$POLICY"
+ate-ish suspend actor demo-agent -a "$AS"
+ate-ish create tag checkpoint-v1 --actor demo-agent -a "$AS"
+ate-ish create actor demo-agent-fork --template "$T" --tag checkpoint-v1 -a "$AS"
+ate-ish create egress-policy demo-agent-fork -a "$AS" -f "$POLICY"
 
 if [[ $DEMO == cursor-agent-sdk ]]; then
   if [[ -n $session ]]; then
@@ -130,6 +130,6 @@ if [[ $DEMO == libfx ]]; then
   footer
 fi
 
-ate get actors -a "$AS"
-ate get tags -a "$AS"
-ate get workers
+ate-ish get actors -a "$AS"
+ate-ish get tags -a "$AS"
+ate-ish get workers

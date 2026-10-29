@@ -20,19 +20,19 @@ wake() {
   echo "$line $(grep -i '^ate-' "/tmp/$AS-$1.h" | tr -d '\r' | sort | tr '\n' ' ')"
 }
 
-bin/ate create atespace "$AS"
-bin/ate create actor-template -f "/tmp/$AS-template.yaml"
-for i in $(seq 10); do bin/ate create actor "p$i" --template pi-durable-data -a "$AS" >/dev/null; done
+bin/ate-ish create atespace "$AS"
+bin/ate-ish create actor-template -f "/tmp/$AS-template.yaml"
+for i in $(seq 10); do bin/ate-ish create actor "p$i" --template pi-durable-data -a "$AS" >/dev/null; done
 
 echo "== p1..p8 at once fill the 8 slots"
 for i in $(seq 8); do wake "p$i" & done
 wait
-bin/ate get workers
+bin/ate-ish get workers
 
 echo "== p9 parks; p1 is suspended 2 s into the wait"
 wake p9 &
 sleep 2
-bin/ate suspend actor p1 -a "$AS" >/dev/null
+bin/ate-ish suspend actor p1 -a "$AS" >/dev/null
 echo "suspended p1"
 wait
 

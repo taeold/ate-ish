@@ -37,7 +37,7 @@ setup() {
     gcloud storage buckets create "gs://$BUCKET" --project "$PROJECT" --location "$REGION" --uniform-bucket-level-access
   gcloud storage buckets add-iam-policy-binding "gs://$BUCKET" --member "serviceAccount:$(sa)" --role roles/storage.objectAdmin >/dev/null
   [[ -z $SECRET ]] || gcloud secrets add-iam-policy-binding "$SECRET" --project "$PROJECT" --member "serviceAccount:$(sa)" --role roles/secretmanager.secretAccessor >/dev/null
-  go build -o bin/ate .
+  go build -o bin/ate-ish .
 }
 
 case ${1:-} in

@@ -78,7 +78,7 @@ func runInit() error {
 	child := exec.Command(spec.Command[0], spec.Command[1:]...)
 	child.Stdout, child.Stderr = log, log
 	if err := child.Start(); err != nil {
-		fmt.Fprintf(log, "ate init: %v\n", err)
+		fmt.Fprintf(log, "ate-ish init: %v\n", err)
 		return writeExit(-1)
 	}
 	go func() {
