@@ -19,6 +19,9 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	// Root certificates for images without them, such as node:24-slim.
+	_ "golang.org/x/crypto/x509roots/fallback"
 )
 
 func main() {

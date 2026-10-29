@@ -54,7 +54,7 @@ ATESPACE      NAME         TEMPLATE          STATE       WORKER   GENERATION   E
 ate-demo-pi   demo-agent   pi-durable-data   suspended   <none>   0            false           0s
 ```
 
-`demo/egress-policy.yaml` is the file from pi-durable-substrate. `demo/template.yaml` is that repository's template with two changes. The command is `node /actor/server.ts`, because the agent is baked into the image at `/actor`. The agent listens on `PORT=8080` and the probe uses port 8080, because a sandbox cannot publish a port below 1024. The `image` field names the public image and is ignored.
+`demo/egress-policy.yaml` is the file from pi-durable-substrate. `demo/template.yaml` is that repository's template with two changes. The command is `node /actor/server.ts`, because the agent is baked into the image at `/actor`. The agent listens on `PORT=8080` and the probe uses port 8080, because a sandbox cannot bind a port below 1024. The `image` field names the public image and is ignored.
 
 ### 2. Run Turn 1
 
@@ -132,6 +132,14 @@ The base image is Debian trixie-slim with `ca-certificates` and `/usr/local/bin/
 
 ate-ish reads these fields of `template.yaml`: `command`, `args`, `env`, `wakeupProbe`, `volumeMounts` and `volumes` (`durableDir` and the `systemInfo` trust bundle). It stores the other fields and ignores them. The `image` field is accepted and ignored.
 
+To start from an image you already have, add the binary and the entrypoint. The binary is static and carries its own root certificates. [Running the Agent Substrate demos](#running-the-agent-substrate-demos) does this for three images.
+
+```Dockerfile
+FROM <your image>
+COPY --from=us-central1-docker.pkg.dev/daniel-junk/ate-ish/ate-ish:latest /usr/local/bin/ate /usr/local/bin/ate
+ENTRYPOINT ["/usr/local/bin/ate", "serve"]
+```
+
 Deploy your image with `IMAGE=<your image> ./deploy.sh play <secret>`, then run `ate create actor-template -f template.yaml`.
 
 The images are public in Artifact Registry today. The intended distribution is GitHub Container Registry, with these commands:
@@ -144,6 +152,203 @@ docker push ghcr.io/taeold/ate-ish/pi-durable:latest
 ```
 
 Cloud Run does not deploy from GHCR directly. Deploy from Artifact Registry, or from an Artifact Registry remote repository for `ghcr.io`.
+
+## Running the Agent Substrate demos
+
+[taeold/coding-agents-on-substrate](https://github.com/taeold/coding-agents-on-substrate) has three coding agents written for Agent Substrate on kind. Each one runs on ate-ish from the demo's own image with `ate` added. `demo/coding-agents/<demo>/` holds a Dockerfile and a template for each demo. The demos' `egress-policy.yaml` files are used unchanged. `demo/coding-agents/journey.sh <demo>` runs a demo's README walkthrough and prints each step with its time. The results below are from `runs/coding-agents-*.txt`, recorded on 2026-10-29 in us-west1 with one instance per demo.
+
+Every demo needs three changes:
+
+- The Dockerfile starts from the demo's image, copies `/usr/local/bin/ate` from the base image, and sets `ENTRYPOINT ["/usr/local/bin/ate", "serve"]`. `ate` carries its own root certificates, because the demo images are built on `node:24-slim`, which has none.
+- The template sets `command`. The demos' templates leave the command to the image's `CMD`, and ate-ish does not read the image's configuration.
+- The server listens on port 8080 and the wakeup probe uses port 8080, because a sandbox cannot bind a port below 1024 (see [Limits](#limits)).
+
+Each demo gets its own instance, because one deployment runs one template. `INSTANCE` names the instance, and its bucket is `gs://$INSTANCE-$PROJECT`. `SECRET_URI` is the `credentialUri` in the demo's egress policy, and `deploy.sh` maps it to the secret it is given.
+
+The walkthroughs read the egress policies from a clone of the demos:
+
+```bash
+git clone https://github.com/taeold/coding-agents-on-substrate ../coding-agents-on-substrate
+DEMOS=$PWD/../coding-agents-on-substrate
+```
+
+The images `us-central1-docker.pkg.dev/daniel-junk/ate-ish/coding-agents-<demo>:latest` are public. To build your own instead, build the demo's image and then the ate-ish layer, with `REPO` set to your Artifact Registry repository:
+
+```bash
+docker build --platform linux/amd64 -t coding-agents/libfx $DEMOS/libfx/agent
+docker build --platform linux/amd64 -t $REPO/coding-agents-libfx demo/coding-agents/libfx
+docker push $REPO/coding-agents-libfx
+```
+
+The walkthroughs below are the demos' READMEs with `kubectl ate` replaced by `ate` and `localhost:8000` replaced by `$ATE_URL`. Each request needs an identity token:
+
+```bash
+TOKEN=$(gcloud auth print-identity-token)
+```
+
+### pi-durable
+
+[pi-durable](https://github.com/taeold/coding-agents-on-substrate/tree/main/pi-durable) uses a Gemini key.
+
+| File | Change |
+|---|---|
+| `demo/coding-agents/pi-durable/Dockerfile` | `FROM coding-agents/pi-durable`, the `ate` binary and the entrypoint. One `sed` changes `server.listen(80, ...)` in `/app/server.ts` to `server.listen(Number(process.env.PORT ?? 80), ...)`. |
+| `demo/coding-agents/pi-durable/template.yaml` | `command: [node, /app/server.ts]`, `PORT=8080`, and wakeup probe port 8080. |
+| `egress-policy.yaml` | None. |
+| Secret | The Gemini key in Secret Manager. `deploy.sh` maps the policy's `credentialUri` to it by default. |
+
+```bash
+INSTANCE=ate-node-pi-durable IMAGE=us-central1-docker.pkg.dev/daniel-junk/ate-ish/coding-agents-pi-durable:latest \
+  ./deploy.sh play gemini-api-key
+export ATE_URL=$(INSTANCE=ate-node-pi-durable ./deploy.sh url play) PATH=$PWD/bin:$PATH
+
+ate create atespace ate-demo-pi
+ate create actor-template -f demo/coding-agents/pi-durable/template.yaml
+ate create actor demo-agent --template pi-durable-data -a ate-demo-pi
+ate create egress-policy demo-agent -a ate-demo-pi -f $DEMOS/pi-durable/egress-policy.yaml
+
+curl -sS -H "Authorization: Bearer $TOKEN" -H "ate-target-actor: ate-demo-pi/demo-agent" $ATE_URL/submit \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Create app.js with add(a, b) and a test.js that verifies it."}'
+
+ate suspend actor demo-agent -a ate-demo-pi
+ate create tag checkpoint-v1 --actor demo-agent -a ate-demo-pi
+ate create actor demo-agent-fork --template pi-durable-data --tag checkpoint-v1 -a ate-demo-pi
+ate create egress-policy demo-agent-fork -a ate-demo-pi -f $DEMOS/pi-durable/egress-policy.yaml
+
+curl -sS -H "Authorization: Bearer $TOKEN" -H "ate-target-actor: ate-demo-pi/demo-agent" $ATE_URL/submit \
+  -H "Content-Type: application/json" -d '{"prompt": "Add multiply(a, b) and structured logging to app.js."}'
+curl -sS -H "Authorization: Bearer $TOKEN" -H "ate-target-actor: ate-demo-pi/demo-agent-fork" $ATE_URL/submit \
+  -H "Content-Type: application/json" -d '{"prompt": "Add divide(a, b) and edge-case tests to test.js."}'
+```
+
+The Gemini key in the test project is revoked, so no turn answered on this image (`runs/coding-agents-pi-durable-gemini.txt`). Every turn settled `unanswered` with `model_error` and Google's 401 reason `ACCESS_TOKEN_TYPE_UNSUPPORTED`. Google gives that reason for the revoked key and `API_KEY_INVALID` for the placeholder, so the proxy did replace the key. The other steps ran. The fork's history held the Turn 1 prompt followed by its own.
+
+The full walkthrough ran on the Gateway variant, the image from `demo/pi-durable` with `demo/template-gateway.yaml` and `demo/egress-policy-gateway.yaml` (see [Use Vercel AI Gateway instead](#use-vercel-ai-gateway-instead)). That image has the same `server.ts` with the same port change, and `server-gateway.ts`, which changes the provider and the model. Results from `runs/coding-agents-pi-durable.txt`:
+
+| Step | Result | Time at the client |
+|---|---|---|
+| Create atespace, template, actor, egress policy | ok | 1.0 to 1.1 s each |
+| Turn 1 | `done`, wrote `app.js` and `test.js` | 8.7 s, resume 3.3 s (first sandbox on a new container) |
+| Suspend | ok, 141,824-byte snapshot, 516 ms on the worker | 1.6 s |
+| Tag, fork | ok | 1.1 and 1.2 s |
+| Turn 2 on `demo-agent` | `done`, entry 18, history: Turn 1 prompt, multiply prompt | 11.4 s, resume 1.25 s |
+| Turn 2 on `demo-agent-fork` | `done`, entry 18, history: Turn 1 prompt, divide prompt | 10.7 s, resume 1.34 s |
+
+The demo's README does not exercise an interrupted turn, and this run did not either.
+
+### libfx
+
+[libfx](https://github.com/taeold/coding-agents-on-substrate/tree/main/libfx) uses a Vercel AI Gateway key with the model `google/gemini-3.8-flash`.
+
+| File | Change |
+|---|---|
+| `demo/coding-agents/libfx/Dockerfile` | `FROM coding-agents/libfx`, the `ate` binary and the entrypoint, and the same `sed` on `/app/server.ts` as pi-durable. |
+| `demo/coding-agents/libfx/template.yaml` | `command: [node, /app/server.ts]`, `PORT=8080`, and wakeup probe port 8080. |
+| `egress-policy.yaml` | None. |
+| Secret | The policy replaces the `authorization` header, and the demo stores `Bearer $AI_GATEWAY_API_KEY` in its secret. Store the same value in Secret Manager. |
+
+```bash
+printf 'Bearer %s' "$AI_GATEWAY_API_KEY" | gcloud secrets create ai-gateway-bearer --data-file=-
+INSTANCE=ate-node-libfx IMAGE=us-central1-docker.pkg.dev/daniel-junk/ate-ish/coding-agents-libfx:latest \
+  SECRET_URI=ate-secret://k8s.io/default/ate-demo-fx/llm-credentials/ai-gateway-api-key \
+  ./deploy.sh play ai-gateway-bearer
+export ATE_URL=$(INSTANCE=ate-node-libfx ./deploy.sh url play) PATH=$PWD/bin:$PATH
+
+ate create atespace ate-demo-fx
+ate create actor-template -f demo/coding-agents/libfx/template.yaml
+ate create actor demo-agent --template fx-durable-data -a ate-demo-fx
+ate create egress-policy demo-agent -a ate-demo-fx -f $DEMOS/libfx/egress-policy.yaml
+
+curl -sS -N -H "Authorization: Bearer $TOKEN" -H "ate-target-actor: ate-demo-fx/demo-agent" $ATE_URL/submit \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Create app.js with add(a, b) and a test.js that verifies it."}'
+
+ate suspend actor demo-agent -a ate-demo-fx
+ate create tag checkpoint-v1 --actor demo-agent -a ate-demo-fx
+ate create actor demo-agent-fork --template fx-durable-data --tag checkpoint-v1 -a ate-demo-fx
+ate create egress-policy demo-agent-fork -a ate-demo-fx -f $DEMOS/libfx/egress-policy.yaml
+
+curl -sS -N -H "Authorization: Bearer $TOKEN" -H "ate-target-actor: ate-demo-fx/demo-agent" $ATE_URL/submit \
+  -H "Content-Type: application/json" -d '{"prompt": "Add multiply(a, b) and structured logging to app.js."}'
+curl -sS -N -H "Authorization: Bearer $TOKEN" -H "ate-target-actor: ate-demo-fx/demo-agent-fork" $ATE_URL/submit \
+  -H "Content-Type: application/json" -d '{"prompt": "Add divide(a, b) and edge-case tests to test.js."}'
+
+curl -sS -N -H "Authorization: Bearer $TOKEN" -H "ate-target-actor: ate-demo-fx/demo-agent-fork" "$ATE_URL/events?cursor=9"
+```
+
+Results from `runs/coding-agents-libfx.txt`:
+
+| Step | Result | Time at the client |
+|---|---|---|
+| Create atespace, template, actor, egress policy | ok | 1.0 to 1.1 s each |
+| Turn 1 | `turn_end` `end_turn` at cursor 39, wrote `app.js` and `test.js` and ran `node test.js` | 38.0 s, resume 1.06 s |
+| Suspend | ok, 694,272-byte snapshot, 506 ms on the worker | 1.7 s |
+| Tag, fork | ok | 1.0 and 1.2 s |
+| Turn 2 on `demo-agent` | `end_turn`, cursors 41 to 120, added `multiply` and logging | 68.0 s, resume 0.80 s |
+| Turn 2 on `demo-agent-fork` | `end_turn`, cursors 41 to 120, added `divide` and tests | 136.6 s, resume 0.85 s |
+| `/events?cursor=9` on the fork | replayed cursors 10 to 120, Turn 1 and the fork's Turn 2, and stayed open | stopped by curl after 5 s |
+| Suspend after `/events`, from `runs/coding-agents-libfx-suspend-after-events.txt` | fails with `actor did not exit 8s after SIGTERM`, and the actor stays running | 9.1 s |
+
+Both branches continued from cursor 41 after the shared Turn 1. The model calls went through the egress proxy, because the sandbox holds only the placeholder key and the turns answered. A turn's time includes every model call and tool run in it, and the split was not measured. The demo's README does not exercise an interrupted turn, and this run did not either.
+
+In the suspend check, a new actor forked from `checkpoint-v1` suspended in 1.5 s after a `/readyz` request. The same actor, woken again by `/events?cursor=0` that curl dropped after 5 s, did not exit within 8 s of `SIGTERM`, and `ate delete actor` failed the same way. The demo's `SIGTERM` handler closes the agent and then the HTTP server, and the dropped stream is likely still open at the actor (see [Limits](#limits)). Which of the two calls waits was not measured.
+
+### cursor-agent-sdk
+
+[cursor-agent-sdk](https://github.com/taeold/coding-agents-on-substrate/tree/main/cursor-agent-sdk) needs a Cursor API key. This project has none, so the walkthrough ran with the demo's placeholder key and stops at the first model call. Nothing past that point is tested on ate-ish.
+
+| File | Change |
+|---|---|
+| `demo/coding-agents/cursor-agent-sdk/Dockerfile` | `FROM coding-agents/cursor-agent-sdk`, the `ate` binary and the entrypoint. |
+| `demo/coding-agents/cursor-agent-sdk/template.yaml` | `command` and `args` from the image's `CMD` with `--port 8080`, and wakeup probe port 8080. |
+| `egress-policy.yaml` | None. |
+| Secret | None. The demo puts the real `CURSOR_API_KEY` in the template, because its egress policy injects nothing. Replace the placeholder `crsr_000...` in the template with your key. |
+
+```bash
+INSTANCE=ate-node-cursor-agent-sdk IMAGE=us-central1-docker.pkg.dev/daniel-junk/ate-ish/coding-agents-cursor-agent-sdk:latest \
+  ./deploy.sh play
+export ATE_URL=$(INSTANCE=ate-node-cursor-agent-sdk ./deploy.sh url play) PATH=$PWD/bin:$PATH
+
+ate create atespace ate-demo-cursor
+ate create actor-template -f demo/coding-agents/cursor-agent-sdk/template.yaml
+ate create actor demo-agent --template cursor-agent -a ate-demo-cursor
+ate create egress-policy demo-agent -a ate-demo-cursor -f $DEMOS/cursor-agent-sdk/egress-policy.yaml
+
+curl -sS -H "Authorization: Bearer $TOKEN" -H "ate-target-actor: ate-demo-cursor/demo-agent" $ATE_URL/v1/session \
+  -H "Content-Type: application/json" \
+  -d '{"message": "Create hello.js that prints hi, run it with node, and report the output."}'
+curl -sS -N -H "Authorization: Bearer $TOKEN" -H "ate-target-actor: ate-demo-cursor/demo-agent" \
+  "$ATE_URL/v1/session/<sessionId>/stream?startIndex=0"
+
+ate suspend actor demo-agent -a ate-demo-cursor
+curl -sS -H "Authorization: Bearer $TOKEN" -H "ate-target-actor: ate-demo-cursor/demo-agent" "$ATE_URL/v1/session/<sessionId>" \
+  -H "Content-Type: application/json" \
+  -d '{"continuationToken": "<token>", "message": "Change hello.js so it also prints the current year, run it again, and tell me what it printed."}'
+
+ate suspend actor demo-agent -a ate-demo-cursor
+ate create tag checkpoint-v1 --actor demo-agent -a ate-demo-cursor
+ate create actor demo-agent-fork --template cursor-agent --tag checkpoint-v1 -a ate-demo-cursor
+ate create egress-policy demo-agent-fork -a ate-demo-cursor -f $DEMOS/cursor-agent-sdk/egress-policy.yaml
+
+curl -sS -H "Authorization: Bearer $TOKEN" -H "ate-target-actor: ate-demo-cursor/demo-agent" "$ATE_URL/v1/session/<sessionId>" \
+  -H "Content-Type: application/json" -d '{"continuationToken": "<token>", "message": "Add add(a, b), call it with 2 and 3"}'
+curl -sS -H "Authorization: Bearer $TOKEN" -H "ate-target-actor: ate-demo-cursor/demo-agent-fork" "$ATE_URL/v1/session/<sessionId>" \
+  -H "Content-Type: application/json" -d '{"continuationToken": "<token>", "message": "Add multiply(a, b), call it with 6 and 7"}'
+```
+
+Results from `runs/coding-agents-cursor-agent-sdk.txt`:
+
+| Step | Result | Time at the client |
+|---|---|---|
+| Create atespace, template, actor, egress policy | ok | 1.0 to 1.1 s each |
+| `POST /v1/session` | 200 with `sessionId` and `continuationToken` | 4.2 s, resume 3.1 s |
+| Stream | `turn.started`, then `turn.failed` "Invalid User API Key" 0.23 s later | open until curl stopped it |
+| Suspend, then Turn 2 with the token | 200 and a new token, then `turn.failed` "Invalid User API Key" | 1.7 s, then 4.2 s with resume 3.2 s |
+| Suspend, tag, fork | ok, 207,872-byte snapshot | 1.6, 1.1 and 1.1 s |
+| Turns 3 on `demo-agent` and `demo-agent-fork` | 200 each, then `turn.failed` "Invalid User API Key" | 4.0 and 4.3 s, resume 3.1 and 3.3 s |
+
+The SDK's requests reached `api2.cursor.sh` and `api.cursor.com` through the egress proxy, according to the worker's `egress ... allowed=true` log lines. Each actor's event log has the same events 0 to 8, from Turns 1 and 2, and its own message at event 9. No turn ran a tool. The demo's interrupted-turn test needs a working key and did not run. A boot of this actor, from `sandbox run` to the wakeup probe, took 2.79 to 2.98 s (n=7), against 0.49 to 1.0 s for pi-durable and libfx (n=6), first boots on a new container left out. The cause was not measured.
 
 ## What Agent Substrate needs and what ate-ish needs
 
@@ -160,7 +365,7 @@ Cloud Run does not deploy from GHCR directly. Deploy from Artifact Registry, or 
 
 ## Agent Substrate's demo templates
 
-Only pi-durable has run on ate-ish. The other rows follow from the snapshot fidelity each template asks for in `substrate/demos`, because ate-ish delivers ROOTFS fidelity.
+Of these templates, only pi-durable has run on ate-ish. The other rows follow from the snapshot fidelity each template asks for in `substrate/demos`, because ate-ish delivers ROOTFS fidelity.
 
 | Demo | Result | Reason |
 |---|---|---|
@@ -199,6 +404,9 @@ What bounds them. Booting is Node starting pi-durable inside gVisor, and four bo
 
 ## Limits
 
+- **No ports below 1024.** In a sandbox, root holds `CAP_NET_BIND_SERVICE` and binding port 80 or 1023 still fails with `EACCES`. Ports 1024 and 8080 bind. gVisor's `/proc` has no `net/ipv4/ip_unprivileged_port_start` to lower (measured on 2026-10-29 with the probe port published as 80 and as 8080). An actor listens on port 1024 or above, and its wakeup probe names that port.
+- **A request stays open after its client leaves.** A probe actor held a streaming response open. After curl dropped the connection, the actor saw no `close` event in 30 s. The request ended when the actor was deleted, about 80 s after curl left, and Cloud Run then logged `Truncated response body`. The cause is likely Cloud Run's front end not closing the request to the container, but that was not confirmed. An actor that waits for its open connections on `SIGTERM` then does not exit, as libfx does after `/events`.
+- **No forced stop.** If an actor does not exit within 8 s of `SIGTERM`, suspend fails and the actor keeps running. `ate delete actor` suspends first, so it fails the same way, and the actor keeps its slot until the worker stops.
 - **ROOTFS fidelity only.** A snapshot is the sandbox's writable layer. Memory and processes are not in it, so an actor runs its command from the start on every resume.
 - **The workspace is RAM on the worker.** The launcher keeps the writable layer in memory (`--overlay2=root:memory`). A 20 MB workspace uses 20 MB of worker memory, and the snapshot tar is in the worker's in-memory `/tmp` during a suspend.
 - **Egress is enforced by convention.** A sandbox without `--allow-egress` cannot reach the worker, so it cannot reach its proxy (measured: connection refused at 169.254.8.1 and 172.20.0.1). Actors therefore run with egress allowed, and `HTTPS_PROXY`, `HTTP_PROXY` and `NODE_USE_ENV_PROXY=1` point them at their proxy. The proxy refuses hosts that are not in the policy (`failed: Request was cancelled.`). A process that ignores those variables reaches the internet directly (`status 200`). `gate.sh` asserts both results on every run.
@@ -225,6 +433,7 @@ The bucket holds a few KB of JSON and one 120 to 170 KB tar per actor. A Turn th
 ```bash
 ./deploy.sh down play
 ./deploy.sh down scale    # only if you deployed it
+INSTANCE=ate-node-libfx ./deploy.sh down play    # and each demo instance, then its bucket gs://ate-node-libfx-$PROJECT
 gcloud storage rm -r gs://ate-node-$PROJECT gs://ate-node-scale-$PROJECT
 gcloud secrets delete gemini-api-key
 ```

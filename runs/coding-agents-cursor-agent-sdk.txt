@@ -1,0 +1,141 @@
+$ ate create atespace ate-demo-cursor
+  create atespace: {"name":"ate-demo-cursor"}
+  [1098 ms]
+$ ate create actor-template -f demo/coding-agents/cursor-agent-sdk/template.yaml
+  create actor-template: {"atespace":"ate-demo-cursor","name":"cursor-agent"}
+  [1019 ms]
+$ ate create actor demo-agent --template cursor-agent -a ate-demo-cursor
+  ATESPACE          NAME         TEMPLATE       STATE       WORKER   GENERATION   EGRESS POLICY   AGE
+  ate-demo-cursor   demo-agent   cursor-agent   suspended   <none>   0            false           0s
+  [1109 ms]
+$ ate create egress-policy demo-agent -a ate-demo-cursor -f /tmp/coding-agents-on-substrate/cursor-agent-sdk/egress-policy.yaml
+  create egress-policy: {"rules":[{"https":{"hostnames":["api2.cursor.sh","api.cursor.com"],"effects":{"replaceHeaders":null}}}]}
+  [1016 ms]
+$ curl -X POST $ATE_URL/v1/session -H 'ate-target-actor: ate-demo-cursor/demo-agent' -d '{"message": "Create hello.js that prints hi, run it with node, and report the output."}'
+  body: {"ok":true,"sessionId":"ses_9654bd362474adb6dc156339","continuationToken":"http:evt:a42ae30fd20a542c0ccd31f1b74aa6af","playgroundUrl":"http://127.0.0.1:10000/playground?sessionId=ses_9654bd362474adb6dc156339","traceUrl":"http://127.0.0.1:10000/v1/session/ses_9654bd362474adb6dc156339/events"}
+  status: HTTP/2 200 
+  ingress: ate-parked-ms: 0 ate-resume-ms: 3120 ate-worker: w-82e889ec 
+  [4161 ms]
+$ curl -N $ATE_URL/v1/session/ses_9654bd362474adb6dc156339/stream?startIndex=0
+curl: (28) Operation timed out after 15002 milliseconds with 871 bytes received
+  body: {"index":0,"sessionId":"ses_9654bd362474adb6dc156339","at":"2026-10-29T00:39:42.866Z","type":"session.started","data":{"channelId":"http"}}
+{"index":1,"sessionId":"ses_9654bd362474adb6dc156339","turnId":"turn_1","at":"2026-10-29T00:39:42.872Z","type":"message.received","data":{"text":"Create hello.js that prints hi, run it with node, and report the output.","deliveryIds":["dlv_34a0fe7cd8d55458bfc8e2c4"]}}
+{"index":2,"sessionId":"ses_9654bd362474adb6dc156339","turnId":"turn_1","at":"2026-10-29T00:39:42.872Z","type":"turn.started","data":{}}
+{"index":3,"sessionId":"ses_9654bd362474adb6dc156339","turnId":"turn_1","at":"2026-10-29T00:39:43.105Z","type":"turn.failed","data":{"status":"error","message":"Invalid User API Key"}}
+{"index":4,"sessionId":"ses_9654bd362474adb6dc156339","turnId":"turn_1","at":"2026-10-29T00:39:43.105Z","type":"session.waiting","data":{}}
+  status: HTTP/2 200 
+  ingress: ate-parked-ms: 0 ate-resume-ms: 75 ate-worker: w-82e889ec 
+  [15891 ms]
+$ ate suspend actor demo-agent -a ate-demo-cursor
+  ATESPACE          NAME         TEMPLATE       STATE       WORKER   GENERATION   EGRESS POLICY   AGE
+  ate-demo-cursor   demo-agent   cursor-agent   suspended   <none>   1            true            23s
+  [1650 ms]
+$ curl -X POST $ATE_URL/v1/session/ses_9654bd362474adb6dc156339 -H 'ate-target-actor: ate-demo-cursor/demo-agent' -d '{"continuationToken": ..., "message": "Change hello.js so it also prints the current year, run it again, and tell me what it printed."}'
+  body: {"ok":true,"sessionId":"ses_9654bd362474adb6dc156339","continuationToken":"http:bae2772b898df94bfb7c8c961ee7d9bf"}
+  status: HTTP/2 200 
+  ingress: ate-parked-ms: 0 ate-resume-ms: 3169 ate-worker: w-82e889ec 
+  [4242 ms]
+$ ate suspend actor demo-agent -a ate-demo-cursor
+  ATESPACE          NAME         TEMPLATE       STATE       WORKER   GENERATION   EGRESS POLICY   AGE
+  ate-demo-cursor   demo-agent   cursor-agent   suspended   <none>   2            true            29s
+  [1591 ms]
+$ ate create tag checkpoint-v1 --actor demo-agent -a ate-demo-cursor
+  create tag: {"actor":"demo-agent","name":"checkpoint-v1"}
+  [1091 ms]
+$ ate create actor demo-agent-fork --template cursor-agent --tag checkpoint-v1 -a ate-demo-cursor
+  ATESPACE          NAME              TEMPLATE       STATE       WORKER   GENERATION   EGRESS POLICY   AGE
+  ate-demo-cursor   demo-agent-fork   cursor-agent   suspended   <none>   0            false           0s
+  [1095 ms]
+$ ate create egress-policy demo-agent-fork -a ate-demo-cursor -f /tmp/coding-agents-on-substrate/cursor-agent-sdk/egress-policy.yaml
+  create egress-policy: {"rules":[{"https":{"hostnames":["api2.cursor.sh","api.cursor.com"],"effects":{"replaceHeaders":null}}}]}
+  [1008 ms]
+$ curl -X POST $ATE_URL/v1/session/ses_9654bd362474adb6dc156339 -H 'ate-target-actor: ate-demo-cursor/demo-agent' -d '{"continuationToken": ..., "message": "Add add(a, b), call it with 2 and 3"}'
+  body: {"ok":true,"sessionId":"ses_9654bd362474adb6dc156339","continuationToken":"http:a1191a8e6a1c8ab8dc23f9d9d04aad64"}
+  status: HTTP/2 200 
+  ingress: ate-parked-ms: 0 ate-resume-ms: 3089 ate-worker: w-82e889ec 
+  [4036 ms]
+$ curl -X POST $ATE_URL/v1/session/ses_9654bd362474adb6dc156339 -H 'ate-target-actor: ate-demo-cursor/demo-agent-fork' -d '{"continuationToken": ..., "message": "Add multiply(a, b), call it with 6 and 7"}'
+  body: {"ok":true,"sessionId":"ses_9654bd362474adb6dc156339","continuationToken":"http:0a210bc1e0c56038907eb30589463cde"}
+  status: HTTP/2 200 
+  ingress: ate-parked-ms: 0 ate-resume-ms: 3303 ate-worker: w-82e889ec 
+  [4319 ms]
+$ ate get actors -a ate-demo-cursor
+  ATESPACE          NAME              TEMPLATE       STATE     WORKER       GENERATION   EGRESS POLICY   AGE
+  ate-demo-cursor   demo-agent-fork   cursor-agent   running   w-82e889ec   1            true            11s
+  ate-demo-cursor   demo-agent        cursor-agent   running   w-82e889ec   3            true            41s
+  [1042 ms]
+$ ate get tags -a ate-demo-cursor
+  ATESPACE          NAME
+  ate-demo-cursor   checkpoint-v1
+  [958 ms]
+$ ate get workers
+  ID           ADDR             ACTORS   LEASE   HOSTED
+  w-82e889ec   127.0.0.1:8080   2/4      live    ate-demo-cursor/demo-agent,ate-demo-cursor/demo-agent-fork
+  [1001 ms]
+
+# worker log, ate-node-cursor-agent-sdk: actor started and actor suspended lines
+2026/10/29 00:37:52 INFO actor started actor=ate-demo-cursor/demo-agent generation=1 sandbox=a-71ad1bb2b339 slot=0 snapshot_ms=46 boot_ms=6223 restored=false
+2026/10/29 00:38:55 INFO actor suspended actor=ate-demo-cursor/demo-agent generation=1 stop_ms=140 tar_ms=80 upload_ms=99 total_ms=560 bytes=205312 err=<nil>
+2026/10/29 00:38:59 INFO actor started actor=ate-demo-cursor/demo-agent generation=2 sandbox=a-1d201acf122c slot=0 snapshot_ms=96 boot_ms=2889 restored=true
+2026/10/29 00:39:01 INFO actor suspended actor=ate-demo-cursor/demo-agent generation=2 stop_ms=140 tar_ms=80 upload_ms=100 total_ms=576 bytes=207872 err=<nil>
+2026/10/29 00:39:08 INFO actor started actor=ate-demo-cursor/demo-agent generation=3 sandbox=a-636cc935832a slot=0 snapshot_ms=68 boot_ms=2908 restored=true
+2026/10/29 00:39:12 INFO actor started actor=ate-demo-cursor/demo-agent-fork generation=1 sandbox=a-81dbb30be481 slot=1 snapshot_ms=45 boot_ms=2788 restored=true
+2026/10/29 00:39:30 INFO actor suspended actor=ate-demo-cursor/demo-agent generation=3 stop_ms=139 tar_ms=83 upload_ms=96 total_ms=525 bytes=207872 err=<nil>
+2026/10/29 00:39:31 INFO actor suspended actor=ate-demo-cursor/demo-agent-fork generation=1 stop_ms=134 tar_ms=85 upload_ms=85 total_ms=548 bytes=207872 err=<nil>
+2026/10/29 00:39:42 INFO actor started actor=ate-demo-cursor/demo-agent generation=1 sandbox=a-fc17254d5944 slot=0 snapshot_ms=47 boot_ms=2858 restored=false
+2026/10/29 00:40:00 INFO actor suspended actor=ate-demo-cursor/demo-agent generation=1 stop_ms=142 tar_ms=84 upload_ms=96 total_ms=541 bytes=205312 err=<nil>
+2026/10/29 00:40:04 INFO actor started actor=ate-demo-cursor/demo-agent generation=2 sandbox=a-2c49e41a4083 slot=0 snapshot_ms=70 boot_ms=2872 restored=true
+2026/10/29 00:40:06 INFO actor suspended actor=ate-demo-cursor/demo-agent generation=2 stop_ms=135 tar_ms=79 upload_ms=103 total_ms=536 bytes=207872 err=<nil>
+2026/10/29 00:40:13 INFO actor started actor=ate-demo-cursor/demo-agent generation=3 sandbox=a-1bff716fbfe5 slot=0 snapshot_ms=64 boot_ms=2812 restored=true
+2026/10/29 00:40:17 INFO actor started actor=ate-demo-cursor/demo-agent-fork generation=1 sandbox=a-086dfd78cf8c slot=1 snapshot_ms=63 boot_ms=2978 restored=true
+
+# events of ses_9654bd362474adb6dc156339 on demo-agent: index, turn, type, text or message
+0  session.started 
+1 turn_1 message.received Create hello.js that prints hi, run it with node, and report the outpu
+2 turn_1 turn.started 
+3 turn_1 turn.failed Invalid User API Key
+4 turn_1 session.waiting 
+5 turn_2 message.received Change hello.js so it also prints the current year, run it again, and 
+6 turn_2 turn.started 
+7 turn_2 turn.failed Invalid User API Key
+8 turn_2 session.waiting 
+9 turn_3 message.received Add add(a, b), call it with 2 and 3
+10 turn_3 turn.started 
+11 turn_3 turn.failed Invalid User API Key
+12 turn_3 session.waiting 
+# events of ses_9654bd362474adb6dc156339 on demo-agent-fork: index, turn, type, text or message
+0  session.started 
+1 turn_1 message.received Create hello.js that prints hi, run it with node, and report the outpu
+2 turn_1 turn.started 
+3 turn_1 turn.failed Invalid User API Key
+4 turn_1 session.waiting 
+5 turn_2 message.received Change hello.js so it also prints the current year, run it again, and 
+6 turn_2 turn.started 
+7 turn_2 turn.failed Invalid User API Key
+8 turn_2 session.waiting 
+9 turn_3 message.received Add multiply(a, b), call it with 6 and 7
+10 turn_3 turn.started 
+11 turn_3 turn.failed Invalid User API Key
+12 turn_3 session.waiting 
+
+# worker log, ate-node-cursor-agent-sdk: egress lines
+      1 2026/10/29 00:38:59 INFO egress actor=ate-demo-cursor/demo-agent remote=172.20.0.38:38756 method=CONNECT host=api2.cursor.sh allowed=true
+      1 2026/10/29 00:38:59 INFO egress actor=ate-demo-cursor/demo-agent remote=172.20.0.38:38764 method=CONNECT host=api2.cursor.sh allowed=true
+      1 2026/10/29 00:38:59 INFO egress actor=ate-demo-cursor/demo-agent remote=172.20.0.38:38774 method=CONNECT host=api2.cursor.sh allowed=true
+      1 2026/10/29 00:38:59 INFO egress actor=ate-demo-cursor/demo-agent remote=172.20.0.38:38778 method=CONNECT host=api2.cursor.sh allowed=true
+      1 2026/10/29 00:38:59 INFO egress actor=ate-demo-cursor/demo-agent remote=172.20.0.38:38784 method=CONNECT host=api.cursor.com allowed=true
+      1 2026/10/29 00:39:08 INFO egress actor=ate-demo-cursor/demo-agent remote=172.20.0.140:42834 method=CONNECT host=api2.cursor.sh allowed=true
+      1 2026/10/29 00:39:08 INFO egress actor=ate-demo-cursor/demo-agent remote=172.20.0.140:42838 method=CONNECT host=api2.cursor.sh allowed=true
+      1 2026/10/29 00:39:08 INFO egress actor=ate-demo-cursor/demo-agent remote=172.20.0.140:42844 method=CONNECT host=api2.cursor.sh allowed=true
+      1 2026/10/29 00:39:08 INFO egress actor=ate-demo-cursor/demo-agent remote=172.20.0.140:42854 method=CONNECT host=api2.cursor.sh allowed=true
+      1 2026/10/29 00:39:12 INFO egress actor=ate-demo-cursor/demo-agent-fork remote=172.20.0.43:43914 method=CONNECT host=api2.cursor.sh allowed=true
+      1 2026/10/29 00:39:12 INFO egress actor=ate-demo-cursor/demo-agent-fork remote=172.20.0.43:43918 method=CONNECT host=api2.cursor.sh allowed=true
+      1 2026/10/29 00:39:12 INFO egress actor=ate-demo-cursor/demo-agent-fork remote=172.20.0.43:43932 method=CONNECT host=api2.cursor.sh allowed=true
+      1 2026/10/29 00:39:42 INFO egress actor=ate-demo-cursor/demo-agent remote=172.20.0.32:35528 method=CONNECT host=registry.npmjs.org allowed=false
+      1 2026/10/29 00:39:42 INFO egress actor=ate-demo-cursor/demo-agent remote=172.20.0.32:35542 method=CONNECT host=api2.cursor.sh allowed=true
+      1 2026/10/29 00:39:42 INFO egress actor=ate-demo-cursor/demo-agent remote=172.20.0.32:35552 method=CONNECT host=api2.cursor.sh allowed=true
+      1 2026/10/29 00:39:42 INFO egress actor=ate-demo-cursor/demo-agent remote=172.20.0.32:35566 method=CONNECT host=api2.cursor.sh allowed=true
+      1 2026/10/29 00:39:43 INFO egress actor=ate-demo-cursor/demo-agent remote=172.20.0.32:35570 method=CONNECT host=api.cursor.com allowed=true
+      1 2026/10/29 00:40:04 INFO egress actor=ate-demo-cursor/demo-agent remote=172.20.0.246:55776 method=CONNECT host=api2.cursor.sh allowed=true
+      1 2026/10/29 00:40:04 INFO egress actor=ate-demo-cursor/demo-agent remote=172.20.0.246:55780 method=CONNECT host=api2.cursor.sh allowed=true
+      1 2026/10/29 00:40:04 INFO egress actor=ate-demo-cursor/demo-agent remote=172.20.0.246:55788 method=CONNECT host=api2.cursor.sh allowed=true

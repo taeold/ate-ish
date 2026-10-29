@@ -1,0 +1,22 @@
+$ bin/ate create actor events-check --template fx-durable-data --tag checkpoint-v1 -a ate-demo-fx
+  ATESPACE      NAME           TEMPLATE          STATE       WORKER   GENERATION   EGRESS POLICY   AGE
+  ate-demo-fx   events-check   fx-durable-data   suspended   <none>   0            false           0s
+  [1120 ms]
+$ curl -sS -H "Authorization: Bearer $TOKEN" -H "ate-target-actor: ate-demo-fx/events-check" $ATE_URL/readyz
+  ok
+  [911 ms]
+$ bin/ate suspend actor events-check -a ate-demo-fx
+  ATESPACE      NAME           TEMPLATE          STATE       WORKER   GENERATION   EGRESS POLICY   AGE
+  ate-demo-fx   events-check   fx-durable-data   suspended   <none>   1            false           3s
+  [1532 ms]
+$ curl -N --max-time 5 $ATE_URL/events?cursor=0 (lines received)
+  44
+$ bin/ate suspend actor events-check -a ate-demo-fx
+  ate: POST /admin/atespaces/ate-demo-fx/actors/events-check/suspend: 500 Internal Server Error: worker 127.0.0.1:8080/suspend: 500 Internal Server Error: actor did not exit 8s after SIGTERM
+  [9126 ms]
+$ bin/ate get actors -a ate-demo-fx
+  ATESPACE      NAME              TEMPLATE          STATE       WORKER       GENERATION   EGRESS POLICY   AGE
+  ate-demo-fx   demo-agent-fork   fx-durable-data   suspended   <none>       0            true            3m39s
+  ate-demo-fx   demo-agent        fx-durable-data   running     w-1418134a   3            true            4m25s
+  ate-demo-fx   events-check      fx-durable-data   running     w-1418134a   2            false           28s
+  [1072 ms]

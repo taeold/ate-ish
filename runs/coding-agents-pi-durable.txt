@@ -1,0 +1,100 @@
+$ ate create atespace ate-demo-pi
+  create atespace: {"name":"ate-demo-pi"}
+  [1005 ms]
+$ ate create actor-template -f demo/template-gateway.yaml
+  create actor-template: {"atespace":"ate-demo-pi","name":"pi-durable-data"}
+  [1061 ms]
+$ ate create actor demo-agent --template pi-durable-data -a ate-demo-pi
+  ATESPACE      NAME         TEMPLATE          STATE       WORKER   GENERATION   EGRESS POLICY   AGE
+  ate-demo-pi   demo-agent   pi-durable-data   suspended   <none>   0            false           0s
+  [1056 ms]
+$ ate create egress-policy demo-agent -a ate-demo-pi -f demo/egress-policy-gateway.yaml
+  create egress-policy: {"rules":[{"https":{"hostnames":["ai-gateway.vercel.sh"],"effects":{"replaceHeaders":[{"header":"x-api-key","credentialUri":"ate-secret://secretmanager.googleapis.com/daniel-junk/ai-gateway-token"}]}}}]}
+  [1021 ms]
+$ curl -X POST $ATE_URL/submit -H 'ate-target-actor: ate-demo-pi/demo-agent' -d '{"prompt": "Create app.js with add(a, b) and a test.js that verifies it."}'
+  settled: {"conversationId":1,"type":"input","status":"done","entry":7,"id":8,"answer":17}
+  user prompts: ["Create app.js with add(a, b) and a test.js that verifies it."]
+  tool results: ["Successfully wrote to app.js","Successfully wrote to test.js"]
+  last answer: Perfect! I've created both files:
+
+**app.js** - Contains a simple `add(a, b)` function that returns the sum of two numbers.
+
+**test.js** - Imports the add function and runs 4 test cases:
+- `add(2, 3)` should equal 5
+- `add(-5, 3)` should equal -2
+- `add(0, 0)` should equal 0
+- `add(100, -50)` should
+  status: HTTP/2 200 
+  ingress: ate-parked-ms: 0 ate-resume-ms: 3300 ate-worker: w-2c881f5c 
+  [8703 ms]
+$ ate suspend actor demo-agent -a ate-demo-pi
+  ATESPACE      NAME         TEMPLATE          STATE       WORKER   GENERATION   EGRESS POLICY   AGE
+  ate-demo-pi   demo-agent   pi-durable-data   suspended   <none>   1            true            11s
+  [1593 ms]
+$ ate create tag checkpoint-v1 --actor demo-agent -a ate-demo-pi
+  create tag: {"actor":"demo-agent","name":"checkpoint-v1"}
+  [1057 ms]
+$ ate create actor demo-agent-fork --template pi-durable-data --tag checkpoint-v1 -a ate-demo-pi
+  ATESPACE      NAME              TEMPLATE          STATE       WORKER   GENERATION   EGRESS POLICY   AGE
+  ate-demo-pi   demo-agent-fork   pi-durable-data   suspended   <none>   0            false           0s
+  [1178 ms]
+$ ate create egress-policy demo-agent-fork -a ate-demo-pi -f demo/egress-policy-gateway.yaml
+  create egress-policy: {"rules":[{"https":{"hostnames":["ai-gateway.vercel.sh"],"effects":{"replaceHeaders":[{"header":"x-api-key","credentialUri":"ate-secret://secretmanager.googleapis.com/daniel-junk/ai-gateway-token"}]}}}]}
+  [1094 ms]
+$ curl -X POST $ATE_URL/submit -H 'ate-target-actor: ate-demo-pi/demo-agent' -d '{"prompt": "Add multiply(a, b) and structured logging to app.js."}'
+  settled: {"conversationId":1,"type":"input","status":"done","entry":18,"id":19,"answer":33}
+  user prompts: ["Create app.js with add(a, b) and a test.js that verifies it.","Add multiply(a, b) and structured logging to app.js."]
+  tool results: ["Successfully replaced 1 block(s) in test.js.","Successfully replaced 1 block(s) in test.js."]
+  last answer: Perfect! I've updated both files:
+
+**app.js changes:**
+- Added `multiply(a, b)` function
+- Added structured logging that outputs JSON with timestamp, operation name, operands, and result
+- Updated exports to include both functions
+
+**test.js changes:**
+- Updated import to destructure both `add` and 
+  status: HTTP/2 200 
+  ingress: ate-parked-ms: 0 ate-resume-ms: 1252 ate-worker: w-2c881f5c 
+  [11437 ms]
+$ curl -X POST $ATE_URL/submit -H 'ate-target-actor: ate-demo-pi/demo-agent-fork' -d '{"prompt": "Add divide(a, b) and edge-case tests to test.js."}'
+  settled: {"conversationId":1,"type":"input","status":"done","entry":18,"id":19,"answer":27}
+  user prompts: ["Create app.js with add(a, b) and a test.js that verifies it.","Add divide(a, b) and edge-case tests to test.js."]
+  tool results: ["Successfully replaced 1 block(s) in app.js.","Successfully replaced 1 block(s) in test.js."]
+  last answer: Done! I've updated both files:
+
+**app.js** - Added a `divide(a, b)` function that:
+- Returns the result of a / b
+- Throws an error if b is 0 (division by zero protection)
+- Exports both `add` and `divide` functions
+
+**test.js** - Added comprehensive tests including:
+- **Basic divide tests**: `divide
+  status: HTTP/2 200 
+  ingress: ate-parked-ms: 0 ate-resume-ms: 1340 ate-worker: w-2c881f5c 
+  [10674 ms]
+$ ate get actors -a ate-demo-pi
+  ATESPACE      NAME              TEMPLATE          STATE     WORKER       GENERATION   EGRESS POLICY   AGE
+  ate-demo-pi   demo-agent-fork   pi-durable-data   running   w-2c881f5c   1            true            25s
+  ate-demo-pi   demo-agent        pi-durable-data   running   w-2c881f5c   2            true            38s
+  [1147 ms]
+$ ate get tags -a ate-demo-pi
+  ATESPACE      NAME
+  ate-demo-pi   checkpoint-v1
+  [1093 ms]
+$ ate get workers
+  ID           ADDR             ACTORS   LEASE   HOSTED
+  w-2c881f5c   127.0.0.1:8080   2/4      live    ate-demo-pi/demo-agent,ate-demo-pi/demo-agent-fork
+  [1078 ms]
+
+# worker log, ate-node-pi-durable: actor started and actor suspended lines
+2026/10/29 00:29:44 INFO actor started actor=ate-demo-pi/demo-agent generation=1 sandbox=a-49367c6b521a slot=0 snapshot_ms=50 boot_ms=3296 restored=false
+2026/10/29 00:29:46 INFO actor suspended actor=ate-demo-pi/demo-agent generation=1 stop_ms=115 tar_ms=55 upload_ms=74 total_ms=422 bytes=122880 err=<nil>
+2026/10/29 00:29:51 INFO actor started actor=ate-demo-pi/demo-agent generation=2 sandbox=a-e8ac651ffa51 slot=0 snapshot_ms=52 boot_ms=862 restored=true
+2026/10/29 00:29:54 INFO actor started actor=ate-demo-pi/demo-agent-fork generation=1 sandbox=a-13455c16f4fb slot=1 snapshot_ms=61 boot_ms=817 restored=true
+2026/10/29 00:32:25 INFO actor started actor=ate-demo-pi/demo-agent generation=1 sandbox=a-43341b303afa slot=0 snapshot_ms=55 boot_ms=2994 restored=false
+2026/10/29 00:32:31 INFO actor suspended actor=ate-demo-pi/demo-agent generation=1 stop_ms=141 tar_ms=78 upload_ms=73 total_ms=516 bytes=141824 err=<nil>
+2026/10/29 00:32:37 INFO actor started actor=ate-demo-pi/demo-agent generation=2 sandbox=a-163d47271aa9 slot=0 snapshot_ms=47 boot_ms=1001 restored=true
+2026/10/29 00:32:49 INFO actor started actor=ate-demo-pi/demo-agent-fork generation=1 sandbox=a-8a72b44c28a9 slot=1 snapshot_ms=72 boot_ms=997 restored=true
+2026/10/29 00:42:53 INFO actor suspended actor=ate-demo-pi/demo-agent generation=2 stop_ms=137 tar_ms=82 upload_ms=131 total_ms=576 bytes=150528 err=<nil>
+2026/10/29 00:43:53 INFO actor suspended actor=ate-demo-pi/demo-agent-fork generation=1 stop_ms=133 tar_ms=84 upload_ms=126 total_ms=556 bytes=155648 err=<nil>

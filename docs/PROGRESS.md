@@ -1,5 +1,85 @@
 # ate-node progress
 
+## Run 3 (2026-10-29): the coding-agents-on-substrate demos on ate-ish
+
+Brief: port 80 test; per-demo minimal delta under demo/coding-agents/<name>/;
+run each demo's README walkthrough on its own instance ate-node-<demo>;
+README section "Running the Agent Substrate demos"; push.
+
+- [x] 1 low ports. Throwaway template on ate-node (atespace port-probe, two
+  actors, deleted). The command ran as init's child, same uid and caps:
+  uid 0, CapEff 0x20000420 (CAP_KILL, CAP_NET_BIND_SERVICE, CAP_AUDIT_WRITE).
+  /proc/sys/net/ipv4/ip_unprivileged_port_start does not exist in gVisor's
+  /proc ("No such file or directory"; a write: "Permission denied").
+  node bind: 80 EACCES, 1023 EACCES, 1024 ok, 8080 ok, with the probe port
+  published as 80 and as 8080. setcap/ambient caps not tried: the process
+  already holds CAP_NET_BIND_SERVICE in its effective set. Result: no init
+  change can bind 80. pi-durable and libfx get the one-line PORT change
+  (sed in the Dockerfile); cursor-agent-sdk takes --port in the template.
+- [x] ate on node:24-slim: the demo images have no /etc/ssl/certs, and ate
+  failed TLS ("x509: certificate signed by unknown authority", local run of
+  `ate get workers`). main.go imports golang.org/x/crypto/x509roots/fallback;
+  after that the same run reached Cloud Run (401). ate-ish:latest rebuilt
+  and pushed, sha256:c60f78838509 (was bb25d41b6733).
+- [x] deploy.sh: INSTANCE (default ate-node), BUCKET defaults to
+  $INSTANCE-$PROJECT, SECRET_URI, SECRET optional.
+- [x] images: coding-agents-{pi-durable,libfx,cursor-agent-sdk}:latest in
+  ate-ish (a24c30d4a6da, efa65555f5b5, ed27604ed580).
+- [x] secret ai-gateway-bearer = "Bearer " + ai-gateway-token, because the
+  libfx policy replaces authorization and its README stores "Bearer $KEY".
+- [x] instances: ate-node-pi-durable (opencode-gemini-key), ate-node-libfx
+  (ai-gateway-bearer), ate-node-cursor-agent-sdk (no secret). deploy.sh play
+  42, 42 and 50 s each, run in parallel, bucket creation included. Each
+  registered one worker (`ate get workers`).
+- opencode-gemini-key: 401 "API key not valid" (one curl, 2026-10-29).
+- [x] journey.sh (demo/coding-agents/journey.sh <demo>) runs a demo README
+  walkthrough; outputs in runs/coding-agents-*.txt with the worker's
+  started/suspended log lines appended.
+- [x] pi-durable, Gemini image: every infra step ran; every turn settled
+  unanswered/model_error 401 ACCESS_TOKEN_TYPE_UNSUPPORTED. A curl with the
+  real key gives that reason, a curl with ate-placeholder-key gives
+  API_KEY_INVALID, so the proxy injected the secret. Fork history: Turn 1
+  prompt + its own. Then instances update to ate-ish/pi-durable:latest
+  (102 s) and the full walkthrough on template-gateway.yaml: all turns done,
+  entry 7, then 18 on both branches with divergent prompts.
+- [x] libfx: full walkthrough passed; branches diverge at cursor 41; /events
+  replays and stays open. Found: after a dropped /events stream the actor
+  does not exit within 8 s of SIGTERM; suspend and delete fail ("actor did
+  not exit 8s after SIGTERM") and the actor keeps its slot. Control: the
+  same actor suspended in 1.5 s after /readyz. Probe (disconnect-probe/h1,
+  node holding a response): no close event in 30 s after curl left; the
+  request ended when the actor was deleted ~80 s later, Cloud Run logged
+  "Truncated response body". Layer inferred, Cloud Run front end; not
+  confirmed. Not fixed: h2c to the container or a forced stop would be the
+  candidates, neither tried.
+  README block run verbatim (bash -x, last curl with --max-time 5): every
+  step through Turn 2 on demo-agent passed; the fork's turn got 503 "no
+  worker has room" because the stuck fork from the journey run had the same
+  key ate-demo-fx/demo-agent-fork (setup artifact: the atespace objects were
+  moved while that copy still ran). The fork turn passed in journey.sh.
+- [x] cursor-agent-sdk: placeholder key. Every infra step ran; every turn
+  turn.failed "Invalid User API Key" 0.23 s after turn.started; requests
+  reached api2.cursor.sh and api.cursor.com through the proxy. First
+  journey run used the Turn 1 token for Turns 3 and 4 (409
+  stale_continuation_token, script bug, fixed; the README uses the Turn 2
+  token); runs/ holds the second run. Boot 2.79 to 2.98 s (n=7), cause not
+  measured.
+- [x] Gateway spend for both pi and libfx runs: $0.23 (credits 14.153 before,
+  13.928 after); $0.30 with the verbatim libfx rerun (13.852 at the end).
+- [x] README: "Running the Agent Substrate demos", Build your own actor
+  (COPY ate into an existing image), Limits (no ports below 1024, request
+  stays open after the client leaves, no forced stop), Cleanup line.
+- [x] deleted: instances ate-node-pi-durable, ate-node-libfx,
+  ate-node-cursor-agent-sdk (deploy.sh down play, 14 to 109 s), their
+  buckets, secret ai-gateway-bearer. ate-node left running on
+  pi-durable@sha256:92dd34fed7d5.
+- review: no independent reviewer ran in this delegate session.
+
+Resources after run 3:
+- Running: instance ate-node (unchanged), bucket gs://ate-node-daniel-junk.
+- Public images: ate-ish:latest (now sha256:c60f78838509, embedded roots),
+  coding-agents-pi-durable, coding-agents-libfx, coding-agents-cursor-agent-sdk.
+
 ## Run 2 (2026-10-28): from proof of concept to public repo
 
 Brief: single-template model, review fixes a-f, public images, BYO Gemini

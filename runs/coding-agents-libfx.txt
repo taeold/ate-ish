@@ -1,0 +1,299 @@
+$ ate create atespace ate-demo-fx
+  create atespace: {"name":"ate-demo-fx"}
+  [1065 ms]
+$ ate create actor-template -f demo/coding-agents/libfx/template.yaml
+  create actor-template: {"atespace":"ate-demo-fx","name":"fx-durable-data"}
+  [1062 ms]
+$ ate create actor demo-agent --template fx-durable-data -a ate-demo-fx
+  ATESPACE      NAME         TEMPLATE          STATE       WORKER   GENERATION   EGRESS POLICY   AGE
+  ate-demo-fx   demo-agent   fx-durable-data   suspended   <none>   0            false           0s
+  [1072 ms]
+$ ate create egress-policy demo-agent -a ate-demo-fx -f /tmp/coding-agents-on-substrate/libfx/egress-policy.yaml
+  create egress-policy: {"rules":[{"https":{"hostnames":["ai-gateway.vercel.sh"],"effects":{"replaceHeaders":[{"header":"authorization","credentialUri":"ate-secret://k8s.io/default/ate-demo-fx/llm-credentials/ai-gateway-api-key"}]}}}]}
+  [1022 ms]
+$ curl -N -X POST $ATE_URL/submit -H 'ate-target-actor: ate-demo-fx/demo-agent' -d '{"prompt": "Create app.js with add(a, b) and a test.js that verifies it."}'
+  2 turn_start   Create app.js with add(a, b) and a test.js that verifies it.
+  3 tool_start bash  {"command":"ls -la"}
+  4 tool_end bash  {"stdout":"total 0\ndrwxr-xr-x 1 root root 60 Oct 29 00:33 .\ndrwxr-xr-x 1 root root 60 Oct 29 00:33 ..\ndrwxr-xr-x 1 root root 60 Oct 29 00
+  5 tool_start bash  {"command":"node -v"}
+  6 tool_end bash  {"stdout":"v24.22.2\n","stderr":""}
+  7 tool_start bash  {"command":"node -e 'const test = require(\"node:test\"); const assert = require(\"node:assert\"); test(\"example\", () => { assert.strictEq
+  8 tool_end bash  {"stdout":"✔ example (0.675231ms)\nℹ tests 1\nℹ suites 0\nℹ pass 1\nℹ fail 0\nℹ cancelled 0\nℹ skipped 0\nℹ todo 0\nℹ duration_ms 5.858859\n
+  9 tool_start write  {"content":"function add(a, b) {\n  return a + b;\n}\n\nmodule.exports = add;\nmodule.exports.add = add;\n","path":"app.js"}
+  10 tool_end write  {"success":true,"path":"app.js"}
+  11 tool_start write  {"path":"test.js","content":"const test = require('node:test');\nconst assert = require('node:assert');\nconst { add } = require('./app');\n
+  12 tool_end write  {"success":true,"path":"test.js"}
+  13 tool_start bash  {"command":"node test.js"}
+  14 tool_end bash  {"stdout":"✔ adds two positive numbers (0.808346ms)\n✔ adds two negative numbers (0.147448ms)\n✔ adds a positive and a negative number (0.11
+  15 tool_start bash  {"command":"node --test test.js"}
+  16 tool_end bash  {"stdout":"✔ adds two positive numbers (0.762755ms)\n✔ adds two negative numbers (0.140071ms)\n✔ adds a positive and a negative number (0.10
+  17 tool_start bash  {"command":"node test.js && echo \"SUCCESS\""}
+  18 tool_end bash  {"stdout":"✔ adds two positive numbers (0.815853ms)\n✔ adds two negative numbers (0.148495ms)\n✔ adds a positive and a negative number (0.11
+  19 tool_start bash  {"command":"git status"}
+  20 tool_end bash  {"error":"Command failed: git status\n/bin/sh: 1: git: not found\n","stdout":"","stderr":"/bin/sh: 1: git: not found\n","exitCode":127}
+  21 tool_start read  {"path":"app.js"}
+  22 tool_end read  function add(a, b) {
+  return a + b;
+}
+
+module.exports = add;
+module.exports.add = add;
+
+  23 tool_start read  {"path":"test.js"}
+  24 tool_end read  const test = require('node:test');
+const assert = require('node:assert');
+const { add } = require('./app');
+
+test('adds two positive numbers
+  39 turn_end  end_turn 
+  text: `app.js` and `test.js` have been created.
+
+### `app.js`
+```javascript
+function add(a, b) {
+  return a + b;
+}
+
+module.exports = add;
+module.exports.add = add;
+```
+
+### `test.js`
+```javascript
+const test = require('node:test');
+const assert = require('node:assert');
+const { add } = require('./app');
+  status: HTTP/2 200 
+  ingress: ate-parked-ms: 0 ate-resume-ms: 1056 ate-worker: w-1418134a 
+  [38006 ms]
+$ ate suspend actor demo-agent -a ate-demo-fx
+  ATESPACE      NAME         TEMPLATE          STATE       WORKER   GENERATION   EGRESS POLICY   AGE
+  ate-demo-fx   demo-agent   fx-durable-data   suspended   <none>   1            true            41s
+  [1680 ms]
+$ ate create tag checkpoint-v1 --actor demo-agent -a ate-demo-fx
+  create tag: {"actor":"demo-agent","name":"checkpoint-v1"}
+  [1040 ms]
+$ ate create actor demo-agent-fork --template fx-durable-data --tag checkpoint-v1 -a ate-demo-fx
+  ATESPACE      NAME              TEMPLATE          STATE       WORKER   GENERATION   EGRESS POLICY   AGE
+  ate-demo-fx   demo-agent-fork   fx-durable-data   suspended   <none>   0            false           0s
+  [1175 ms]
+$ ate create egress-policy demo-agent-fork -a ate-demo-fx -f /tmp/coding-agents-on-substrate/libfx/egress-policy.yaml
+  create egress-policy: {"rules":[{"https":{"hostnames":["ai-gateway.vercel.sh"],"effects":{"replaceHeaders":[{"header":"authorization","credentialUri":"ate-secret://k8s.io/default/ate-demo-fx/llm-credentials/ai-gateway-api-key"}]}}}]}
+  [1072 ms]
+$ curl -N -X POST $ATE_URL/submit -H 'ate-target-actor: ate-demo-fx/demo-agent' -d '{"prompt": "Add multiply(a, b) and structured logging to app.js."}'
+  41 turn_start   Add multiply(a, b) and structured logging to app.js.
+  42 tool_start bash  {"command":"node -e 'const test = require(\"node:test\"); const assert = require(\"node:assert\"); test(\"example\", () => { console.log(JSO
+  43 tool_end bash  {"stdout":"{\"level\":\"info\",\"message\":\"test\"}\n✔ example (1.216735ms)\nℹ tests 1\nℹ suites 0\nℹ pass 1\nℹ fail 0\nℹ cancelled 0\nℹ sk
+  44 tool_start write  {"content":"function log(level, message, meta = {}) {\n  if (typeof message === 'object' && message !== null && typeof meta === 'string') {\
+  45 tool_end write  {"success":true,"path":"app.js"}
+  46 tool_start write  {"path":"test.js","content":"const test = require('node:test');\nconst assert = require('node:assert');\nconst { add, multiply, logger, log 
+  47 tool_end write  {"success":true,"path":"test.js"}
+  48 tool_start bash  {"command":"node test.js"}
+  49 tool_end bash  {"stdout":"{\"timestamp\":\"2026-10-29T00:34:49.576Z\",\"level\":\"info\",\"message\":\"add\",\"operation\":\"add\",\"a\":2,\"b\":3,\"result
+  50 tool_start bash  {"command":"node --test test.js"}
+  51 tool_end bash  {"stdout":"{\"timestamp\":\"2026-10-29T00:34:51.807Z\",\"level\":\"info\",\"message\":\"add\",\"operation\":\"add\",\"a\":2,\"b\":3,\"result
+  120 turn_end  end_turn 
+  text: `multiply(a, b)` and structured logging have been added to `app.js`, and `test.js` has been updated with tests covering the new functionality.
+
+### `app.js`
+```javascript
+function log(level, message, meta = {}) {
+  if (typeof message === 'object' && message !== null && typeof meta === 'string') {
+  
+  status: HTTP/2 200 
+  ingress: ate-parked-ms: 0 ate-resume-ms: 804 ate-worker: w-1418134a 
+  [67996 ms]
+$ curl -N -X POST $ATE_URL/submit -H 'ate-target-actor: ate-demo-fx/demo-agent-fork' -d '{"prompt": "Add divide(a, b) and edge-case tests to test.js."}'
+  41 turn_start   Add divide(a, b) and edge-case tests to test.js.
+  42 tool_start bash  {"command":"ls -la .fx"}
+  43 tool_end bash  {"stdout":"total 0\ndrwxr-xr-x 1 root root  60 Oct 29 00:33 .\ndrwxr-xr-x 1 root root 100 Oct 29 00:33 ..\ndrwxr-xr-x 1 root root 160 Oct 29
+  44 tool_start bash  {"command":"ls -la .fx/sessions"}
+  45 tool_end bash  {"stdout":"total 1\ndrwxr-xr-x 1 root root 160 Oct 29 00:35 .\ndrwxr-xr-x 1 root root  60 Oct 29 00:33 ..\ndrwxr-xr-x 1 root root  80 Oct 29
+  46 tool_start bash  {"command":"node -e '\nfunction add(a, b) { return a + b; }\nfunction divide(a, b) { if (b === 0) throw new Error(\"Cannot divide by zero\")
+  47 tool_end bash  {"stdout":"destructure: 3 3\ndirect call: 3 3\n","stderr":""}
+  48 tool_start bash  {"command":"node -e 'const { describe, it } = require(\"node:test\"); const assert = require(\"node:assert\"); describe(\"math\", () => { it
+  49 tool_end bash  {"stdout":"▶ math\n  ✔ works (0.583795ms)\n✔ math (1.456069ms)\nℹ tests 1\nℹ suites 1\nℹ pass 1\nℹ fail 0\nℹ cancelled 0\nℹ skipped 0\nℹ tod
+  50 tool_start bash  {"command":"node -e 'const assert = require(\"node:assert\"); assert.strictEqual(0, -0);'"}
+  51 tool_end bash  {"error":"Command failed: node -e 'const assert = require(\"node:assert\"); assert.strictEqual(0, -0);'\nnode:assert:152\n  throw new Assert
+  52 tool_start bash  {"command":"node -e '\nconst msg = \"Cannot divide by zero (division by zero)\";\nconsole.log(/cannot divide by zero/i.test(msg));\nconsole.
+  53 tool_end bash  {"stdout":"true\ntrue\ntrue\ntrue\n","stderr":""}
+  54 tool_start bash  {"command":"find . -maxdepth 3 -not -path '*/.*'"}
+  55 tool_end bash  {"stdout":".\n./app.js\n./test.js\n","stderr":""}
+  56 tool_start bash  {"command":"ls -la .."}
+  57 tool_end bash  {"stdout":"total 10\ndrwxr-xr-x  1 root root   60 Oct 29 00:33 .\ndrwxr-xr-x  1 root root   60 Oct 29 00:33 ..\ndrwxr-xr-x  3 root root   80
+  58 tool_start write  {"path":"app.js","content":"function add(a, b) {\n  return a + b;\n}\n\nfunction divide(a, b) {\n  if (b === 0) {\n    throw new Error('Cann
+  59 tool_end write  {"success":true,"path":"app.js"}
+  60 tool_start write  {"content":"const test = require('node:test');\nconst assert = require('node:assert');\nconst { add, divide } = require('./app');\n\n// add 
+  61 tool_end write  {"success":true,"path":"test.js"}
+  62 tool_start bash  {"command":"node test.js"}
+  63 tool_end bash  {"stdout":"✔ adds two positive numbers (0.974185ms)\n✔ adds two negative numbers (0.137908ms)\n✔ adds a positive and a negative number (0.11
+  64 tool_start bash  {"command":"node --test test.js"}
+  65 tool_end bash  {"stdout":"✔ adds two positive numbers (1.333759ms)\n✔ adds two negative numbers (0.14256ms)\n✔ adds a positive and a negative number (0.122
+  66 tool_start read  {"path":"app.js"}
+  67 tool_end read  function add(a, b) {
+  return a + b;
+}
+
+function divide(a, b) {
+  if (b === 0) {
+    throw new Error('Cannot divide by zero');
+  }
+  return 
+  68 tool_start read  {"path":"test.js"}
+  69 tool_end read  const test = require('node:test');
+const assert = require('node:assert');
+const { add, divide } = require('./app');
+
+// add tests
+test('adds
+  120 turn_end  end_turn 
+  text: `divide(a, b)` has been added to `app.js` along with comprehensive edge-case tests in `test.js`.
+
+### Updated Files
+
+#### `app.js`
+```javascript
+function add(a, b) {
+  return a + b;
+}
+
+function divide(a, b) {
+  if (b === 0) {
+    throw new Error('Cannot divide by zero');
+  }
+  return a / b;
+}
+
+modul
+  status: HTTP/2 200 
+  ingress: ate-parked-ms: 0 ate-resume-ms: 851 ate-worker: w-1418134a 
+  [136649 ms]
+$ curl -N $ATE_URL/events?cursor=9 -H 'ate-target-actor: ate-demo-fx/demo-agent-fork'
+curl: (28) Operation timed out after 5000 milliseconds with 26338 bytes received
+  10 tool_end write  {"success":true,"path":"app.js"}
+  11 tool_start write  {"path":"test.js","content":"const test = require('node:test');\nconst assert = require('node:assert');\nconst { add } = require('./app');\n
+  12 tool_end write  {"success":true,"path":"test.js"}
+  13 tool_start bash  {"command":"node test.js"}
+  14 tool_end bash  {"stdout":"✔ adds two positive numbers (0.808346ms)\n✔ adds two negative numbers (0.147448ms)\n✔ adds a positive and a negative number (0.11
+  15 tool_start bash  {"command":"node --test test.js"}
+  16 tool_end bash  {"stdout":"✔ adds two positive numbers (0.762755ms)\n✔ adds two negative numbers (0.140071ms)\n✔ adds a positive and a negative number (0.10
+  17 tool_start bash  {"command":"node test.js && echo \"SUCCESS\""}
+  18 tool_end bash  {"stdout":"✔ adds two positive numbers (0.815853ms)\n✔ adds two negative numbers (0.148495ms)\n✔ adds a positive and a negative number (0.11
+  19 tool_start bash  {"command":"git status"}
+  20 tool_end bash  {"error":"Command failed: git status\n/bin/sh: 1: git: not found\n","stdout":"","stderr":"/bin/sh: 1: git: not found\n","exitCode":127}
+  21 tool_start read  {"path":"app.js"}
+  22 tool_end read  function add(a, b) {
+  return a + b;
+}
+
+module.exports = add;
+module.exports.add = add;
+
+  23 tool_start read  {"path":"test.js"}
+  24 tool_end read  const test = require('node:test');
+const assert = require('node:assert');
+const { add } = require('./app');
+
+test('adds two positive numbers
+  39 turn_end  end_turn 
+  40 idle   
+  41 turn_start   Add divide(a, b) and edge-case tests to test.js.
+  42 tool_start bash  {"command":"ls -la .fx"}
+  43 tool_end bash  {"stdout":"total 0\ndrwxr-xr-x 1 root root  60 Oct 29 00:33 .\ndrwxr-xr-x 1 root root 100 Oct 29 00:33 ..\ndrwxr-xr-x 1 root root 160 Oct 29
+  44 tool_start bash  {"command":"ls -la .fx/sessions"}
+  45 tool_end bash  {"stdout":"total 1\ndrwxr-xr-x 1 root root 160 Oct 29 00:35 .\ndrwxr-xr-x 1 root root  60 Oct 29 00:33 ..\ndrwxr-xr-x 1 root root  80 Oct 29
+  46 tool_start bash  {"command":"node -e '\nfunction add(a, b) { return a + b; }\nfunction divide(a, b) { if (b === 0) throw new Error(\"Cannot divide by zero\")
+  47 tool_end bash  {"stdout":"destructure: 3 3\ndirect call: 3 3\n","stderr":""}
+  48 tool_start bash  {"command":"node -e 'const { describe, it } = require(\"node:test\"); const assert = require(\"node:assert\"); describe(\"math\", () => { it
+  49 tool_end bash  {"stdout":"▶ math\n  ✔ works (0.583795ms)\n✔ math (1.456069ms)\nℹ tests 1\nℹ suites 1\nℹ pass 1\nℹ fail 0\nℹ cancelled 0\nℹ skipped 0\nℹ tod
+  50 tool_start bash  {"command":"node -e 'const assert = require(\"node:assert\"); assert.strictEqual(0, -0);'"}
+  51 tool_end bash  {"error":"Command failed: node -e 'const assert = require(\"node:assert\"); assert.strictEqual(0, -0);'\nnode:assert:152\n  throw new Assert
+  52 tool_start bash  {"command":"node -e '\nconst msg = \"Cannot divide by zero (division by zero)\";\nconsole.log(/cannot divide by zero/i.test(msg));\nconsole.
+  53 tool_end bash  {"stdout":"true\ntrue\ntrue\ntrue\n","stderr":""}
+  54 tool_start bash  {"command":"find . -maxdepth 3 -not -path '*/.*'"}
+  55 tool_end bash  {"stdout":".\n./app.js\n./test.js\n","stderr":""}
+  56 tool_start bash  {"command":"ls -la .."}
+  57 tool_end bash  {"stdout":"total 10\ndrwxr-xr-x  1 root root   60 Oct 29 00:33 .\ndrwxr-xr-x  1 root root   60 Oct 29 00:33 ..\ndrwxr-xr-x  3 root root   80
+  58 tool_start write  {"path":"app.js","content":"function add(a, b) {\n  return a + b;\n}\n\nfunction divide(a, b) {\n  if (b === 0) {\n    throw new Error('Cann
+  59 tool_end write  {"success":true,"path":"app.js"}
+  60 tool_start write  {"content":"const test = require('node:test');\nconst assert = require('node:assert');\nconst { add, divide } = require('./app');\n\n// add 
+  61 tool_end write  {"success":true,"path":"test.js"}
+  62 tool_start bash  {"command":"node test.js"}
+  63 tool_end bash  {"stdout":"✔ adds two positive numbers (0.974185ms)\n✔ adds two negative numbers (0.137908ms)\n✔ adds a positive and a negative number (0.11
+  64 tool_start bash  {"command":"node --test test.js"}
+  65 tool_end bash  {"stdout":"✔ adds two positive numbers (1.333759ms)\n✔ adds two negative numbers (0.14256ms)\n✔ adds a positive and a negative number (0.122
+  66 tool_start read  {"path":"app.js"}
+  67 tool_end read  function add(a, b) {
+  return a + b;
+}
+
+function divide(a, b) {
+  if (b === 0) {
+    throw new Error('Cannot divide by zero');
+  }
+  return 
+  68 tool_start read  {"path":"test.js"}
+  69 tool_end read  const test = require('node:test');
+const assert = require('node:assert');
+const { add, divide } = require('./app');
+
+// add tests
+test('adds
+  120 turn_end  end_turn 
+  text: `app.js` and `test.js` have been created.
+
+### `app.js`
+```javascript
+function add(a, b) {
+  return a + b;
+}
+
+module.exports = add;
+module.exports.add = add;
+```
+
+### `test.js`
+```javascript
+const test = require('node:test');
+const assert = require('node:assert');
+const { add } = require('./app');
+  status: HTTP/2 200 
+  ingress: ate-parked-ms: 0 ate-resume-ms: 92 ate-worker: w-1418134a 
+  [6109 ms]
+$ ate get actors -a ate-demo-fx
+  ATESPACE      NAME              TEMPLATE          STATE     WORKER       GENERATION   EGRESS POLICY   AGE
+  ate-demo-fx   demo-agent-fork   fx-durable-data   running   w-1418134a   1            true            3m33s
+  ate-demo-fx   demo-agent        fx-durable-data   running   w-1418134a   2            true            4m16s
+  [1037 ms]
+$ ate get tags -a ate-demo-fx
+  ATESPACE      NAME
+  ate-demo-fx   checkpoint-v1
+  [942 ms]
+$ ate get workers
+  ID           ADDR             ACTORS   LEASE   HOSTED
+  w-1418134a   127.0.0.1:8080   2/4      live    ate-demo-fx/demo-agent,ate-demo-fx/demo-agent-fork
+  [1059 ms]
+
+# worker log, ate-node-libfx: actor started and actor suspended lines
+2026/10/29 00:33:14 INFO actor started actor=ate-demo-fx/demo-agent generation=1 sandbox=a-7470abd1f07a slot=0 snapshot_ms=62 boot_ms=746 restored=false
+2026/10/29 00:33:51 INFO actor suspended actor=ate-demo-fx/demo-agent generation=1 stop_ms=113 tar_ms=55 upload_ms=98 total_ms=506 bytes=694272 err=<nil>
+2026/10/29 00:33:57 INFO actor started actor=ate-demo-fx/demo-agent generation=2 sandbox=a-c4a7746b5db7 slot=0 snapshot_ms=87 boot_ms=491 restored=true
+2026/10/29 00:35:05 INFO actor started actor=ate-demo-fx/demo-agent-fork generation=1 sandbox=a-68ed682d2a87 slot=1 snapshot_ms=103 boot_ms=493 restored=true
+2026/10/29 00:44:17 INFO actor suspended actor=ate-demo-fx/demo-agent generation=2 stop_ms=113 tar_ms=65 upload_ms=205 total_ms=577 bytes=2304512 err=<nil>
+2026/10/29 00:44:26 ERROR suspend failed, actor kept actor=ate-demo-fx/demo-agent-fork generation=1 err="actor did not exit 8s after SIGTERM"
+2026/10/29 00:45:18 ERROR suspend failed, actor kept actor=ate-demo-fx/demo-agent-fork generation=1 err="actor did not exit 8s after SIGTERM"
+2026/10/29 00:45:47 INFO actor started actor=disconnect-probe/h1 generation=1 sandbox=a-53333c462779 slot=0 snapshot_ms=61 boot_ms=244 restored=false
+2026/10/29 00:47:11 INFO actor suspended actor=disconnect-probe/h1 generation=1 stop_ms=61 tar_ms=54 upload_ms=85 total_ms=413 bytes=1536 err=<nil>
+2026/10/29 00:47:29 INFO actor started actor=ate-demo-fx/demo-agent generation=1 sandbox=a-c9578c4d4464 slot=0 snapshot_ms=57 boot_ms=499 restored=false
+2026/10/29 00:48:10 INFO actor suspended actor=ate-demo-fx/demo-agent generation=1 stop_ms=113 tar_ms=58 upload_ms=95 total_ms=474 bytes=790528 err=<nil>
+2026/10/29 00:48:14 INFO actor started actor=ate-demo-fx/demo-agent generation=2 sandbox=a-0c5efc28e729 slot=0 snapshot_ms=69 boot_ms=501 restored=true
+2026/10/29 00:49:24 ERROR suspend failed, actor kept actor=ate-demo-fx/demo-agent-fork generation=1 err="actor did not exit 8s after SIGTERM"
+2026/10/29 00:49:32 ERROR suspend failed, actor kept actor=ate-demo-fx/demo-agent-fork generation=1 err="actor did not exit 8s after SIGTERM"
+2026/10/29 00:50:18 INFO actor suspended actor=ate-demo-fx/demo-agent generation=2 stop_ms=66 tar_ms=64 upload_ms=130 total_ms=466 bytes=2053632 err=<nil>
+2026/10/29 00:50:19 INFO actor started actor=ate-demo-fx/demo-agent generation=3 sandbox=a-db3195cf068c slot=0 snapshot_ms=83 boot_ms=517 restored=true
+2026/10/29 00:50:42 ERROR suspend failed, actor kept actor=ate-demo-fx/demo-agent generation=3 err="actor did not exit 8s after SIGTERM"
+2026/10/29 00:51:25 INFO actor started actor=ate-demo-fx/events-check generation=1 sandbox=a-604624c942c3 slot=2 snapshot_ms=76 boot_ms=500 restored=true
+2026/10/29 00:51:26 INFO actor suspended actor=ate-demo-fx/events-check generation=1 stop_ms=119 tar_ms=59 upload_ms=117 total_ms=495 bytes=798208 err=<nil>
+2026/10/29 00:51:27 INFO actor started actor=ate-demo-fx/events-check generation=2 sandbox=a-02250ee99fb4 slot=2 snapshot_ms=84 boot_ms=526 restored=true
+2026/10/29 00:51:50 ERROR suspend failed, actor kept actor=ate-demo-fx/events-check generation=2 err="actor did not exit 8s after SIGTERM"
+2026/10/29 00:52:28 ERROR suspend failed, actor kept actor=ate-demo-fx/events-check generation=2 err="actor did not exit 8s after SIGTERM"

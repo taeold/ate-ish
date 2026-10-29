@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # Deploys ate-ish.
 #
-#   ./deploy.sh play SECRET    one Cloud Run instance, ATE_ROLE=all
+#   ./deploy.sh play [SECRET]  one Cloud Run instance $INSTANCE, ATE_ROLE=all
 #   ./deploy.sh scale SECRET   ingress service + worker pool, over Direct VPC
 #   ./deploy.sh images         build and push the base and pi-durable images to $REPO
 #   ./deploy.sh url play|scale
 #   ./deploy.sh down play|scale
 #
-# SECRET is the Secret Manager secret that holds the model key.
+# SECRET is the Secret Manager secret that holds the model key, if the actor
+# needs one. SECRET_URI is the credentialUri in the egress policy that maps to it.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -15,14 +16,15 @@ PROJECT=${PROJECT:-$(gcloud config get project)}
 REGION=${REGION:-us-west1}
 REPO=${REPO:-us-central1-docker.pkg.dev/daniel-junk/ate-ish}
 IMAGE=${IMAGE:-$REPO/pi-durable:latest}
-# Each shape has its own bucket, so neither places actors on the other's workers.
-BUCKET=${BUCKET:-ate-node-$PROJECT}
+INSTANCE=${INSTANCE:-ate-node}
+# Each deployment has its own bucket, so none places actors on another's workers.
+BUCKET=${BUCKET:-$INSTANCE-$PROJECT}
 [[ ${1:-} == scale || ${2:-} == scale ]] && BUCKET=${SCALE_BUCKET:-ate-node-scale-$PROJECT}
 WORKERS=${WORKERS:-2}
 CAPACITY=${CAPACITY:-4}
 SECRET=${2:-}
-# demo/egress-policy.yaml names the key with substrate's k8s credentialUri; this maps it to SECRET.
-ENV="ATE_BUCKET=$BUCKET,ATE_CAPACITY=$CAPACITY,ATE_SECRET_MAP=ate-secret://k8s.io/default/ate-demo-pi/llm-credentials/gemini-api-key=$PROJECT/$SECRET"
+SECRET_URI=${SECRET_URI:-ate-secret://k8s.io/default/ate-demo-pi/llm-credentials/gemini-api-key}
+ENV="ATE_BUCKET=$BUCKET,ATE_CAPACITY=$CAPACITY,ATE_SECRET_MAP=$SECRET_URI=$PROJECT/$SECRET"
 GC=(--project "$PROJECT" --region "$REGION" --quiet)
 
 sa() {
@@ -31,21 +33,20 @@ sa() {
 
 # setup creates the bucket, lets the service account use it and the secret, and builds the CLI.
 setup() {
-  : "${SECRET:?usage: ./deploy.sh $1 SECRET}"
   gcloud storage buckets describe "gs://$BUCKET" >/dev/null 2>&1 ||
     gcloud storage buckets create "gs://$BUCKET" --project "$PROJECT" --location "$REGION" --uniform-bucket-level-access
   gcloud storage buckets add-iam-policy-binding "gs://$BUCKET" --member "serviceAccount:$(sa)" --role roles/storage.objectAdmin >/dev/null
-  gcloud secrets add-iam-policy-binding "$SECRET" --project "$PROJECT" --member "serviceAccount:$(sa)" --role roles/secretmanager.secretAccessor >/dev/null
+  [[ -z $SECRET ]] || gcloud secrets add-iam-policy-binding "$SECRET" --project "$PROJECT" --member "serviceAccount:$(sa)" --role roles/secretmanager.secretAccessor >/dev/null
   go build -o bin/ate .
 }
 
 case ${1:-} in
 play)
   setup play
-  if gcloud beta run instances describe ate-node "${GC[@]}" >/dev/null 2>&1; then
-    gcloud beta run instances update ate-node "${GC[@]}" --image "$IMAGE" --update-env-vars "ATE_ROLE=all,$ENV"
+  if gcloud beta run instances describe "$INSTANCE" "${GC[@]}" >/dev/null 2>&1; then
+    gcloud beta run instances update "$INSTANCE" "${GC[@]}" --image "$IMAGE" --update-env-vars "ATE_ROLE=all,$ENV"
   else
-    gcloud beta run instances create ate-node "${GC[@]}" --image "$IMAGE" --service-account "$(sa)" \
+    gcloud beta run instances create "$INSTANCE" "${GC[@]}" --image "$IMAGE" --service-account "$(sa)" \
       --sandbox-launcher --cpu 2 --memory 4Gi --port 8080 --set-env-vars "ATE_ROLE=all,$ENV"
   fi
   echo "export ATE_URL=$("$0" url play) PATH=$PWD/bin:\$PATH"
@@ -71,13 +72,13 @@ images)
   ;;
 url)
   case ${2:-} in
-  play) gcloud beta run instances describe ate-node "${GC[@]}" --format 'value(status.urls[0])' ;;
+  play) gcloud beta run instances describe "$INSTANCE" "${GC[@]}" --format 'value(status.urls[0])' ;;
   scale) gcloud run services describe ate-node-ingress "${GC[@]}" --format 'value(status.url)' ;;
   esac
   ;;
 down)
   case ${2:-} in
-  play) gcloud beta run instances delete ate-node "${GC[@]}" ;;
+  play) gcloud beta run instances delete "$INSTANCE" "${GC[@]}" ;;
   scale)
     gcloud run services delete ate-node-ingress "${GC[@]}"
     gcloud beta run worker-pools delete ate-node-workers "${GC[@]}"

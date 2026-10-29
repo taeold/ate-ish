@@ -1,0 +1,64 @@
+$ ate create atespace ate-demo-pi
+  create atespace: {"name":"ate-demo-pi"}
+  [1009 ms]
+$ ate create actor-template -f demo/coding-agents/pi-durable/template.yaml
+  create actor-template: {"atespace":"ate-demo-pi","name":"pi-durable-data"}
+  [1009 ms]
+$ ate create actor demo-agent --template pi-durable-data -a ate-demo-pi
+  ATESPACE      NAME         TEMPLATE          STATE       WORKER   GENERATION   EGRESS POLICY   AGE
+  ate-demo-pi   demo-agent   pi-durable-data   suspended   <none>   0            false           0s
+  [1064 ms]
+$ ate create egress-policy demo-agent -a ate-demo-pi -f /tmp/coding-agents-on-substrate/pi-durable/egress-policy.yaml
+  create egress-policy: {"rules":[{"https":{"hostnames":["generativelanguage.googleapis.com"],"effects":{"replaceHeaders":[{"header":"x-goog-api-key","credentialUri":"ate-secret://k8s.io/default/ate-demo-pi/llm-credentials/gemini-api-key"}]}}}]}
+  [1079 ms]
+$ curl -X POST $ATE_URL/submit -H 'ate-target-actor: ate-demo-pi/demo-agent' -d '{"prompt": "Create app.js with add(a, b) and a test.js that verifies it."}'
+  settled: {"conversationId":1,"type":"input","status":"unanswered","entry":7,"id":8,"reason":"model_error","detail":"{\"error\":{\"message\":\"{\\n  \\\"error\\\": {\\n    \\\"code\\\": 401,\\n    \\\"message\\\": \\\"API key not valid. Please pass a valid API key.\\\",\\n    \\\"status\\\": \\\"UNAUTHENTICATED\\\",\\n    \\\"details\\\": [\\n      {\\n        \\\"@type\\\": \\\"type.googleapis.com/google.rpc.ErrorInfo\\\",\\n        \\\"reason\\\": \\\"ACCESS_TOKEN_TYPE_UNSUPPORTED\\\",\\n        \\\"metadata\\\": {\\n          \\\"service\\\": \\\"generativelanguage.googleapis.com\\\",\\n          \\\"method\\\": \\\"google.ai.generativelanguage.v1beta.GenerativeService.StreamGenerateContent\\\"\\n        }\\n      }\\n    ]\\n  }\\n}\\n\",\"code\":401,\"status\":\"Unauthorized\"}}"}
+  user prompts: ["Create app.js with add(a, b) and a test.js that verifies it."]
+  tool results: []
+  body: {"settled":{"conversationId":1,"type":"input","status":"unanswered","entry":7,"id":8,"reason":"model_error","detail":"{\"error\":{\"message\":\"{\\n  \\\"error\\\": {\\n    \\\"code\\\": 401,\\n    \\\"message\\\": \\\"API key not valid. Please pass a valid API key.\\\",\\n    \\\"status\\\": \\\"UNAUTHENTICATED\\\",\\n    \\\"details\\\": [\\n      {\\n        \\\"@type\\\": \\\"type.googleapis.com/google.rpc.ErrorInfo\\\",\\n        \\\"reason\\\": \\\"ACCESS_TOKEN_TYPE_UNSUPPORTED\\\",\\n        \\\"metadata\\\": {\\n          \\\"service\\\": \\\"generativelanguage.googleapis.com\\\",\\n  
+  status: HTTP/2 200 
+  ingress: ate-parked-ms: 0 ate-resume-ms: 3577 ate-worker: w-e69b6208 
+  [4966 ms]
+$ ate suspend actor demo-agent -a ate-demo-pi
+  ATESPACE      NAME         TEMPLATE          STATE       WORKER   GENERATION   EGRESS POLICY   AGE
+  ate-demo-pi   demo-agent   pi-durable-data   suspended   <none>   1            true            8s
+  [1514 ms]
+$ ate create tag checkpoint-v1 --actor demo-agent -a ate-demo-pi
+  create tag: {"actor":"demo-agent","name":"checkpoint-v1"}
+  [1089 ms]
+$ ate create actor demo-agent-fork --template pi-durable-data --tag checkpoint-v1 -a ate-demo-pi
+  ATESPACE      NAME              TEMPLATE          STATE       WORKER   GENERATION   EGRESS POLICY   AGE
+  ate-demo-pi   demo-agent-fork   pi-durable-data   suspended   <none>   0            false           0s
+  [1087 ms]
+$ ate create egress-policy demo-agent-fork -a ate-demo-pi -f /tmp/coding-agents-on-substrate/pi-durable/egress-policy.yaml
+  create egress-policy: {"rules":[{"https":{"hostnames":["generativelanguage.googleapis.com"],"effects":{"replaceHeaders":[{"header":"x-goog-api-key","credentialUri":"ate-secret://k8s.io/default/ate-demo-pi/llm-credentials/gemini-api-key"}]}}}]}
+  [1137 ms]
+$ curl -X POST $ATE_URL/submit -H 'ate-target-actor: ate-demo-pi/demo-agent' -d '{"prompt": "Add multiply(a, b) and structured logging to app.js."}'
+  settled: {"conversationId":1,"type":"input","status":"unanswered","entry":12,"id":13,"reason":"model_error","detail":"{\"error\":{\"message\":\"{\\n  \\\"error\\\": {\\n    \\\"code\\\": 401,\\n    \\\"message\\\": \\\"API key not valid. Please pass a valid API key.\\\",\\n    \\\"status\\\": \\\"UNAUTHENTICATED\\\",\\n    \\\"details\\\": [\\n      {\\n        \\\"@type\\\": \\\"type.googleapis.com/google.rpc.ErrorInfo\\\",\\n        \\\"reason\\\": \\\"ACCESS_TOKEN_TYPE_UNSUPPORTED\\\",\\n        \\\"metadata\\\": {\\n          \\\"service\\\": \\\"generativelanguage.googleapis.com\\\",\\n          \\\"method\\\": \\\"google.ai.generativelanguage.v1beta.GenerativeService.StreamGenerateContent\\\"\\n        }\\n      }\\n    ]\\n  }\\n}\\n\",\"code\":401,\"status\":\"Unauthorized\"}}"}
+  user prompts: ["Create app.js with add(a, b) and a test.js that verifies it.","Add multiply(a, b) and structured logging to app.js."]
+  tool results: []
+  body: {"settled":{"conversationId":1,"type":"input","status":"unanswered","entry":12,"id":13,"reason":"model_error","detail":"{\"error\":{\"message\":\"{\\n  \\\"error\\\": {\\n    \\\"code\\\": 401,\\n    \\\"message\\\": \\\"API key not valid. Please pass a valid API key.\\\",\\n    \\\"status\\\": \\\"UNAUTHENTICATED\\\",\\n    \\\"details\\\": [\\n      {\\n        \\\"@type\\\": \\\"type.googleapis.com/google.rpc.ErrorInfo\\\",\\n        \\\"reason\\\": \\\"ACCESS_TOKEN_TYPE_UNSUPPORTED\\\",\\n        \\\"metadata\\\": {\\n          \\\"service\\\": \\\"generativelanguage.googleapis.com\\\",\\n
+  status: HTTP/2 200 
+  ingress: ate-parked-ms: 0 ate-resume-ms: 1104 ate-worker: w-e69b6208 
+  [2384 ms]
+$ curl -X POST $ATE_URL/submit -H 'ate-target-actor: ate-demo-pi/demo-agent-fork' -d '{"prompt": "Add divide(a, b) and edge-case tests to test.js."}'
+  settled: {"conversationId":1,"type":"input","status":"unanswered","entry":12,"id":13,"reason":"model_error","detail":"{\"error\":{\"message\":\"{\\n  \\\"error\\\": {\\n    \\\"code\\\": 401,\\n    \\\"message\\\": \\\"API key not valid. Please pass a valid API key.\\\",\\n    \\\"status\\\": \\\"UNAUTHENTICATED\\\",\\n    \\\"details\\\": [\\n      {\\n        \\\"@type\\\": \\\"type.googleapis.com/google.rpc.ErrorInfo\\\",\\n        \\\"reason\\\": \\\"ACCESS_TOKEN_TYPE_UNSUPPORTED\\\",\\n        \\\"metadata\\\": {\\n          \\\"method\\\": \\\"google.ai.generativelanguage.v1beta.GenerativeService.StreamGenerateContent\\\",\\n          \\\"service\\\": \\\"generativelanguage.googleapis.com\\\"\\n        }\\n      }\\n    ]\\n  }\\n}\\n\",\"code\":401,\"status\":\"Unauthorized\"}}"}
+  user prompts: ["Create app.js with add(a, b) and a test.js that verifies it.","Add divide(a, b) and edge-case tests to test.js."]
+  tool results: []
+  body: {"settled":{"conversationId":1,"type":"input","status":"unanswered","entry":12,"id":13,"reason":"model_error","detail":"{\"error\":{\"message\":\"{\\n  \\\"error\\\": {\\n    \\\"code\\\": 401,\\n    \\\"message\\\": \\\"API key not valid. Please pass a valid API key.\\\",\\n    \\\"status\\\": \\\"UNAUTHENTICATED\\\",\\n    \\\"details\\\": [\\n      {\\n        \\\"@type\\\": \\\"type.googleapis.com/google.rpc.ErrorInfo\\\",\\n        \\\"reason\\\": \\\"ACCESS_TOKEN_TYPE_UNSUPPORTED\\\",\\n        \\\"metadata\\\": {\\n          \\\"method\\\": \\\"google.ai.generativelanguage.v1beta.Genera
+  status: HTTP/2 200 
+  ingress: ate-parked-ms: 0 ate-resume-ms: 1093 ate-worker: w-e69b6208 
+  [2393 ms]
+$ ate get actors -a ate-demo-pi
+  ATESPACE      NAME              TEMPLATE          STATE     WORKER       GENERATION   EGRESS POLICY   AGE
+  ate-demo-pi   demo-agent-fork   pi-durable-data   running   w-e69b6208   1            true            7s
+  ate-demo-pi   demo-agent        pi-durable-data   running   w-e69b6208   2            true            17s
+  [1039 ms]
+$ ate get tags -a ate-demo-pi
+  ATESPACE      NAME
+  ate-demo-pi   checkpoint-v1
+  [936 ms]
+$ ate get workers
+  ID           ADDR             ACTORS   LEASE   HOSTED
+  w-e69b6208   127.0.0.1:8080   2/4      live    ate-demo-pi/demo-agent,ate-demo-pi/demo-agent-fork
+  [959 ms]
