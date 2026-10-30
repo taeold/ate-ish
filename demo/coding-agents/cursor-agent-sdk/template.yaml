@@ -9,7 +9,7 @@ containers:
   image: IMAGE
   command:
   - /app/node_modules/.bin/agent-sdk
-  args: [serve, --dir, /app, --mode, single, --host, 0.0.0.0, --port, "8080", --state-root, /workspace/state, --allow-anonymous, --no-playground, --no-docs]
+  args: [serve, --dir, /app, --mode, single, --host, 0.0.0.0, --port, "80", --state-root, /workspace/state, --allow-anonymous, --no-playground, --no-docs]
   env:
   - name: CURSOR_API_KEY
     value: crsr_0000000000000000000000000000000000000000000000000000000000000000
@@ -18,7 +18,7 @@ containers:
   wakeupProbe:
     httpGet:
       path: /v1/info
-      port: 8080
+      port: 80
   volumeMounts:
   - name: workspace
     mountPath: /workspace

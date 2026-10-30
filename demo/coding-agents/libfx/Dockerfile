@@ -1,6 +1,15 @@
-# docker build -t coding-agents/libfx https://github.com/taeold/coding-agents-on-substrate.git#main:libfx/agent
-FROM coding-agents/libfx
-# A sandbox cannot bind a port below 1024, so the server listens on $PORT.
-RUN sed -i 's/server.listen(80,/server.listen(Number(process.env.PORT ?? 80),/' /app/server.ts && grep -q process.env.PORT /app/server.ts
-COPY --from=us-central1-docker.pkg.dev/daniel-junk/ate-ish/ate-ish:latest /usr/local/bin/ate-ish /usr/local/bin/ate-ish
-ENTRYPOINT ["/usr/local/bin/ate-ish", "serve"]
+# The coding-agents-on-substrate libfx agent, unmodified (it already reads
+# AI_GATEWAY_API_KEY itself). Port 80 unchanged: v2's worker runs it
+# directly, no PORT env, no sed. Final stage is $BASE, same reason as
+# demo/coding-agents/pi-durable/Dockerfile.
+ARG BASE=us-central1-docker.pkg.dev/daniel-junk/ate-ish/ate-ish:latest
+FROM node:24-slim AS agent
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
+COPY tools.ts server.ts ./
+RUN mkdir -p /workspace
+
+FROM $BASE
+COPY --from=agent /usr/local/bin/node /usr/local/bin/node
+COPY --from=agent /app /app

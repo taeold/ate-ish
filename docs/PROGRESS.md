@@ -1,5 +1,109 @@
 # ate-node progress
 
+## v2 stage 6 (2026-10-30): the demo table, from real runs
+
+Ran the three coding-agents-on-substrate demos (pi-durable, libfx,
+cursor-agent-sdk) and substrate's own `counter` demo, on v2. Session was
+interrupted once mid-task; resumed cleanly (no stray `runsc`, all actors
+already suspended, `ate-ish-v2` already back on a known image) and
+continued from the cursor-agent-sdk demo onward.
+
+**Local, one node** (`sudo HOME=$HOME ATE_BUCKET=ate-ish-v2-daniel-junk
+ATE_ROLE=all bin/ate-ish serve`). Each demo's own agent installed directly
+on this VM under `/actor-<demo>` (`npm ci --omit=dev` from the demo's own
+`package.json`/`package-lock.json`; ~2-13s each), because v2's rootfs is
+the node's own filesystem. Each demo's own `template.yaml`/
+`egress-policy.yaml` used as written, with only the two forced deviations
+recorded in the README (`command` added; Gemini swapped for the Gateway
+on pi-durable per `demo/pi-durable`'s own variant; libfx's
+`credentialUri` pointed at `ate-secret://secretmanager.googleapis.com/...`
+since the `k8s.io` form is not one `egress.go` resolves).
+
+- pi-durable: full walkthrough (turn 1, suspend, tag, fork, turn 2 on
+  both). Pass. Turn 1 8.8s; turn 2 13.4s / 14.0s.
+- libfx: turn 1 only. Reproduces the known stuck-after-stream issue: the
+  ndjson showed every step (write `app.js`, write `test.js`, `node
+  test.js`, `node --test`, all passing) inside 60s, but the HTTP response
+  never closed (curl timed out, rc 124).
+- cursor-agent-sdk: session create + stream, no key, as documented.
+  `POST /v1/session` 5.8s; stream showed `turn.started` then
+  `turn.failed` `"Invalid User API Key"` 1.27s later. Matches the
+  expected stopping point exactly.
+- substrate `counter` (`/tmp/substrate/demos/counter`, built with
+  `GOFLAGS=-mod=readonly go build`, no change to `/tmp/substrate`'s git
+  state): MEMORY-fidelity template (top-level `preferredFidelity: MEMORY`;
+  the demo's own nested `snapshotConfig.preferredFidelity` is a field
+  `records.go`'s `Template` ignores). Two suspend/resume cycles: memory,
+  file, and rootfs counters went 3 -> suspend/resume -> 4 ->
+  suspend/resume -> 5, always equal. **Pass — this is the exact case that
+  failed on v1** (process restart on resume zeroed the in-memory
+  counter); v2's real runsc checkpoint fixes it.
+
+**Cloud Run gen2** (`ate-ish-v2`), pi-durable and libfx, one at a time.
+Built `demo/coding-agents/<demo>/` into images on top of `ate-ish:latest`
+(`FROM $BASE`, not the demo's own `node:24-slim` image — the final stage
+has to carry `ateworker-gvisor`, `bin/runsc`, and the `kodata` directory
+`atelet.go`'s `stageKodata` reads by a path relative to `WORKDIR /ate-ish`,
+all of which only `ate-ish:latest` ships; a first attempt using the
+demo's own base image as the final stage crashed the whole worker with
+"reading the vendored internal_flags.json: ... no such file or
+directory" on every boot, confirmed by `docker cp`-inspecting the broken
+image and comparing it against the working `ate-ish:latest`). A second
+mistake, caught from the actor's own crash log
+("`Error: Cannot find module '/actor-pi-durable/server-gateway.ts'`"):
+the gen2 run must use the image-path template
+(`demo/coding-agents/pi-durable/template.yaml`, `command: [node,
+/app/server.ts]`), not the local-run template pointing at
+`/actor-pi-durable/...`, a path that only exists on this VM.
+
+- `docker build --platform linux/amd64 -t $REPO/coding-agents-pi-durable
+  demo/coding-agents/pi-durable && docker push ...` (15-20s build, 4-6s
+  push); `IMAGE=$REPO/coding-agents-pi-durable:latest ./deploy.sh play`
+  (72-106s). Full walkthrough: pass. Turn 1 6.6s; turn 2 7.2s / 11.5s.
+- Same for `coding-agents-libfx` (8s build, 4s push, 103s redeploy). Turn
+  1: egress allowed (`egress ... allowed=true` in the worker log), but
+  the stuck-after-stream issue reproduces here too — only `turn_start`
+  logged in 90s, and a second request against the same session hung with
+  zero output. `ate-ish suspend actor` still worked on the wedged actor
+  in both the local and gen2 case (1-2s), so the lock is in the HTTP
+  response path, not suspend.
+- Redeployed `ate-ish-v2` back to `$REPO/pi-durable:latest` (the original
+  quickstart image) to end on it, per the brief; confirmed healthy
+  (`get workers` returns live leases) before finishing.
+
+**README**: replaced the "Agent Substrate's demo templates" pass/fail
+table with this round's results (demo, fidelity asked, what ran, what
+changed, result, numbers); rewrote "Running the Agent Substrate demos"
+for v2 (no port edits, no sandbox-launcher, the `/actor-<demo>` local
+install and the `FROM $BASE` image build); fixed three now-false Limits
+bullets this stage's own work contradicted ("No ports below 1024",
+"ROOTFS fidelity only", "Egress is enforced by convention") and added the
+libfx stuck-after-stream finding. Left the gen2-cgroup and rootfs-copy
+bullets from stage 5f as is (still true, re-confirmed by this round's
+redeploys). Did not touch the README's top-level quickstart/walkthrough
+sections or the `Measured`/`Estimated cost` sections; out of this stage's
+scope.
+
+**New files** (none committed, per the brief): `demo/coding-agents/pi-durable/{package.json,package-lock.json,server-gateway.ts}`,
+`demo/coding-agents/libfx/{package.json,package-lock.json,server.ts,tools.ts,egress-policy.yaml}`,
+`demo/coding-agents/cursor-agent-sdk/{package.json,package-lock.json,bot/,egress-policy.yaml}`.
+Changed: `demo/coding-agents/{pi-durable,libfx,cursor-agent-sdk}/{Dockerfile,template.yaml}`
+(port 80, `FROM $BASE`, `command` added); `README.md`.
+
+**Resources left running**: `ate-ish-v2` (gen2, back on
+`us-central1-docker.pkg.dev/daniel-junk/ate-ish/pi-durable:latest`,
+healthy). Local `bin/ate-ish serve` (this VM, `ATE_BUCKET=ate-ish-v2-daniel-junk`)
+still running in the background from this session; all actors created
+this stage (local and gen2, atespaces `ate-s6-*`) suspended. No stray
+`runsc` sandboxes, checked before and after. `ate-node` (v1) and
+`/tmp/substrate`'s git state untouched.
+
+Cloud spend this stage: two gen2 redeploys' worth of build/push/update
+time plus the libfx/pi-durable image storage; no new instances or
+buckets created.
+
+No commit made, per the brief.
+
 ## v2 stage 5f (2026-10-30): the subcontainer cgroup path, patched; `gate.sh play` green on real gen2
 
 Brief (coordinator): get past the subcontainer cgroup wall, in order of
