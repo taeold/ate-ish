@@ -21,33 +21,39 @@ import (
 // and the one the worker is told (--atunnel-broker-identity) to require.
 var ateletSPIFFE = installdefaults.AteletSPIFFEID(installdefaults.SystemNamespace)
 
-// cgroupLeaf is where startWorker moves this process before forking the
+// cgroupLeafFor is where startWorker moves this process before forking the
 // worker subprocess with a fresh cgroup namespace (see its doc comment).
-const cgroupLeaf = "/sys/fs/cgroup/ate-ish-worker"
+// Stage 4 (two nodes, one host): the real cgroupfs is not namespaced away
+// from the ate-ish parent process (only the forked ateworker-gvisor gets
+// CLONE_NEWCGROUP), so a single fixed leaf would have a second node's
+// startup clean up and reuse the first node's still-live leaf. nodeTag
+// (ATE_DIR's base name, stable across one node's restarts, distinct between
+// nodes) keeps each node in its own leaf.
+func cgroupLeafFor(nodeTag string) string { return "/sys/fs/cgroup/ate-ish-worker-" + nodeTag }
 
 // moveSelfIntoLeafCgroup and cleanupLeafCgroup replicate stage 0's cgroup
 // namespace trick: internal/ateworker/cgroup.Delegate needs
 // /proc/self/cgroup to read "0::/" inside the worker's own cgroup
 // namespace, which only happens when the namespace root at clone(2) time is
 // a leaf this process already sits in.
-func moveSelfIntoLeafCgroup() error {
-	cleanupLeafCgroup()
-	if err := os.MkdirAll(cgroupLeaf, 0o755); err != nil {
+func moveSelfIntoLeafCgroup(leaf string) error {
+	cleanupLeafCgroup(leaf)
+	if err := os.MkdirAll(leaf, 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(cgroupLeaf+"/cgroup.procs", []byte(fmt.Sprintf("%d", os.Getpid())), 0o644)
+	return os.WriteFile(leaf+"/cgroup.procs", []byte(fmt.Sprintf("%d", os.Getpid())), 0o644)
 }
 
 // cleanupLeafCgroup undoes what a previous run's worker left behind:
 // cgroup.Delegate enables every controller in subtree_control and moves
 // itself into a "worker" child leaf, and cgroupfs refuses to add a process
 // to a non-leaf cgroup (the "no internal processes" rule).
-func cleanupLeafCgroup() {
+func cleanupLeafCgroup(leaf string) {
 	for _, c := range []string{"cpuset", "cpu", "io", "memory", "hugetlb", "pids", "rdma"} {
-		_ = os.WriteFile(cgroupLeaf+"/cgroup.subtree_control", []byte("-"+c), 0o644)
+		_ = os.WriteFile(leaf+"/cgroup.subtree_control", []byte("-"+c), 0o644)
 	}
-	_ = os.Remove(cgroupLeaf + "/worker")
-	_ = os.Remove(cgroupLeaf)
+	_ = os.Remove(leaf + "/worker")
+	_ = os.Remove(leaf)
 }
 
 // ateworkerConfig is what startAteworker needs to launch the vendored
@@ -56,6 +62,7 @@ type ateworkerConfig struct {
 	binary      string // bin/ateworker-gvisor
 	kodata      string // third_party/substrate/cmd/ateworker-gvisor/kodata (internal_flags.json)
 	podUID      string
+	nodeTag     string // ATE_DIR's base name: scopes the cgroup leaf and the stale-process pkill to this node only
 	maxActors   int
 	pki         *devatelet.PKI
 	readyPort   int
@@ -68,11 +75,18 @@ type ateworkerConfig struct {
 // namespace and a fresh cgroup2 mount, the same way a kubelet-run pod would
 // give it one (see moveSelfIntoLeafCgroup).
 func startAteworker(cfg ateworkerConfig) (*exec.Cmd, error) {
-	selfSafePattern := "[" + cfg.binary[:1] + "]" + cfg.binary[1:]
+	// Stage 4: two nodes on this host run the identical binary path, so a
+	// pattern on cfg.binary alone (single-node assumption) would pkill the
+	// OTHER node's live ateworker-gvisor the moment this node starts.
+	// cfg.pki.Path(...) embeds this node's own ATE_DIR, unique per node, so
+	// scoping the kill pattern to it only ever reaps this node's own stale
+	// process from a previous, uncleanly-stopped run.
+	marker := cfg.pki.Path(devatelet.WorkerCredentialBundleFile)
+	selfSafePattern := "[" + marker[:1] + "]" + marker[1:]
 	_ = exec.Command("pkill", "-9", "-f", selfSafePattern).Run()
 	time.Sleep(300 * time.Millisecond)
 
-	if err := moveSelfIntoLeafCgroup(); err != nil {
+	if err := moveSelfIntoLeafCgroup(cgroupLeafFor(cfg.nodeTag)); err != nil {
 		return nil, fmt.Errorf("moving into leaf cgroup: %w", err)
 	}
 

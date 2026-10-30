@@ -1,5 +1,196 @@
 # ate-node progress
 
+## v2 stage 4 (2026-10-30): two nodes, one bucket
+
+Brief (docs/V2.md stage 4): two ate-ish processes on this VM, different
+ports/node ids/worker dirs/lease addresses, one bucket, either node
+accepts ingress. Gate: an actor created and run through node A, suspended,
+resumed through node B and actually running there with its history; a
+capacity-1-per-node park/503 test with three actors; `./gate.sh play`
+still green against node A alone.
+
+Gate: PASS, all three parts.
+
+(1) Cross-node resume. `ate-ish create actor cross-node ...`, turn 1
+through node A's ingress (port 8080) — ran on node A (`w-0ab34a93`),
+`settled.status: done`. `ate-ish suspend actor cross-node`. Node A then
+relaunched with `ATE_CAPACITY=0` (forces every placement elsewhere, the
+deterministic way to prove node B specifically, since both nodes'
+fewest-hosted tie would otherwise pick either). Turn 2 submitted to node
+A's own ingress (port 8080, the one node A never stopped accepting on):
+`Ate-Worker: w-22845e0a` (node B), node B's own log shows `[fake-atelet]
+MintActorCertificate` + `actor started ... generation=4` + `egress
+... allowed=true`, all minted and served by node B's own, independent PKI
+and gateway — never node A's. The resumed actor's history carried on (14
+messages across the two turns, same conversation). Timings: resume_ms
+2612, total request 5364 ms (includes the real model turn).
+
+(2) Capacity-1 park/503. Both nodes relaunched at `ATE_CAPACITY=1`. Three
+fresh actors (a1, a2, a3) created, then three concurrent `/submit` calls
+fired at node A's ingress. Result: a2 ran on node A (`w-4d371b1e`), a3 ran
+on node B (`w-6beb5257`) — one per node — and a1 parked for the full 5 s
+placement budget then got exactly `503` with body `actor
+ate-stage4/a1: no worker has room for the actor` (`errNoRoom`'s own
+message, verbatim). Recorded which: **parks and 503s**, not "served after
+one finishes" — `place()`'s 5 s budget expired before either slot freed
+(neither turn had finished suspending).
+
+(3) `./gate.sh play` alone. Both multi-node processes stopped, node A
+relaunched solo at `ATE_CAPACITY=4` (its ordinary single-node shape).
+`ATE_URL=http://127.0.0.1:8080 AS=ate-gate-stage4 ./gate.sh` and a second
+run with a different `AS`: both exit 0, including the create/turn/
+suspend/tag/fork/divergent-turns sequence and the three egress-enforcement
+assertions (unlisted-host refusal with and without the proxy env var, the
+listed-host-no-header 401). Unaffected by anything stage 4 changed, as
+expected — single-node is still the default shape of every port/dir/cgroup
+parameterization below.
+
+What assumed one node, and the fix for each (none touched any vendored
+file):
+
+- **ateworker-gvisor's own control ports.** `worker.go` hardcoded
+  `--readiness-listen-address`, `--atunnel-listen-address`,
+  `--atunnel-connect-listen-address` to 28080/28443/28444 — these bind on
+  the *host* network namespace (unlike the actor sandboxes, which get their
+  own netns from `internal/ateworker/actornet`), so a second node's
+  subprocess would fail to bind the instant it tried. Fixed: `worker.go`
+  now reads `ATE_READY_PORT`/`ATE_ATUNNEL_PORT`/`ATE_CONNECT_PORT`
+  (defaulting to the old hardcoded values, so single-node callers see no
+  change), one disjoint triple per node.
+- **The stale-process pkill pattern.** `atelet.go`'s `startAteworker`
+  cleaned up a leftover `ateworker-gvisor` from an unclean previous run by
+  `pkill -f` matching the bare binary path — identical for every node,
+  since every node runs the same binary at the same relative path. Node
+  B's own startup would `pkill -9` node A's *live* worker subprocess out
+  from under it the moment it started. Found by reading the code, not by
+  reproducing the kill blind: confirmed it was real by checking that the
+  pattern string (`bin/ateworker-gvisor`) has no node-specific component
+  anywhere in `ateworkerConfig`. Fixed: the kill pattern now matches
+  `cfg.pki.Path(WorkerCredentialBundleFile)`, which embeds that node's own
+  `ATE_DIR` — unique per node, stable across one node's own restarts (so
+  same-node stale cleanup still works), never matching another node's
+  process.
+- **The cgroup leaf.** `moveSelfIntoLeafCgroup`/`cleanupLeafCgroup` used a
+  single fixed path, `/sys/fs/cgroup/ate-ish-worker` — real cgroupfs, not
+  namespaced away from the ate-ish *parent* process (only the forked
+  `ateworker-gvisor` gets `CLONE_NEWCGROUP`). A second node's startup would
+  call `cleanupLeafCgroup` against the first node's still-populated leaf
+  (removal silently ignored, since errors there were already swallowed)
+  and then move its own PID into that shared leaf, racing both nodes for
+  the same "/worker" child `cgroup.Delegate` creates — this surfaces
+  either as an outright startup error (cgroup v2 refuses adding a process
+  to a non-leaf cgroup once it has children) or silent cross-node resource
+  accounting. Fixed: `cgroupLeafFor(nodeTag)` suffixes the path with
+  `filepath.Base(ATE_DIR)`, so each node gets its own leaf
+  (`ate-ish-worker-ate-ish-a`, `ate-ish-worker-ate-ish-b` this run).
+- **`nodepath.BasePath` (`/var/lib/ate`), a vendored `const`.** Everything
+  the vendored worker and `internal/devatelet`'s fake atelet pin to a
+  fixed host path hangs off this one constant — most critically
+  `WorkerSupportSocket` (`/var/lib/ate/worker-support.sock`, no per-node
+  component at all): a second node's `ServeFakeAtelet` would
+  `os.RemoveAll` and re-`Listen` on the exact path the first node's own
+  worker subprocess dials for every `MintActorCertificate`/
+  `GetActorEgressPolicy` call, silently rewiring node A's atunnel to node
+  B's atelet on next reconnect. Cannot be fixed in Go without patching a
+  vendored file (disallowed; `BasePath` is a `const`, not a flag). Fixed
+  outside the Go tree instead, in the launch invocation: node B runs
+  inside `unshare --mount --propagation private`, with
+  `mount --bind /var/lib/ate-b /var/lib/ate` performed first thing inside
+  that new namespace, before `exec bin/ate-ish serve`. Every vendored
+  path rooted at `/var/lib/ate` (the socket, `ActorsDir`, `WorkersDir`,
+  the OTLP relay socket) now resolves against a private directory for
+  node B, invisible to node A and vice versa; the forked
+  `ateworker-gvisor` subprocess inherits the same remapped view, since its
+  own `CLONE_NEWNS` namespace starts as a copy of whatever node B's parent
+  already sees. Node A keeps the host's real `/var/lib/ate`, unchanged —
+  this is purely additive for additional nodes.
+  - **Side effect this surfaced, fixed in Go:** `bundle.go`'s `stageRunsc`
+    hardlinked the runsc release into the actor's `sandbox-assets` dir.
+    `link(2)` refuses across a bind-mount boundary with `EXDEV` even when
+    both paths resolve to the same underlying device (confirmed: `stat`
+    showed identical `st_dev` on both sides; the kernel's `do_linkat`
+    compares `vfsmount` identity, not device number) — node B's first
+    actor boot failed with `linking "bin/runsc/containerd-shim-runsc-v1":
+    ... invalid cross-device link`. Fixed with a `copyFile` fallback used
+    only on `EXDEV`, so the single-node, same-mount case still gets the
+    cheap hardlink unchanged.
+- **Placement and the lease address.** Checked, not changed:
+  `ingress.go`'s `place()` already asks every live lease with room,
+  fewest-hosted first, and `Lease.Addr` (worker.go's `writeLease`) was
+  already the flag-supplied `addr`, not a hardcoded host — this part of
+  V2.md's stage 4 ask ("a lease carries the address other nodes reach this
+  node on... any node accepts ingress") was already true going into this
+  stage, nothing to fix. Verified by the gate itself: node A's ingress
+  correctly proxied to node B's `127.0.0.1:8081` lease address in test (1).
+
+**Where the node CA key lives, and why it did not need to move to the
+bucket:** each node's `devatelet.GeneratePKI` still generates its own,
+fresh, node-local CA (unchanged from stage 2/3; lives only in that node's
+own `ATE_DIR/pki`, never written to the bucket). This turned out to be
+sufficient, not a gap: an actor's client certificate for atunnel is
+minted fresh on *every* boot (`RunWorkload`/`RestoreWorkload`), by
+whichever node is booting it, from that node's own atelet
+(`MintActorCertificate`, `internal/devatelet/fakeatelet.go`) — and that
+same node's own egress gateway is the only gateway address the boot
+request names (`egressGateway{Address: w.gateway.Addr}` in `worker.go`'s
+`boot`), trusting its own node CA (`startEgressGateway`'s `nodeCAPEM`
+argument). An actor's certificate therefore only ever has to be accepted
+by the gateway that minted it; it never crosses a node boundary. Verified
+directly in test (1)'s log: node B minted `cross-node`'s certificate and
+accepted it at its own gateway, with no reference to node A's CA at all.
+If a future stage needs a certificate to outlive the node that minted it
+(e.g. an in-flight TCP connection surviving a resume onto a different
+node, which this design does not attempt — a resume always re-boots and
+re-mints), *that* is when the CA key would need to move to the bucket;
+stage 4's gate does not exercise that case, so the brief's "simplest: CA
+key in the bucket" option was not built.
+
+Timings: see gate (1)-(3) above; cross-node resume total 5.4 s wall
+(resume_ms 2612, the rest the actual model turn through the real AI
+Gateway).
+
+Commands (abbreviated; full session used explicit PIDs for restarts
+between capacity changes):
+```
+# Node A
+sudo HOME=$HOME ATE_BUCKET=ate-ish-v2-daniel-junk ATE_ROLE=all \
+  ATE_DIR=/var/lib/ate-ish-a PORT=8080 ATE_CAPACITY=4 bin/ate-ish serve
+
+# Node B: private /var/lib/ate so the vendored WorkerSupportSocket path
+# (and every other nodepath.BasePath-rooted path) does not collide with
+# node A's.
+sudo HOME=$HOME unshare --mount --propagation private -- bash -c '
+  mkdir -p /var/lib/ate /var/lib/ate-b
+  mount --bind /var/lib/ate-b /var/lib/ate
+  export ATE_BUCKET=ate-ish-v2-daniel-junk ATE_ROLE=all \
+    ATE_DIR=/var/lib/ate-ish-b PORT=8081 ATE_CAPACITY=4
+  export ATE_READY_PORT=29080 ATE_ATUNNEL_PORT=29443 ATE_CONNECT_PORT=29444
+  exec bin/ate-ish serve
+'
+
+# Gate (1): create+turn1 via node A, suspend, turn2 via node A's own
+# ingress with node A at ATE_CAPACITY=0 (forces the cross-node path).
+curl -X POST http://127.0.0.1:8080/submit -H 'ate-target-actor: AS/cross-node' ...
+
+# Gate (2): both nodes at ATE_CAPACITY=1, three actors, three concurrent
+# POSTs at node A's ingress (see run_one() in the session transcript).
+
+# Gate (3), node A alone, default capacity:
+ATE_URL=http://127.0.0.1:8080 AS=ate-gate-stage4 ./gate.sh
+```
+
+Files changed: `worker.go` (configurable atunnel/ready/connect ports,
+`nodeTag` threaded into `ateworkerConfig`); `atelet.go`
+(`cgroupLeafFor`/parameterized `moveSelfIntoLeafCgroup`/
+`cleanupLeafCgroup`, node-scoped pkill pattern); `bundle.go` (`stageRunsc`
+EXDEV fallback to `copyFile`). No vendored file touched. No bucket records
+left running: every actor created this stage (`cross-node`, `a1`, `a2`,
+`a3`, and `gate.sh`'s own `demo-agent`/`demo-agent-fork` under
+`ate-gate-stage4`/`ate-gate-stage4-2`) suspended before shutdown; both
+node processes stopped cleanly (`suspendAll`, lease deleted); no stray
+`ateworker-gvisor` or `runsc` processes left (checked before and after).
+No commit made, per the brief.
+
 ## v2 stage 3 (2026-10-30): egress through the worker's network, with credential injection
 
 Brief (docs/V2.md stage 3 plus the coordinator's message): replace

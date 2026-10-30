@@ -117,16 +117,27 @@ func newWorker(ctx context.Context, b *bucket, addr string, capacity int, dir st
 		return nil, fmt.Errorf("starting the egress gateway: %w", err)
 	}
 
+	// Stage 4: two nodes on this host each start their own ateworker-gvisor,
+	// which (unlike the actor sandboxes it launches) is not network-namespace
+	// isolated from the host, so a single fixed port triple (single-node
+	// assumption) would have the second node fail to bind. ATE_READY_PORT/
+	// ATE_ATUNNEL_PORT/ATE_CONNECT_PORT let each node's launcher pick a
+	// disjoint triple; defaults keep the single-node case unchanged.
+	readyPort, _ := strconv.Atoi(env("ATE_READY_PORT", "28080"))
+	atunnelPort, _ := strconv.Atoi(env("ATE_ATUNNEL_PORT", "28443"))
+	connectPort, _ := strconv.Atoi(env("ATE_CONNECT_PORT", "28444"))
+
 	podUID := "ate-ish-" + randomHex(4)
 	cmd, err := startAteworker(ateworkerConfig{
 		binary:      workerBinaryInBin,
 		kodata:      workerKodataPath,
 		podUID:      podUID,
+		nodeTag:     filepath.Base(dir),
 		maxActors:   capacity,
 		pki:         pki,
-		readyPort:   28080,
-		atunnelPort: 28443,
-		connectPort: 28444,
+		readyPort:   readyPort,
+		atunnelPort: atunnelPort,
+		connectPort: connectPort,
 		logFile:     filepath.Join(dir, "ateworker-gvisor.log"),
 	})
 	if err != nil {

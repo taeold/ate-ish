@@ -1,11 +1,14 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/taeold/ate-ish/third_party/substrate/exported/nodepath"
 	"github.com/taeold/ate-ish/third_party/substrate/exported/proto/ateworkerpb"
@@ -69,6 +72,16 @@ func prepareActorDirs(d *actorDirs, volumeNames []string, systemInfoNames []stri
 // whole layout is needed) into the actor's sandbox assets dir, the only
 // place validateRunscPath lets a request name. Hardlinks instead of copies:
 // cheap, and runscRelease never changes under a running actor.
+//
+// Stage 4 (two nodes, one host): isolating a node's nodepath.BasePath
+// (/var/lib/ate) with a private bind mount, so two nodes' fixed vendored
+// socket paths do not collide (see docs/PROGRESS.md's stage 4 notes), puts
+// the actor's sandbox-assets dir on a different vfsmount than this
+// relative runscRelease path even though both resolve to the same
+// underlying device: link(2) refuses that with EXDEV (the kernel compares
+// mount instances, not device numbers). copyFile is the fallback, used only
+// when linking fails, so the single-node, same-mount case still gets the
+// cheap hardlink.
 func stageRunsc(runscRelease string, d *actorDirs) error {
 	if err := os.RemoveAll(d.sandboxAssetsDir); err != nil {
 		return err
@@ -89,10 +102,32 @@ func stageRunsc(runscRelease string, d *actorDirs) error {
 			return os.MkdirAll(dst, 0o755)
 		}
 		if err := os.Link(path, dst); err != nil {
-			return fmt.Errorf("linking %q: %w", path, err)
+			if !errors.Is(err, syscall.EXDEV) {
+				return fmt.Errorf("linking %q: %w", path, err)
+			}
+			if err := copyFile(path, dst, info.Mode()); err != nil {
+				return fmt.Errorf("copying %q (link crossed a mount): %w", path, err)
+			}
 		}
 		return nil
 	})
+}
+
+// copyFile is stageRunsc's fallback when path and dst are not on the same
+// vfsmount (see stageRunsc's doc comment).
+func copyFile(path, dst string, mode os.FileMode) error {
+	src, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, mode)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	_, err = io.Copy(out, src)
+	return err
 }
 
 // mountBundleRootfs builds containerName's OCI bundle rootfs as a runsc
