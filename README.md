@@ -1,6 +1,28 @@
 # ate-ish
 
-ate-ish is a small [Agent Substrate](https://github.com/agent-substrate/substrate) for Cloud Run: one binary, one bucket, no cluster.
+ate-ish is a small [Agent Substrate](https://github.com/agent-substrate/substrate) for Cloud Run: one binary, one bucket, no cluster. Write an Agent Substrate actor (a Dockerfile, a `template.yaml`, and optionally an `egress-policy.yaml`), and deploy it to Cloud Run in one command:
+
+```bash
+go install github.com/taeold/ate-ish@latest   # or: download a release binary
+printf %s "$AI_GATEWAY_API_KEY" | gcloud secrets create ai-gateway-token --data-file=-
+
+cd your-actor-directory   # holds Dockerfile, template.yaml, egress-policy.yaml
+ate-ish deploy -f template.yaml -e egress-policy.yaml
+```
+
+Run it from the actor's own directory (where its `Dockerfile` lives). `ate-ish deploy` builds that Dockerfile, adds `ate-ish` and its vendored gVisor worker on top, pushes the image to an Artifact Registry repo named `ate-ish` in your project (created if missing), creates the bucket `gs://ate-ish-$PROJECT` and grants it and every secret the egress policy's `credentialUri`s name to the default compute service account, creates or updates the Cloud Run gen2 instance (default name `ate-ish`), uploads the template and egress policy, creates one actor, and prints the URL, the `export` line, and a ready-to-paste `curl` with the actor header. It is idempotent: rerun it after a code change and it converges instead of failing on things that already exist. `ate-ish deploy --down` deletes the instance and keeps the bucket.
+
+Before you run it:
+
+- A template that leaves `command` to the image's own `CMD`/`ENTRYPOINT` (as the upstream demos' templates do) gets it filled in automatically, read from the image `deploy` just built; `ate-ish` does not otherwise read the image's configuration.
+- Store the credential your egress policy's `credentialUri` names in Secret Manager, in the native `ate-secret://secretmanager.googleapis.com/<project>/<secret>` form. A policy using another form (such as a demo's `ate-secret://k8s.io/...`) gets a warning naming the `ATE_SECRET_MAP` line that would resolve it; rewriting the policy to the native form is simpler.
+- Use a billed project, the Google Cloud CLI, Docker, and Go 1.27 or later (to build `ate-ish` itself, or to use `go install`). Cloud Run instances and sandboxes are in preview.
+- `--project` and `--region` (default `us-west1`) override your gcloud project and region; `--name` (default `ate-ish`) sets the instance name, so more than one actor can run as separate instances.
+- Your gcloud account needs permission to invoke the instance, such as the Cloud Run Invoker role.
+
+## Manual deploy
+
+The steps above as their own commands, `deploy.sh` and the CLI's own `create` verbs, useful when you want to see or change one step (a different bucket layout, an existing image, a template already uploaded):
 
 ```bash
 ./deploy.sh play gemini-api-key

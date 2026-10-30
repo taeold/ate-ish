@@ -1,7 +1,8 @@
 // ate-ish is a small Agent Substrate for Cloud Run: one program, one bucket.
 //
-//	ate-ish serve   the server; ATE_ROLE=all|ingress|worker (worker needs root)
-//	ate-ish ...     the CLI (create, get, suspend, delete)
+//	ate-ish serve    the server; ATE_ROLE=all|ingress|worker (worker needs root)
+//	ate-ish deploy   builds, pushes, deploys to Cloud Run, and creates the actor, in one command
+//	ate-ish ...      the CLI (create, get, suspend, delete)
 package main
 
 import (
@@ -26,6 +27,8 @@ func main() {
 	switch cmd := append(os.Args[1:], "")[0]; cmd {
 	case "serve":
 		err = serve()
+	case "deploy":
+		err = runDeploy(os.Args[2:])
 	default:
 		err = runCLI(os.Args[1:])
 	}

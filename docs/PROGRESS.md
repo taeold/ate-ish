@@ -1,5 +1,113 @@
 # ate-node progress
 
+## v2 stage 7 (2026-10-30): the hook itself, `ate-ish deploy`
+
+Built the `deploy` subcommand (`deploy.go`, wired into `main.go`'s dispatch
+next to `serve`). Plain Go shelling out to `docker` and `gcloud`, same
+approach as `deploy.sh`, not an SDK. `ate-ish deploy -f template.yaml [-e
+egress-policy.yaml] [--project P] [--region R] [--name N] [--base IMAGE]
+[--no-actor] [--down]`, run from a directory holding the actor's own
+Dockerfile:
+
+1. Builds that Dockerfile as its own image, then a generated wrapper
+   Dockerfile (`FROM <that image>`, the apt packages the worker needs —
+   `ca-certificates nftables iproute2 util-linux kmod python3 curl`, the
+   exact list from the base `ate-ish` image's own Dockerfile — plus
+   `COPY --from=<base>` of `/usr/local/bin/ate-ish`, `bin/ateworker-gvisor`,
+   `bin/runsc` and the `kodata` directory, `WORKDIR /ate-ish`, and the
+   `ENTRYPOINT`). `--base` defaults to the published
+   `us-central1-docker.pkg.dev/daniel-junk/ate-ish/ate-ish:latest`.
+2. Pushes to `<region>-docker.pkg.dev/<project>/ate-ish/<name>:latest`,
+   creating that Artifact Registry repo if missing.
+3. Creates `gs://ate-ish-<project>` if missing, grants the compute service
+   account `objectAdmin` on it, and `secretAccessor` on every secret a
+   `ate-secret://secretmanager.googleapis.com/<project>/<secret>`
+   `credentialUri` in the egress policy names — the native form; a
+   `k8s.io` or other form gets a printed warning naming the
+   `ATE_SECRET_MAP` line that would resolve it, rather than failing (the
+   "or better" option in the brief).
+4. Creates or updates the Cloud Run gen2 instance with `deploy.sh play`'s
+   own flags (2 vCPU, 4Gi, the in-memory rootfs volume, `ATE_ROLE=all`),
+   then polls `GET /admin/workers` (`waitInstanceReady`) instead of
+   racing the 40-50s rootfs copy — the first version of this command
+   hit the instance immediately after `create`/`update` and got a 500.
+5. Creates the atespace from the template's `metadata.atespace`, uploads
+   the template, creates one actor named after the template (unless
+   `--no-actor`), and the egress policy if given.
+6. Prints the URL, the `export` line, and one ready `curl` with the actor
+   header.
+
+**One real gap found and closed**: the upstream demos' own templates
+leave `command` to the image's `CMD`, which `ate-ish` never reads
+(`records.go`'s `Container` has no image lookup) — confirmed by the gate
+run below failing with `400: a template needs exactly one container with
+a command`. Fixed by reading the user's own image's effective command
+with `docker inspect` (its `ENTRYPOINT`, or `CMD` alone if it has none)
+right after building it, before the wrapper stage's own `ENTRYPOINT`
+overwrites that metadata, and filling it into the uploaded template JSON
+at the generic `map[string]any` level (not by round-tripping through
+`records.go`'s `Template`/`Container` structs, which do not model every
+template field — `workerSelector`, `resources`, `snapshotConfig` would
+have been dropped) only when the template itself leaves `command` empty.
+Idempotency: `create` calls that 409 (template, actor, atespace already
+present from a prior run of the same command) are treated as success
+(`idempotent`), so a rerun converges.
+
+**Gate, exactly as asked**: fresh clone of
+`https://github.com/taeold/coding-agents-on-substrate`, `pi-durable/agent`
+(the directory holding its own `Dockerfile`; the demo's `template.yaml`
+and `egress-policy.yaml` live one level up, in `pi-durable/`, referenced
+by relative path, not copied).
+
+```bash
+git clone https://github.com/taeold/coding-agents-on-substrate /tmp/gate-clone
+cd /tmp/gate-clone/pi-durable/agent
+ate-ish deploy -f ../template.yaml -e ../egress-policy.yaml \
+  --name ate-ish-demo --project daniel-junk --region us-west1
+```
+
+**The model key, the one accepted deviation**: Gemini is revoked in this
+project, so the demo cannot otherwise call a model. `template.yaml` stays
+byte-for-byte untouched (still `GEMINI_API_KEY: ate-placeholder-key`).
+Two files changed, as the brief allowed: `egress-policy.yaml`'s
+hostname/header/credentialUri point at the Vercel AI Gateway instead of
+Gemini, and `agent/server.ts` swaps providers. The two lines that matter
+in `server.ts`:
+
+```ts
+import { vercelAIGatewayProvider } from "@earendil-works/pi-ai/providers/vercel-ai-gateway";
+process.env.AI_GATEWAY_API_KEY = process.env.GEMINI_API_KEY;  // the gateway provider only reads this env var
+```
+
+(plus the matching `setProvider`/`modelId` lines). `agent/Dockerfile`
+never changed — it just `COPY`s whatever is named `server.ts`.
+
+**Timings** (first run hit two bugs, fixed in `deploy.go`, both described
+above; this is the clean, fixed-code run): wall time from command start
+to the printed URL, **155s** (image build+push ~45s, bucket/IAM ~15s,
+instance update+boot-wait ~90s, atespace/template/actor <1s). First
+turn through the actor header after that, a separate `curl`: **3.2s**,
+`"settled":{"status":"done"}`, answer `"pong"` — a real model answer
+through the Gateway, not the placeholder key. `ate-ish deploy --down`:
+**11s**.
+
+**Resources**: `ate-ish-demo` deleted after the gate
+(`ate-ish deploy --down --name ate-ish-demo`); its Docker/Artifact
+Registry images removed too. `ate-ish-v2` was never touched (`--name
+ate-ish-demo` throughout) — confirmed still on
+`us-central1-docker.pkg.dev/daniel-junk/ate-ish/pi-durable:latest` and
+healthy (`get workers` returns live leases) after the gate. The `ate-ish`
+Artifact Registry repo and the `ate-ish-daniel-junk` bucket this round
+created are left in place (reusable plumbing for a future `ate-ish
+deploy`, not a cost at rest). No stray `runsc` sandboxes, checked before
+and after. `ate-node` (v1) untouched.
+
+**README**: the quickstart is now the one `ate-ish deploy` command; the
+previous `deploy.sh` path moved under a new "Manual deploy" heading,
+unchanged in content.
+
+No vendored edits. No commit made, per the brief.
+
 ## v2 stage 6 (2026-10-30): the demo table, from real runs
 
 Ran the three coding-agents-on-substrate demos (pi-durable, libfx,
