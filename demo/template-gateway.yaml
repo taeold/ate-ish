@@ -11,8 +11,6 @@ containers:
   - node
   - /actor/server-gateway.ts
   env:
-  - name: PORT
-    value: "8080"
   - name: AI_GATEWAY_API_KEY
     value: ate-placeholder-key
   - name: NODE_EXTRA_CA_CERTS
@@ -20,7 +18,7 @@ containers:
   wakeupProbe:
     httpGet:
       path: /readyz
-      port: 8080
+      port: 80
     timeoutSeconds: 30
   volumeMounts:
   - name: workspace
@@ -33,6 +31,7 @@ resources:
     quantity: "1"
   - name: memory
     quantity: 512Mi
+preferredFidelity: VOLUMES
 snapshotConfig:
   onPause: SNAPSHOT_CONTENT_SCOPE_DATA
   onCommit: SNAPSHOT_CONTENT_SCOPE_DATA

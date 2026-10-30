@@ -10,7 +10,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"strconv"
+	"strings"
+	"time"
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
@@ -32,9 +35,32 @@ type bucket struct {
 func newBucket(ctx context.Context, name string) (*bucket, error) {
 	ts, err := google.DefaultTokenSource(ctx, "https://www.googleapis.com/auth/cloud-platform")
 	if err != nil {
-		return nil, err
+		// No Application Default Credentials file on this machine (no
+		// metadata server, no GOOGLE_APPLICATION_CREDENTIALS, no `gcloud
+		// auth application-default login`, which needs a browser this
+		// shell cannot drive). Fall back to the gcloud user login's own
+		// token, the same source cli.go's call() already uses for the
+		// admin API's bearer token.
+		ts = gcloudTokenSource{}
 	}
 	return &bucket{name: name, client: oauth2.NewClient(ctx, ts)}, nil
+}
+
+// gcloudTokenSource gets a fresh access token from `gcloud auth
+// print-access-token` on every call. gcloud caches and refreshes the
+// underlying credential itself, so this just adds one process spawn
+// (tens of milliseconds) to the token refresh path, not to every request.
+type gcloudTokenSource struct{}
+
+func (gcloudTokenSource) Token() (*oauth2.Token, error) {
+	out, err := exec.Command("gcloud", "auth", "print-access-token").Output()
+	if err != nil {
+		return nil, fmt.Errorf("gcloud auth print-access-token: %w", err)
+	}
+	// A short expiry, well inside gcloud's own ~1h token lifetime, so
+	// oauth2's reuse-until-expired wrapper (which treats a zero Expiry as
+	// "never expires") calls back here instead of using one token forever.
+	return &oauth2.Token{AccessToken: strings.TrimSpace(string(out)), TokenType: "Bearer", Expiry: time.Now().Add(5 * time.Minute)}, nil
 }
 
 const gcs = "https://storage.googleapis.com"

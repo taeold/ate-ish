@@ -1,0 +1,529 @@
+// Copyright 2026 Google LLC
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// Package ateattr is the single source of truth for substrate's ate.* telemetry
+// attributes: the identity keys stamped on spans/logs, and the bounded value
+// sets used as metric labels. Centralizing them keeps a key (and value) meaning
+// the same thing across every signal and binary.
+package ateattr
+
+import (
+	"log/slog"
+	"slices"
+
+	"go.opentelemetry.io/otel/attribute"
+
+	"github.com/taeold/ate-ish/third_party/substrate/exported/proto/ateletpb"
+	"github.com/taeold/ate-ish/third_party/substrate/internal/resources"
+
+	"github.com/taeold/ate-ish/third_party/substrate/api/ateapi/v1"
+	"github.com/taeold/ate-ish/third_party/substrate/pkg/sandboxclass"
+)
+
+// Dotted ate.* matches the metric-instrument naming (atenet.*, atelet.*), not the
+// ate.dev/ slash form, which is k8s labels only.
+// name vs uid mirror the k8s object model that ResourceMetadata follows:
+// ate.actor.name is the atespace-scoped addressable name, ate.actor.uid is the
+// server-assigned globally-unique key. There is deliberately no ate.actor.id
+// (an ambiguous term when both a name and a uid exist).
+// atespace and template are their own top-level namespaces (ate.atespace,
+// ate.template.*) rather than nested under actor: both are first-class resources
+// that also appear in non-actor telemetry, so the keys must mean the same thing
+// regardless of what a span is about. ActorContainerNameKey nests under actor for
+// the mirror-image reason: it names a container the ActorTemplate declared, which
+// exists only within an actor. It is deliberately not the registry's
+// k8s.container.name or container.name, both of which the collector already
+// assigns to the worker pod's own containers.
+const (
+	AtespaceKey           = attribute.Key("ate.atespace")
+	ActorNameKey          = attribute.Key("ate.actor.name")
+	ActorUIDKey           = attribute.Key("ate.actor.uid")
+	ActorContainerNameKey = attribute.Key("ate.actor.container.name")
+	TemplateNameKey       = attribute.Key("ate.template.name")
+	TemplateAtespaceKey   = attribute.Key("ate.template.atespace")
+	ActorVersionKey       = attribute.Key("ate.actor.version")
+)
+
+// TemplateUnknown is the fallback for a template dimension the emitter cannot
+// resolve. "unknown" is a legal atespace or template name, so a real object
+// with that name collides with the fallback. Like ate.sandbox.class="unknown",
+// the registry accepts that collision to keep the dimension bounded and
+// non-empty.
+const TemplateUnknown = "unknown"
+
+// NormalizeTemplateDimension returns dim, or TemplateUnknown when dim is empty.
+// Only the router calls it today. The other metrics that carry ate.template.*
+// emit the raw value.
+func NormalizeTemplateDimension(dim string) string {
+	if dim == "" {
+		return TemplateUnknown
+	}
+	return dim
+}
+
+// ReservedNamespace is substrate's. A producer that merges untrusted fields into a
+// record drops everything under it, so nothing a workload sets can read as
+// platform-issued attribution downstream.
+const ReservedNamespace = "ate."
+
+// Trace-context fields for structured logs, per the OTel spec for non-OTLP log
+// formats: these exact names, top-level in the record, lowercase hex. Not ate.*
+// and not attributes - a collector maps them onto the log record's own
+// TraceId/SpanId/flags fields.
+// https://opentelemetry.io/docs/specs/otel/compatibility/logging_trace_context/
+const (
+	LogTraceIDField    = "trace_id"
+	LogSpanIDField     = "span_id"
+	LogTraceFlagsField = "trace_flags"
+)
+
+// OTLPRelayKey is a resource attribute rather than a subject one: it describes
+// how the emitting component reached the collector, not what the signal is about.
+// Only the components that have a relay to take or miss carry it.
+const OTLPRelayKey = attribute.Key("ate.otlp.relay")
+
+// ActorStateKey is log-only. It is bounded, but it is only ever recorded beside
+// actor identity, which no metric may carry.
+const ActorStateKey = attribute.Key("ate.actor.state")
+
+// Values for ActorStateKey, mirroring ateapi.ActorState with the
+// ACTOR_STATE_ prefix dropped so the two cannot fork. ActorStateDeleted is the
+// exception and has no enum counterpart: the record is gone, so no stored state
+// can stand for it.
+const (
+	ActorStateResuming   = "resuming"
+	ActorStateRunning    = "running"
+	ActorStateSuspending = "suspending"
+	ActorStateSuspended  = "suspended"
+	ActorStateCrashed    = "crashed"
+	ActorStateDeleting   = "deleting"
+	ActorStateReverting  = "reverting"
+	ActorStateDeleted    = "deleted"
+	ActorStateUnknown    = "unknown"
+)
+
+// ActorStateValue maps the committed state onto its label value, so a producer
+// reports the state the store holds rather than one it names by hand.
+func ActorStateValue(state ateapi.ActorState) string {
+	switch state {
+	case ateapi.ActorState_ACTOR_STATE_RESUMING:
+		return ActorStateResuming
+	case ateapi.ActorState_ACTOR_STATE_RUNNING:
+		return ActorStateRunning
+	case ateapi.ActorState_ACTOR_STATE_SUSPENDING:
+		return ActorStateSuspending
+	case ateapi.ActorState_ACTOR_STATE_SUSPENDED:
+		return ActorStateSuspended
+	case ateapi.ActorState_ACTOR_STATE_CRASHED:
+		return ActorStateCrashed
+	case ateapi.ActorState_ACTOR_STATE_DELETING:
+		return ActorStateDeleting
+	case ateapi.ActorState_ACTOR_STATE_REVERTING:
+		return ActorStateReverting
+	default:
+		return ActorStateUnknown
+	}
+}
+
+// Metric-label keys: the only ate.* attributes allowed on metric datapoints,
+// each with a small bounded value set. High-cardinality identity (actor
+// name/uid, atespace) is absent by design; it belongs on spans and logs.
+// ActorOperationNameKey follows the registry's *.operation.name pattern
+// (db.operation.name, gen_ai.operation.name). WorkerStateKey stays worker-rooted
+// rather than nesting under the pool so it can grow siblings.
+// WorkerPoolNamespaceKey pairs with WorkerPoolNameKey: a WorkerPool is
+// namespaced, so the name alone does not identify one.
+// The snapshot keys are orthogonal: kind is which snapshot, scope is what
+// content it covers, and phase is which step of the operation an observation
+// timed. Naming one image within a snapshot is the registry's file.name, not an
+// ate.* key of its own.
+// ImageCacheOutcomeKey is rooted at the subsystem, not under actor: the layer
+// pool is node state every actor shares. For the same reason it is the only
+// ate.* label on its counter.
+const (
+	ActorOperationNameKey  = attribute.Key("ate.actor.operation.name")
+	WorkerPoolNamespaceKey = attribute.Key("ate.workerpool.namespace")
+	WorkerPoolNameKey      = attribute.Key("ate.workerpool.name")
+	WorkerStateKey         = attribute.Key("ate.worker.state")
+	SandboxClassKey        = attribute.Key("ate.sandbox.class")
+	SnapshotKindKey        = attribute.Key("ate.snapshot.kind")
+	SnapshotFidelityKey    = attribute.Key("ate.snapshot.fidelity")
+	SnapshotPhaseKey       = attribute.Key("ate.snapshot.phase")
+	ImageCacheOutcomeKey   = attribute.Key("ate.imagecache.outcome")
+	FileCacheNameKey       = attribute.Key("ate.filecache.name")
+	FileCacheGCOutcomeKey  = attribute.Key("ate.filecache.gc.outcome")
+	SchedulerOutcomeKey    = attribute.Key("ate.scheduler.outcome")
+	RouterResumeKey        = attribute.Key("ate.router.resume")
+	RouterOutcomeKey       = attribute.Key("ate.router.outcome")
+	StatsSourceKey         = attribute.Key("ate.stats.source")
+)
+
+// Keys of the actor usage record. Logs only: the measurements are unbounded and
+// the epoch is per activation. The measurement names follow the
+// ate.actor.stats.* instruments and share their units, so a query works the
+// same on both signals: the memory keys are bytes, StatsCPUTimeKey is seconds
+// as a double.
+//
+// ActorEpochKey identifies one activation of an actor, a Run or Restore, as the
+// unix-nano time it began. It is the boundary of ate.stats.cpu.time, which
+// restarts at zero with each activation.
+const (
+	ActorEpochKey            = attribute.Key("ate.actor.epoch")
+	StatsKindKey             = attribute.Key("ate.stats.kind")
+	StatsMemoryUsageKey      = attribute.Key("ate.stats.memory.usage")
+	StatsMemoryPeakKey       = attribute.Key("ate.stats.memory.peak")
+	StatsMemoryWorkingSetKey = attribute.Key("ate.stats.memory.working_set")
+	StatsCPUTimeKey          = attribute.Key("ate.stats.cpu.time")
+)
+
+// SandboxOOMKillsKey is memory.events' oom_kill for the sandbox cgroup leaf, on
+// the record ateworker-gvisor writes when a hosted actor's sandbox has no process
+// left. Logs only: it is only ever recorded beside actor identity.
+const SandboxOOMKillsKey = attribute.Key("ate.sandbox.oom_kills")
+
+// Values for StatsKindKey. An initial or final sample brackets an activation; a
+// periodic one is the timer's.
+const (
+	StatsKindPeriodic = "periodic"
+	StatsKindInitial  = "initial"
+	StatsKindFinal    = "final"
+)
+
+// Values for StatsSourceKey, mirroring ateworkerpb.StatsSource. The two sources do
+// not measure the same thing (the cgroup source charges the sandbox runtime's
+// overhead along with the workload, the guest-agent source sees only the
+// workload's containers), so rollups must group by this key rather than sum
+// across it.
+const (
+	StatsSourceUnspecified = "unspecified"
+	StatsSourceCgroup      = "cgroup"
+	StatsSourceGuestAgent  = "guest-agent"
+)
+
+// Values for RouterResumeKey.
+const (
+	// RouterResumeNone indicates the resume completed and found the actor already
+	// running (steady-state route).
+	RouterResumeNone = "none"
+	// RouterResumeTriggered indicates this request won the singleflight lock and
+	// completed a cold activation.
+	RouterResumeTriggered = "triggered"
+	// RouterResumeJoined indicates this request waited on another request's
+	// singleflight resume, which completed a cold activation.
+	RouterResumeJoined = "joined"
+	// RouterResumeUnknown indicates the resume did not complete, so the router
+	// cannot tell whether an activation ran. The resume failed, or the request
+	// stopped first, or the direction never resumes an actor.
+	RouterResumeUnknown = "unknown"
+)
+
+// Values for ImageCacheOutcomeKey. A hit is a complete image record; a miss
+// must pull. A failed lookup is neither: Error is the only one that carries an
+// error.type, Cancelled and Timeout mean the caller gave up.
+const (
+	ImageCacheOutcomeHit       = "hit"
+	ImageCacheOutcomeMiss      = "miss"
+	ImageCacheOutcomeError     = "error"
+	ImageCacheOutcomeCancelled = "cancelled"
+	ImageCacheOutcomeTimeout   = "timeout"
+)
+
+// Values for FileCacheNameKey.
+const (
+	// FileCacheSandboxAsset is the sandbox asset cache: the runsc binaries,
+	// kernels and guest images the workers run actors with.
+	FileCacheSandboxAsset = "sandbox_asset"
+	// FileCacheSnapshot is the snapshot cache: the files of shared snapshots,
+	// the ones many actors restore from.
+	FileCacheSnapshot = "snapshot"
+)
+
+// Values for FileCacheGCOutcomeKey. A pass is quiet when the cache is within
+// its budget and nothing is asked of it; those are not recorded.
+const (
+	FileCacheGCOutcomeComplete  = "complete"  // the pass freed what the budget asked
+	FileCacheGCOutcomeShortfall = "shortfall" // it freed what it could, less than asked
+	FileCacheGCOutcomeSkipped   = "skipped"   // it could not size the cache and did nothing
+)
+
+// Values for RouterOutcomeKey. RouterOutcomeNoCapacity means that no worker
+// that meets the constraints of the actor had room. scheduling.ErrNoCapacity
+// reports the same condition. It is a capacity signal, not a defect. A request
+// that the router sheds from a full parking lot is RouterOutcomeNoCapacity when
+// its resume failed with ResourceExhausted. A 503 without a gRPC cause, such as
+// a failed policy lookup or a shed request whose resume failed for a different
+// reason, is RouterOutcomeUnavailable. RouterOutcomeDenied is a request the
+// router refused by policy (a 403 or PermissionDenied), such as an egress
+// request outside the actor's egress policy. It is a policy decision, not a
+// defect.
+const (
+	RouterOutcomeOK                 = "ok"
+	RouterOutcomeCancelled          = "cancelled"
+	RouterOutcomeTimeout            = "timeout"
+	RouterOutcomeNoCapacity         = "no_capacity"
+	RouterOutcomeFailedPrecondition = "failed_precondition"
+	RouterOutcomeLockConflict       = "lock_conflict"
+	RouterOutcomeNotFound           = "not_found"
+	RouterOutcomeUnavailable        = "unavailable"
+	RouterOutcomeRateLimited        = "rate_limited"
+	RouterOutcomeDenied             = "denied"
+	RouterOutcomeResumeError        = "resume_error"
+)
+
+// ErrorTypeKey is the OTel registry attribute, reused verbatim (not aliased into
+// ate.*): failures are reported on the same instrument via this key, its absence
+// meaning success, never as a parallel _failures counter.
+const ErrorTypeKey = attribute.Key("error.type")
+
+// Values for WorkerStateKey. Unschedulable wins over occupancy.
+const (
+	WorkerStateIdle          = "idle"
+	WorkerStatePartial       = "partial"
+	WorkerStateAtCapacity    = "at_capacity"
+	WorkerStateUnschedulable = "unschedulable"
+)
+
+// Values for ActorOperationNameKey: the actor lifecycle operations ateapi
+// serves.
+const (
+	OperationCreate  = "create"
+	OperationResume  = "resume"
+	OperationSuspend = "suspend"
+	OperationDelete  = "delete"
+	OperationRevert  = "revert"
+	OperationUnknown = "unknown"
+)
+
+// AllOperations lists all registered bounded actor lifecycle operations.
+var AllOperations = []string{
+	OperationCreate,
+	OperationResume,
+	OperationSuspend,
+	OperationDelete,
+	OperationRevert,
+}
+
+// NormalizeOperationName ensures op is one of the bounded lifecycle operations.
+// Any unlisted or empty operation maps to OperationUnknown.
+func NormalizeOperationName(op string) string {
+	if slices.Contains(AllOperations, op) {
+		return op
+	}
+	return OperationUnknown
+}
+
+// Values for SchedulerOutcomeKey. NoCapacity is a capacity signal, not a
+// failure, so it is a distinct outcome rather than an error.type value; only the
+// Error outcome carries an error.type.
+const (
+	SchedulerOutcomeAssigned   = "assigned"
+	SchedulerOutcomeNoCapacity = "no_capacity"
+	SchedulerOutcomeError      = "error"
+)
+
+// Values for SnapshotKindKey, set by ateapi from its own resume branching, so
+// the label is bounded at the producer: Local restores an in-node snapshot,
+// Latest pulls a durable snapshot from object storage (including a template's
+// golden snapshot), Boot is a from-scratch start (not a restore).
+// atelet derives the same values for its own histograms, where the kind is the
+// snapshot a restore reads or a checkpoint writes; Boot never appears there.
+const (
+	SnapshotKindLatest = "latest"
+	SnapshotKindLocal  = "local"
+	SnapshotKindBoot   = "boot"
+)
+
+// Values for SnapshotFidelityKey, mirroring ateletpb.SnapshotFidelity.
+const (
+	SnapshotFidelityVolumes = "volumes"
+	SnapshotFidelityRootfs  = "rootfs"
+	SnapshotFidelityMemory  = "memory"
+	SnapshotFidelityUnknown = "unknown"
+)
+
+// SnapshotUploadOverdueBandKey buckets how long past the upload delay an
+// actor's undurable local snapshot has been waiting on atelet.
+const SnapshotUploadOverdueBandKey = attribute.Key("ate.snapshot.upload_overdue_band")
+
+// Values for SnapshotUploadOverdueBandKey.
+const (
+	SnapshotUploadOverdueBandUnder1m = "under_1m"
+	SnapshotUploadOverdueBand1mTo5m  = "1m_to_5m"
+	SnapshotUploadOverdueBand5mTo15m = "5m_to_15m"
+	SnapshotUploadOverdueBandOver15m = "over_15m"
+)
+
+// SnapshotFidelityValue maps the wire enum onto its label value, shared so
+// ateapi (which sets the fidelity) and atelet (which receives it) cannot
+// drift. An unrecognized fidelity reports as unknown rather than stringified,
+// so no wire value can widen the label set.
+func SnapshotFidelityValue(fidelity ateletpb.SnapshotFidelity) string {
+	switch fidelity {
+	case ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES:
+		return SnapshotFidelityVolumes
+	case ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_ROOTFS:
+		return SnapshotFidelityRootfs
+	case ateletpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY:
+		return SnapshotFidelityMemory
+	default:
+		return SnapshotFidelityUnknown
+	}
+}
+
+// Values for SnapshotPhaseKey. Phases overlap (the download runs concurrently
+// with the asset fetch and OCI unpack), so they are independent observations,
+// not a partition of Total: summing across them is meaningless.
+const (
+	SnapshotPhaseVolumeMount      = "volume_mount"
+	SnapshotPhaseManifestFetch    = "manifest_fetch"
+	SnapshotPhaseSandboxAssets    = "sandbox_assets"
+	SnapshotPhaseDownload         = "download"
+	SnapshotPhaseOCIUnpack        = "oci_unpack"
+	SnapshotPhaseWorkerRestore    = "worker_restore"
+	SnapshotPhaseWorkerCheckpoint = "worker_checkpoint"
+	// Persist is one step with two destinations (upload for external, rename
+	// for local); SnapshotKindKey already says which.
+	SnapshotPhasePersist = "persist"
+	SnapshotPhaseCleanup = "cleanup"
+	SnapshotPhaseTotal   = "total"
+)
+
+// SandboxClassUnknown is the NormalizeSandboxClass fallback.
+const SandboxClassUnknown = "unknown"
+
+// NormalizeSandboxClass bounds the label: atelet reads the class from a
+// snapshot manifest in object storage that nothing validates on the way in.
+// Empty reports as unknown rather than the gvisor default, so a manifest
+// problem stays visible.
+func NormalizeSandboxClass(class string) string {
+	if sandboxclass.Valid(class) {
+		return class
+	}
+	return SandboxClassUnknown
+}
+
+// SandboxClassAttribute sets ate.sandbox.class. No source of the class is
+// validated, thus an emitter that sets the attribute must set it through this
+// helper and not through SandboxClassKey.
+//
+// To omit the attribute while the class is unknown is a different choice, and
+// three emitters make it: lifecycleOpAttrs, recordSchedulerAssignment and
+// snapshotOp.attrs.
+func SandboxClassAttribute(class string) attribute.KeyValue {
+	return SandboxClassKey.String(NormalizeSandboxClass(class))
+}
+
+// WorkerPoolAttributes returns the namespaced identity of a WorkerPool. A
+// WorkerPool is namespaced, so half the pair identifies no pool: either key
+// missing drops both, rather than emit an empty-string series that merges
+// same-named pools and joins to nothing.
+//
+// This is for the actor-centric instruments, where an unknown pool is omitted.
+// Pool-centric ones that record a deliberate zero-valued series for "no pool
+// matched" build the pair themselves.
+func WorkerPoolAttributes(namespace, name string) []attribute.KeyValue {
+	if name == "" || namespace == "" {
+		return nil
+	}
+	return []attribute.KeyValue{
+		WorkerPoolNamespaceKey.String(namespace),
+		WorkerPoolNameKey.String(name),
+	}
+}
+
+// ActorRefAttributes returns the subset knowable before the Actor record
+// resolves: only the (atespace, name) the request addresses. The uid and version
+// are server-assigned and unknown until the record loads, so they are omitted.
+func ActorRefAttributes(actorRef resources.ActorRef) []attribute.KeyValue {
+	return []attribute.KeyValue{
+		AtespaceKey.String(actorRef.Atespace),
+		ActorNameKey.String(actorRef.Name),
+	}
+}
+
+// ActorAttributes is nil-safe; a nil Actor yields zero-valued attributes.
+func ActorAttributes(a *ateapi.Actor) []attribute.KeyValue {
+	return []attribute.KeyValue{
+		AtespaceKey.String(a.GetMetadata().GetAtespace()),
+		ActorNameKey.String(a.GetMetadata().GetName()),
+		ActorUIDKey.String(a.GetMetadata().GetUid()),
+		TemplateNameKey.String(a.GetActorTemplate().GetName()),
+		TemplateAtespaceKey.String(a.GetActorTemplate().GetAtespace()),
+		ActorVersionKey.Int64(a.GetMetadata().GetVersion()),
+	}
+}
+
+// ActorLogLabels returns the actor identity stamped on every actor log record. A
+// string map because GKE promotes the record's label group into LogEntry.labels,
+// which is string-valued. An empty containerName omits the key rather than
+// emitting it empty, so a consumer filtering on it gets container output only.
+func ActorLogLabels(a resources.ActorAttribution, containerName string) map[string]string {
+	labels := map[string]string{
+		string(AtespaceKey):         a.Ref.Atespace,
+		string(ActorNameKey):        a.Ref.Name,
+		string(ActorUIDKey):         a.UID,
+		string(TemplateAtespaceKey): a.TemplateAtespace,
+		string(TemplateNameKey):     a.TemplateName,
+	}
+	if containerName != "" {
+		labels[string(ActorContainerNameKey)] = containerName
+	}
+	return labels
+}
+
+// ActorLogAttrs is the same identity for a component's own slog record, which
+// needs no envelope: a collector lifts flat keys straight onto the record's OTLP
+// attributes. It must agree with ActorLogLabels key for key, or joining a
+// component record to the actor lifecycle stream takes two spellings.
+func ActorLogAttrs(a resources.ActorAttribution) []slog.Attr {
+	return []slog.Attr{
+		slog.String(string(AtespaceKey), a.Ref.Atespace),
+		slog.String(string(ActorNameKey), a.Ref.Name),
+		slog.String(string(ActorUIDKey), a.UID),
+		slog.String(string(TemplateAtespaceKey), a.TemplateAtespace),
+		slog.String(string(TemplateNameKey), a.TemplateName),
+	}
+}
+
+// ActorRefLogAttrs is ActorLogAttrs for a record written before the Actor
+// resolves, mirroring ActorRefAttributes on the span side. The uid is unknown
+// until the record loads, so it is omitted rather than emitted empty.
+func ActorRefLogAttrs(actorRef resources.ActorRef) []slog.Attr {
+	return []slog.Attr{
+		slog.String(string(AtespaceKey), actorRef.Atespace),
+		slog.String(string(ActorNameKey), actorRef.Name),
+	}
+}
+
+// ActorMetricAttributes returns the metric labels for an Actor.
+// High-cardinality attributes (atespace, actor name, actor uid) are omitted.
+// The worker-pool pair is omitted while the actor holds no assignment, so a
+// crash before the actor reaches a worker reports no pool rather than an
+// empty-string one.
+func ActorMetricAttributes(a *ateapi.Actor, sandboxClass, operationName string) []attribute.KeyValue {
+	if a == nil {
+		return nil
+	}
+
+	operationName = NormalizeOperationName(operationName)
+
+	ass := a.GetStatus().GetWorkerAssignment()
+	attrs := []attribute.KeyValue{
+		TemplateAtespaceKey.String(a.GetActorTemplate().GetAtespace()),
+		TemplateNameKey.String(a.GetActorTemplate().GetName()),
+		SandboxClassAttribute(sandboxClass),
+		ActorOperationNameKey.String(operationName),
+	}
+	return append(attrs, WorkerPoolAttributes(ass.GetWorkerNamespace(), ass.GetWorkerPool())...)
+}

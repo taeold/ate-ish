@@ -15,10 +15,17 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
+
+	"github.com/taeold/ate-ish/internal/devatelet"
+	"github.com/taeold/ate-ish/internal/devgateway"
+	"github.com/taeold/ate-ish/third_party/substrate/exported/installdefaults"
+	"github.com/taeold/ate-ish/third_party/substrate/exported/nodepath"
+	"github.com/taeold/ate-ish/third_party/substrate/exported/proto/ateworkerpb"
+	"google.golang.org/grpc"
 )
 
 var (
@@ -27,17 +34,35 @@ var (
 	errNotHosted = errors.New("actor is not running on this worker")
 )
 
-// worker runs actors as sandboxes. Slot i of capacity serves the actor on
-// host port 10000+i and its egress proxy on 11000+i.
+// actorVethIP and actorVethUp are the sandbox's fixed address and the
+// gateway-namespace-name suffix internal/ateworker/actornet gives every
+// actor (net.go's ActorVethIP, sandbox.go's SandboxGatewayNetNSName). Both
+// are stable parts of the vendored worker's own contract, so ate-ish names
+// them directly rather than importing actornet just for two strings.
+const (
+	actorVethIP       = "169.254.17.2"
+	gatewayNSSuffix   = "-at"
+	runscReleaseDir   = "bin/runsc"
+	workerBinaryInBin = "bin/ateworker-gvisor"
+	workerKodataPath  = "third_party/substrate/cmd/ateworker-gvisor/kodata"
+)
+
+// worker is ate-ish acting as both atelet and worker-pool node: it runs the
+// vendored ateworker-gvisor as a subprocess, serves it the one atelet RPC
+// surface it needs (internal/devatelet), fronts its own egress gateway
+// (internal/devgateway), and drives actor lifecycle over ateworkerpb.
 type worker struct {
 	id     string
 	addr   string
-	hostIP string // the worker's address as actors see it
-	dir    string
-	exe    string // this binary; the sandbox sees the same path, so it runs as init
+	dir    string // base dir for actor state, e.g. /var/lib/ate-ish
 	bucket *bucket
-	ca     *egressCA
-	secret *secrets
+
+	pki        *devatelet.PKI
+	ateletSrv  *grpc.Server
+	gateway    *devgateway.Gateway
+	workerPID  int
+	workerConn *grpc.ClientConn
+	client     ateworkerpb.WorkerClient
 
 	mu    sync.Mutex
 	slots []*hosted
@@ -51,42 +76,81 @@ type hosted struct {
 	as, name string
 	gen      int64
 	slot     int
-	sandbox  string
-	ready    chan struct{} // closed once started, or failed with err
+	actorUID string
+	dirs     *actorDirs
+	tmpl     Template
+	cname    string // the one container's name
+	port     int    // its wakeup-probe / listen port, on actorVethIP
+
+	ready    chan struct{}
 	err      error
-	egress   *http.Server
 	busy     int
 	lastUsed time.Time
 	stopping bool
 }
 
 func (h *hosted) key() string { return h.as + "/" + h.name }
-func appPort(slot int) int    { return 10000 + slot }
 
-func newWorker(ctx context.Context, b *bucket, addr string, capacity int) (*worker, error) {
-	ca, err := newEgressCA()
+// addr is the address the ingress (via worker.proxy) and the wakeup-probe
+// poller reach the actor on: its own veth address and container port,
+// reachable only from inside its gateway network namespace (see nsdial.go).
+func (h *hosted) addr() string { return fmt.Sprintf("%s:%d", actorVethIP, h.port) }
+
+func newWorker(ctx context.Context, b *bucket, addr string, capacity int, dir string) (*worker, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	ateletSPIFFE := installdefaults.AteletSPIFFEID(installdefaults.SystemNamespace)
+	pki, err := devatelet.GeneratePKI(filepath.Join(dir, "pki"), ateletSPIFFE)
+	if err != nil {
+		return nil, fmt.Errorf("generating node PKI: %w", err)
+	}
+	ateletSrv, err := devatelet.ServeFakeAtelet(ctx, nodepath.WorkerSupportSocket, pki, actorPolicyLookup(b))
+	if err != nil {
+		return nil, fmt.Errorf("serving the atelet credential broker: %w", err)
+	}
+	gwCert, err := pki.GatewayCertificate()
+	if err != nil {
+		return nil, fmt.Errorf("loading the gateway's own credential: %w", err)
+	}
+	gateway, err := devgateway.Start("127.0.0.1:0", gwCert)
+	if err != nil {
+		return nil, fmt.Errorf("starting the egress gateway: %w", err)
+	}
+
+	podUID := "ate-ish-" + randomHex(4)
+	cmd, err := startAteworker(ateworkerConfig{
+		binary:      workerBinaryInBin,
+		kodata:      workerKodataPath,
+		podUID:      podUID,
+		maxActors:   capacity,
+		pki:         pki,
+		readyPort:   28080,
+		atunnelPort: 28443,
+		connectPort: 28444,
+		logFile:     filepath.Join(dir, "ateworker-gvisor.log"),
+	})
 	if err != nil {
 		return nil, err
 	}
-	exe, err := os.Executable()
+	sockPath := nodepath.WorkerSocketPath(podUID)
+	if err := waitForSocket(sockPath, 30*time.Second); err != nil {
+		return nil, fmt.Errorf("waiting for ateworker-gvisor's socket: %w", err)
+	}
+	conn, err := dialAteworker(sockPath)
 	if err != nil {
 		return nil, err
 	}
+
 	w := &worker{
-		id: "w-" + randomHex(4), addr: addr, hostIP: env("ATE_HOST_IP", "169.254.8.1"), dir: "/tmp/ate", exe: exe,
-		bucket: b, ca: ca, secret: &secrets{client: b.client, cache: map[string]string{}},
+		id: "w-" + randomHex(4), addr: addr, dir: dir, bucket: b,
+		pki: pki, ateletSrv: ateletSrv, gateway: gateway,
+		workerPID: cmd.Process.Pid, workerConn: conn, client: ateworkerpb.NewWorkerClient(conn),
 		slots: make([]*hosted, capacity),
-	}
-	for _, d := range []string{"actors", "snapshots"} {
-		if err := os.MkdirAll(filepath.Join(w.dir, d), 0o755); err != nil {
-			return nil, err
-		}
 	}
 	if err := w.writeLease(ctx); err != nil {
 		return nil, err
 	}
-	// GCS takes about one write per second to an object, so changes mark
-	// the lease dirty and this loop writes it at most once a second.
 	go func() {
 		last := time.Now()
 		for range time.Tick(time.Second) {
@@ -98,7 +162,7 @@ func newWorker(ctx context.Context, b *bucket, addr string, capacity int) (*work
 			}
 		}
 	}()
-	slog.Info("worker up", "id", w.id, "addr", addr, "capacity", capacity)
+	slog.Info("worker up", "id", w.id, "addr", addr, "capacity", capacity, "worker_pid", w.workerPID, "egress_gateway", gateway.Addr)
 	return w, nil
 }
 
@@ -140,9 +204,6 @@ func (w *worker) find(key string) *hosted {
 }
 
 // resume runs an actor in a free slot and returns the generation it runs.
-// A full worker refuses before it writes anything. A second call for an actor
-// the worker already runs waits for the first, and succeeds only if that copy
-// is still the one the record names.
 func (w *worker) resume(ctx context.Context, as, name string, recordGen int64) (int64, error) {
 	w.mu.Lock()
 	h := w.find(as + "/" + name)
@@ -159,7 +220,7 @@ func (w *worker) resume(ctx context.Context, as, name string, recordGen int64) (
 		w.mu.Unlock()
 		return 0, errFull
 	}
-	h = &hosted{as: as, name: name, slot: slot, sandbox: "a-" + randomHex(6), ready: make(chan struct{}), lastUsed: time.Now()}
+	h = &hosted{as: as, name: name, slot: slot, actorUID: newActorUID(), ready: make(chan struct{}), lastUsed: time.Now()}
 	w.slots[slot] = h
 	w.mu.Unlock()
 
@@ -174,8 +235,6 @@ func (w *worker) resume(ctx context.Context, as, name string, recordGen int64) (
 	return h.gen, h.err
 }
 
-// current refuses a copy that is stopping or that the record no longer names,
-// and stops a copy the record no longer names.
 func (w *worker) current(ctx context.Context, h *hosted) error {
 	w.mu.Lock()
 	stopping := h.stopping
@@ -218,9 +277,6 @@ func (w *worker) start(ctx context.Context, h *hosted, recordGen int64) error {
 	return nil
 }
 
-// release marks the record suspended if it still names this copy. It re-reads
-// on 412 and waits out 429, so the record does not stay running on a worker
-// that no longer hosts the actor.
 func (w *worker) release(ctx context.Context, h *hosted) error {
 	var err error
 	for range 5 {
@@ -242,123 +298,137 @@ func (w *worker) release(ctx context.Context, h *hosted) error {
 	return err
 }
 
+// boot builds the actor's dirs and OCI bundle, then RunWorkload (a fresh
+// actor) or RestoreWorkload (a snapshot downloaded from the bucket).
 func (w *worker) boot(ctx context.Context, h *hosted, rec Actor) error {
 	t0 := time.Now()
 	var tmpl Template
 	if _, err := w.bucket.get(ctx, templateKey(h.as, rec.Template), &tmpl); err != nil {
 		return fmt.Errorf("template %s: %w", rec.Template, err)
 	}
-	c := tmpl.Containers[0]
-	dir := filepath.Join(w.dir, "actors", h.sandbox)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if len(tmpl.Containers) != 1 {
+		return fmt.Errorf("template %s: exactly one container is supported, got %d", rec.Template, len(tmpl.Containers))
+	}
+	h.tmpl = tmpl
+	h.cname = containerName(tmpl.Containers[0])
+	h.port = tmpl.Containers[0].WakeupProbe.HTTPGet.Port
+	if h.port == 0 {
+		h.port = 80
+	}
+
+	spec, err := buildSpec(tmpl)
+	if err != nil {
 		return err
 	}
-	// No --rootfs: the actor's root is this container's own filesystem, read
-	// only, under a writable overlay.
-	args := []string{"run", h.sandbox, "--detach", "--write", "--allow-egress",
-		"-p", fmt.Sprintf("%d:%d", appPort(h.slot), c.WakeupProbe.HTTPGet.Port),
-		"--mount", "type=bind,source=" + dir + ",destination=" + actorDir}
-
-	spec := initSpec{Command: slices.Concat(c.Command, c.Args)}
-	for _, m := range c.VolumeMounts {
-		i := slices.IndexFunc(tmpl.Volumes, func(v Volume) bool { return v.Name == m.Name })
-		if i < 0 {
-			return fmt.Errorf("volumeMount %q has no volume", m.Name)
-		}
-		switch v := tmpl.Volumes[i]; {
-		case v.DurableDir != nil:
-			spec.Dirs = append(spec.Dirs, m.MountPath)
-		case v.SystemInfo != nil:
-			src := filepath.Join(dir, "volume-"+v.Name)
-			if err := os.MkdirAll(src, 0o755); err != nil {
-				return err
-			}
-			for _, ds := range v.SystemInfo.DataSources {
-				if ds.TrustBundle != nil {
-					if err := os.WriteFile(filepath.Join(src, ds.TrustBundle.Path), w.ca.pem, 0o644); err != nil {
-						return err
-					}
-				}
-			}
-			args = append(args, "--mount", "type=bind,source="+src+",destination="+m.MountPath)
-		}
-	}
-
-	proxy := fmt.Sprintf("http://%s:%d", w.hostIP, 11000+h.slot)
-	spec.Env = []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"}
-	for _, e := range c.Env {
-		spec.Env = append(spec.Env, e.Name+"="+e.Value)
-	}
-	for _, name := range []string{"HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"} {
-		spec.Env = append(spec.Env, name+"="+proxy)
-	}
-	spec.Env = append(spec.Env, "NO_PROXY=localhost,127.0.0.1", "no_proxy=localhost,127.0.0.1", "NODE_USE_ENV_PROXY=1")
-	data, _ := json.Marshal(spec)
-	if err := os.WriteFile(filepath.Join(dir, "spec.json"), data, 0o600); err != nil {
+	dirs := buildActorDirs(w.dir, h.actorUID)
+	h.dirs = dirs
+	durableNames, systemInfoNames := durableVolumeNames(tmpl)
+	if err := prepareActorDirs(dirs, durableNames, systemInfoNames); err != nil {
 		return err
 	}
+	if err := writeSystemInfoFiles(dirs, tmpl, w.pki.GatewayCAPEM()); err != nil {
+		return err
+	}
+	if err := stageRunsc(runscReleaseDir, dirs); err != nil {
+		return fmt.Errorf("staging runsc: %w", err)
+	}
+	if err := mountBundleRootfs(w.workerPID, dirs, h.cname); err != nil {
+		return fmt.Errorf("mounting bundle rootfs: %w", err)
+	}
 
-	tar := filepath.Join(w.dir, "snapshots", h.sandbox+".tar")
-	switch err := w.bucket.downloadFile(ctx, snapshotKey(h.as, h.name), tar); {
+	egress := &ateworkerpb.EgressGateway{Address: w.gateway.Addr}
+	snapshotTar := filepath.Join(dirs.pb.GetRootDir(), "snapshot.tar.gz")
+	fidelity := fidelityOf(tmpl)
+	var bootErr error
+	switch err := w.bucket.downloadFile(ctx, snapshotKey(h.as, h.name), snapshotTar); {
 	case err == nil:
-		args = append(args, "--import-tar", tar)
-		defer os.Remove(tar)
-	case !errors.Is(err, errNotFound):
-		return err
+		defer os.Remove(snapshotTar)
+		if err := untarDir(snapshotTar, dirs.pb.GetCheckpointDir()); err != nil {
+			return fmt.Errorf("extracting snapshot: %w", err)
+		}
+		bootErr = callWithRetry(ctx, "RestoreWorkload", func(ctx context.Context) error {
+			_, err := w.client.RestoreWorkload(ctx, &ateworkerpb.RestoreWorkloadRequest{
+				Atespace: h.as, ActorName: h.name, ActorUid: h.actorUID,
+				RunscPath: dirs.sandboxRunscPath, Spec: spec, ActorDirs: dirs.pb,
+				Fidelity: fidelity, EgressGateway: egress,
+			})
+			return err
+		})
+	case errors.Is(err, errNotFound):
+		bootErr = callWithRetry(ctx, "RunWorkload", func(ctx context.Context) error {
+			_, err := w.client.RunWorkload(ctx, &ateworkerpb.RunWorkloadRequest{
+				Atespace: h.as, ActorName: h.name, ActorUid: h.actorUID,
+				RunscPath: dirs.sandboxRunscPath, Spec: spec, ActorDirs: dirs.pb,
+				EgressGateway: egress,
+			})
+			return err
+		})
+	default:
+		return fmt.Errorf("downloading snapshot: %w", err)
 	}
 	downloaded := time.Since(t0)
+	if bootErr != nil {
+		unmountBundleRootfs(w.workerPID, dirs, h.cname)
+		return bootErr
+	}
 
-	p := &egressProxy{actor: h.key(), policy: rec.EgressPolicy, ca: w.ca, secrets: w.secret}
-	var err error
-	if h.egress, err = p.listen(fmt.Sprintf("%s:%d", w.hostIP, 11000+h.slot)); err != nil {
+	path := tmpl.Containers[0].WakeupProbe.HTTPGet.Path
+	timeout := time.Duration(max(tmpl.Containers[0].WakeupProbe.TimeoutSeconds, 30)) * time.Second
+	if err := waitReady(ctx, w.workerPID, h, path, timeout); err != nil {
+		w.terminateWorkload(context.Background(), h, spec)
+		unmountBundleRootfs(w.workerPID, dirs, h.cname)
 		return err
 	}
-	if err := sandbox(ctx, append(args, "--", w.exe, "init")...); err != nil {
-		h.egress.Close()
-		return err
-	}
-	if err := waitReady(ctx, h, dir, c.WakeupProbe.HTTPGet.Path, time.Duration(max(c.WakeupProbe.TimeoutSeconds, 30))*time.Second); err != nil {
-		sandbox(context.Background(), "delete", h.sandbox, "--force")
-		h.egress.Close()
-		return err
-	}
-	slog.Info("actor started", "actor", h.key(), "generation", h.gen, "sandbox", h.sandbox, "slot", h.slot,
-		"snapshot_ms", downloaded.Milliseconds(),
-		"boot_ms", (time.Since(t0) - downloaded).Milliseconds(), "restored", slices.Contains(args, "--import-tar"))
+	slog.Info("actor started", "actor", h.key(), "generation", h.gen, "actor_uid", h.actorUID, "slot", h.slot,
+		"fidelity", fidelity, "snapshot_ms", downloaded.Milliseconds(), "boot_ms", (time.Since(t0) - downloaded).Milliseconds())
 	return nil
 }
 
-// waitReady polls the wakeup probe and fails early if the actor exits.
-func waitReady(ctx context.Context, h *hosted, dir, path string, timeout time.Duration) error {
+// waitReady polls the wakeup probe through the actor's own veth address,
+// dialed from inside its gateway network namespace (nsdial.go): that
+// address is not routable from ate-ish's own network namespace any other
+// way.
+func waitReady(ctx context.Context, workerPID int, h *hosted, path string, timeout time.Duration) error {
+	dial := dialViaActorGateway(ctx, workerPID, h.actorUID)
+	client := &http.Client{Transport: &http.Transport{DialContext: dial}}
 	deadline := time.Now().Add(timeout)
+	var lastErr error
 	for time.Now().Before(deadline) {
-		resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d%s", appPort(h.slot), path))
+		resp, err := client.Get("http://" + h.addr() + path)
 		if err == nil {
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
 				return nil
 			}
-		}
-		if code, err := os.ReadFile(filepath.Join(dir, "exit")); err == nil {
-			return fmt.Errorf("actor exited with %s: %s", strings.TrimSpace(string(code)), tail(filepath.Join(dir, "log")))
+			lastErr = fmt.Errorf("wakeup probe: status %s", resp.Status)
+		} else {
+			lastErr = err
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(50 * time.Millisecond):
+		case <-time.After(100 * time.Millisecond):
 		}
 	}
-	return fmt.Errorf("wakeup probe %s not ready after %s: %s", path, timeout, tail(filepath.Join(dir, "log")))
+	return fmt.Errorf("wakeup probe %s not ready after %s: %w", path, timeout, lastErr)
 }
 
-func tail(file string) string {
-	data, _ := os.ReadFile(file)
-	return string(data[max(0, len(data)-2000):])
+func (w *worker) terminateWorkload(ctx context.Context, h *hosted, spec *ateworkerpb.WorkloadSpec) {
+	err := callWithRetry(ctx, "TerminateWorkload", func(ctx context.Context) error {
+		_, err := w.client.TerminateWorkload(ctx, &ateworkerpb.TerminateWorkloadRequest{
+			Atespace: h.as, ActorName: h.name, ActorUid: h.actorUID,
+			RunscPath: h.dirs.sandboxRunscPath, Spec: spec, ActorDirs: h.dirs.pb,
+		})
+		return err
+	})
+	if err != nil {
+		slog.Warn("TerminateWorkload", "actor", h.key(), "err", err)
+	}
 }
 
-// suspend stops an actor, uploads its rootfs as the snapshot, and marks the
-// record suspended. If the stop, tar or upload fails, the actor keeps its
-// sandbox and its running record, so a later suspend can try again.
+// suspend checkpoints an actor, uploads the checkpoint as the snapshot, and
+// marks the record suspended. If any step fails, the actor keeps its sandbox
+// and running record, so a later suspend can try again.
 func (w *worker) suspend(ctx context.Context, key string) error {
 	t0 := time.Now()
 	w.mu.Lock()
@@ -378,29 +448,34 @@ func (w *worker) suspend(ctx context.Context, key string) error {
 		return errNotHosted
 	}
 
-	dir := filepath.Join(w.dir, "actors", h.sandbox)
-	tar := filepath.Join(w.dir, "snapshots", h.sandbox+".tar")
-	err := sandbox(ctx, "exec", h.sandbox, "--", w.exe, "stop")
-	if err == nil {
-		err = waitExit(dir, 8*time.Second)
+	spec, err := buildSpec(h.tmpl)
+	if err != nil {
+		return err
 	}
-	stopped := time.Since(t0)
+	fidelity := fidelityOf(h.tmpl)
+	err = callWithRetry(ctx, "CheckpointWorkload", func(ctx context.Context) error {
+		_, err := w.client.CheckpointWorkload(ctx, &ateworkerpb.CheckpointWorkloadRequest{
+			Atespace: h.as, ActorName: h.name, ActorUid: h.actorUID,
+			RunscPath: h.dirs.sandboxRunscPath, Spec: spec, ActorDirs: h.dirs.pb, Fidelity: fidelity,
+		})
+		return err
+	})
+	checkpointed := time.Since(t0)
+
+	snapshotTar := filepath.Join(h.dirs.pb.GetRootDir(), "snapshot-out.tar.gz")
 	if err == nil {
-		err = sandbox(ctx, "tar", h.sandbox, "--file", tar)
+		err = tarDir(h.dirs.pb.GetCheckpointDir(), snapshotTar)
 	}
-	tarred := time.Since(t0)
-	// Upload only while the record still names this copy, so a superseded
-	// copy never overwrites the snapshot of the new one.
 	var rec Actor
 	if err == nil {
 		_, err = w.bucket.get(ctx, actorKey(h.as, h.name), &rec)
 	}
 	if err == nil && rec.Owner == w.id && rec.Generation == h.gen {
-		err = w.bucket.uploadFile(ctx, snapshotKey(h.as, h.name), tar)
+		err = w.bucket.uploadFile(ctx, snapshotKey(h.as, h.name), snapshotTar)
 	}
 	uploaded := time.Since(t0)
-	size := fileSize(tar)
-	os.Remove(tar)
+	size := fileSize(snapshotTar)
+	os.Remove(snapshotTar)
 	if err != nil {
 		w.mu.Lock()
 		h.stopping = false
@@ -408,25 +483,19 @@ func (w *worker) suspend(ctx context.Context, key string) error {
 		slog.Error("suspend failed, actor kept", "actor", key, "generation", h.gen, "err", err)
 		return err
 	}
-	err = errors.Join(w.release(ctx, h), sandbox(ctx, "delete", h.sandbox, "--force"), h.egress.Close())
-	os.RemoveAll(dir)
+
+	w.terminateWorkload(ctx, h, spec)
+	unmountBundleRootfs(w.workerPID, h.dirs, h.cname)
+	os.RemoveAll(h.dirs.pb.GetRootDir())
+	os.RemoveAll(h.dirs.sandboxAssetsDir)
+	err = w.release(ctx, h)
 	w.mu.Lock()
 	w.slots[h.slot] = nil
 	w.mu.Unlock()
 	w.dirty.Store(true)
-	slog.Info("actor suspended", "actor", key, "generation", h.gen, "stop_ms", stopped.Milliseconds(),
-		"tar_ms", (tarred - stopped).Milliseconds(), "upload_ms", (uploaded - tarred).Milliseconds(),
-		"total_ms", time.Since(t0).Milliseconds(), "bytes", size, "err", err)
+	slog.Info("actor suspended", "actor", key, "generation", h.gen, "checkpoint_ms", checkpointed.Milliseconds(),
+		"upload_ms", (uploaded - checkpointed).Milliseconds(), "total_ms", time.Since(t0).Milliseconds(), "bytes", size, "err", err)
 	return err
-}
-
-func waitExit(dir string, timeout time.Duration) error {
-	for deadline := time.Now().Add(timeout); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
-		if _, err := os.Stat(filepath.Join(dir, "exit")); err == nil {
-			return nil
-		}
-	}
-	return fmt.Errorf("actor did not exit %s after SIGTERM", timeout)
 }
 
 func fileSize(file string) int64 {
@@ -437,7 +506,6 @@ func fileSize(file string) int64 {
 	return st.Size()
 }
 
-// reap suspends actors that have served no request for idle.
 func (w *worker) reap(ctx context.Context, idle time.Duration) []string {
 	w.mu.Lock()
 	var idleKeys []string
@@ -458,7 +526,7 @@ func (w *worker) reap(ctx context.Context, idle time.Duration) []string {
 	return done
 }
 
-// suspendAll runs on SIGTERM: Cloud Run gives the container 10 s.
+// suspendAll runs on SIGTERM.
 func (w *worker) suspendAll(ctx context.Context) {
 	w.mu.Lock()
 	var keys []string
@@ -474,9 +542,31 @@ func (w *worker) suspendAll(ctx context.Context) {
 	}
 	wg.Wait()
 	slog.Info("lease deleted", "err", w.bucket.delete(ctx, leaseKey(w.id)))
+	if w.gateway != nil {
+		w.gateway.Close()
+	}
+	if w.ateletSrv != nil {
+		w.ateletSrv.GracefulStop()
+	}
+	if w.workerConn != nil {
+		w.workerConn.Close()
+	}
+	if w.workerPID > 0 {
+		// ateworker-gvisor has its own graceful-shutdown path (it stops
+		// cleanly, since every actor was already suspended above); give it
+		// a few seconds before this process exits out from under it.
+		syscall.Kill(w.workerPID, syscall.SIGTERM)
+		for range 50 {
+			if syscall.Kill(w.workerPID, 0) != nil {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
 }
 
-// proxy forwards an ingress request to the actor's published port.
+// proxy forwards an ingress request to the actor, dialing its veth address
+// from inside its gateway network namespace.
 func (w *worker) proxy(rw http.ResponseWriter, r *http.Request) {
 	key := r.PathValue("as") + "/" + r.PathValue("actor")
 	gen, _ := strconv.ParseInt(r.Header.Get("ate-actor-generation"), 10, 64)
@@ -506,8 +596,10 @@ func (w *worker) proxy(rw http.ResponseWriter, r *http.Request) {
 		h.lastUsed = time.Now()
 		w.mu.Unlock()
 	}()
-	target := &url.URL{Scheme: "http", Host: fmt.Sprintf("127.0.0.1:%d", appPort(h.slot))}
+	target := &url.URL{Scheme: "http", Host: h.addr()}
+	transport := &http.Transport{DialContext: dialViaActorGateway(r.Context(), w.workerPID, h.actorUID)}
 	(&httputil.ReverseProxy{
+		Transport:     transport,
 		FlushInterval: -1,
 		Rewrite: func(pr *httputil.ProxyRequest) {
 			pr.SetURL(target)
@@ -548,7 +640,6 @@ func env(name, def string) string {
 	return def
 }
 
-// reply writes v as JSON, or err with a status that names its kind.
 func reply(rw http.ResponseWriter, v any, err error) {
 	switch {
 	case errors.Is(err, errFull), errors.Is(err, errStopping), errors.Is(err, errNoRoom):

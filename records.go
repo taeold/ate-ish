@@ -51,10 +51,18 @@ type Template struct {
 	} `json:"metadata"`
 	Containers []Container `json:"containers"`
 	Volumes    []Volume    `json:"volumes"`
+	// PreferredFidelity selects CheckpointWorkload/RestoreWorkload's
+	// fidelity: "MEMORY" checkpoints the sandbox's process memory; anything
+	// else (including empty) uses "VOLUMES", durable dirs only, which is
+	// what the worker's RunWorkload-only (no snapshot yet) path also uses.
+	PreferredFidelity string `json:"preferredFidelity,omitempty"`
 }
 
 // Container's image field is ignored: actors run from the node image.
 type Container struct {
+	// Name becomes the container's own OCI bundle subdirectory and the
+	// ateworkerpb.Container name; required by the vendored worker.
+	Name    string   `json:"name"`
 	Command []string `json:"command"`
 	Args    []string `json:"args"`
 	Env     []struct {

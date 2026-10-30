@@ -1,5 +1,352 @@
 # ate-node progress
 
+## v2 stage 2 (2026-10-30): the small atelet, on the vendored worker
+
+Brief (docs/V2.md stage 2, with the coordinator's follow-up decisions):
+worker.go/sandbox.go drive the vendored ateworker-gvisor as a separate
+process ate-ish starts and controls, same boundary substrate itself has
+between atelet and worker. ate-ish is the atelet: it serves WorkerSupport,
+mints actor certs, holds the node CA (internal/devatelet, promoted from the
+stage-0 probe). Gate: `./gate.sh`'s README sequence — template, actor, turn
+1, suspend, tag, fork, divergent turns — on one local node, pi-durable's
+Gateway variant, egress_gateway pointed at a passthrough CONNECT gateway
+(internal/devgateway) rather than left empty, because a dead network gives
+no way to tell "the worker runs the template" from "the worker is broken."
+
+Gate: PASS. Verified twice: once while fixing bugs, once as a clean
+from-scratch run (fresh bucket actors, fresh `sudo bin/ate-ish serve`) to
+confirm reproducibility. Every step: create atespace/template/actor/egress-policy,
+turn 1 (real HTTP round trip through the ingress to the actor and back),
+suspend, tag, fork, a turn on each of the original and the fork (proving
+restore and checkpoint-copy both work). `gate.sh`'s own success check
+(`jq -e .settled`) passes on every turn.
+
+Turn 1 and both divergent turns settle `status: unanswered, reason:
+model_error`, not a model answer — by design this stage: AI_GATEWAY_API_KEY
+is still `ate-placeholder-key` (the egress policy's header replacement
+is the gateway's own job, stage 3's, same as docs/V2.md says), so the real
+Vercel AI Gateway correctly answers 401. What matters for this gate is that
+it is a real 401 from the real service, not a connection failure: DNS
+resolved, TLS to the real host completed, the real HTTPS request reached
+`ai-gateway.vercel.sh`, logged on the gateway as `CONNECT
+destination=<real IP>:443 actor_cert="CN=actor"`.
+
+Timings (clean run): RunWorkload (fresh actor) boot_ms 1716 (snapshot_ms 189
+downloading nothing, since none existed yet); CheckpointWorkload+upload
+total_ms 443 (checkpoint_ms 107, upload_ms 136, VOLUMES fidelity, 13.9 KB);
+RestoreWorkload (resume from own snapshot) boot_ms 1427, snapshot_ms 211;
+RestoreWorkload (fork, from a tag-copied snapshot) boot_ms 1432, snapshot_ms
+216. Ingress round trip (placement + proxied turn) 2.3-2.6 s per turn.
+
+Decisions taken as directed:
+- ateworker-gvisor stays a separate process (`bin/ateworker-gvisor`, built
+  from the vendored tree unmodified), launched the stage-0 way: a private
+  cgroup+mount namespace so `internal/ateworker/cgroup.Delegate` sees
+  `0::/`, flags pointing at files `internal/devatelet.GeneratePKI` writes.
+- Packages ate-ish's own code imports moved from `internal/` to `exported/`
+  within the vendored tree (not a new API, the same move stage 1's VENDOR.md
+  already flagged as coming): `proto/ateworkerpb`, `proto/ateletpb`,
+  `ocispec`, `nodepath`, `netns`, `installdefaults`, `credbundle`,
+  `substratex509` (the last four not in the original stage-1 list, needed
+  once `devatelet`/`worker.go`/`nsdial.go` actually compiled against them).
+  `internal/volume` stayed under `internal/`: nothing imports it. Recorded
+  in VENDOR.md's "Packages moved out of internal/ (stage 2)" section.
+  `ate-ish/internal/devatelet` (asked for at that path) now compiles there,
+  since its own dependencies are exported too; it serves `WorkerSupport` for
+  real now (AcquireWorkerEpoch, RegisterWorker, SetWorkerSandboxRuntimes,
+  MintActorCertificate, and new this stage, GetActorEgressPolicy, reading
+  the actor's real policy out of ate-ish's own bucket record) rather than
+  logging and returning fixed stage-0 answers.
+- runsc: `scripts/fetch-runsc.sh` (pinned release, gh or a direct GitHub
+  release URL, staged at `bin/runsc/` in the full release layout — runsc's
+  sidecars next to it, same requirement stage 0 found). Not yet wired into
+  the Dockerfile; local-only this stage, since the gate is local.
+- Store: `gs://ate-ish-v2-daniel-junk` (us-west1), created this stage.
+  bucket.go's own token source needed a fallback: no Application Default
+  Credentials file exists here (`gcloud auth application-default login`
+  needs a browser this shell cannot drive), so a missing-ADC error falls
+  back to `gcloud auth print-access-token` (the same source cli.go's own
+  admin-API calls already used). Running the server also needs
+  `sudo HOME=$HOME`, not bare `sudo`: sudo's own default HOME (root's) has
+  no gcloud config, so the fallback token source fails too, silently,
+  until HOME is preserved.
+- Fidelity: `Template.PreferredFidelity` (new field; default, and
+  pi-durable's own template, is VOLUMES). A fresh actor always
+  RunWorkload-only regardless (no snapshot to restore from yet); Checkpoint
+  and Restore both read the template's fidelity.
+- Local-directory store: not attempted — GCS already covers the gate, so
+  the "only if it fits under 100 lines" budget was not spent.
+
+Launcher-path rewrite (worker.go, sandbox.go deleted, new bundle.go/
+actors.go/atelet.go/nsdial.go): ActorDirs and the OCI bundle are built per
+boot; the rootfs is the node's own filesystem, as an actual runsc-style
+overlay (lowerdir `/` read-only, upperdir/workdir on a fresh tmpfs) rather
+than the plain read-only bind mount V2.md offered as the simpler
+alternative — tried that first, and setupAppRootfs's own rewrite of
+`/etc/resolv.conf` inside the bundle needs a writable layer regardless of
+how little else the node image needs changed. Both the overlay mount and
+unmount run via `nsenter --mount=/proc/<workerpid>/ns/mnt`, not in-process:
+measured two things that do not work first — mounting through
+`/proc/<pid>/root/<path>` (works for open(), used for the actor's network
+namespace below, but a mount(2) call still attaches in the caller's own
+mount namespace) and in-process `setns(CLONE_NEWNS)` (the kernel refuses it
+for any thread of a multithreaded process, which every Go binary is;
+returns EINVAL). The actor's address is its veth address and the
+template's container port, dialed through its gateway network namespace
+(nsdial.go, open() through `/proc/<pid>/root/run/netns/...-at`, which does
+work from outside, then `exported/netns.Dialer`); the ingress proxy and the
+wakeup-probe poller both dial this way. The `-p` publish flag and the
+low-port workaround are gone along with the old sandbox-launcher path.
+
+Found and fixed along the way, beyond the mount-namespace ones above:
+- gVisor starts a container with no PATH at all ("error finding executable
+  ... in PATH []") — the sandbox's rootfs is the node's own filesystem, but
+  gVisor does not consult the host's PATH or any image config for one, so
+  ate-ish sets `PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`
+  itself (actors.go), overridable per-container by the template's own PATH
+  env entry.
+- atunnel's DNS relay fails every query closed ("Could not fetch the
+  actor's egress policy") until `GetActorEgressPolicy` exists on the
+  credential broker; unimplemented, not merely denying, so no hostname
+  ever resolved, including the one stage 0 never needed (literal IPs only).
+- Node 24 (not previously on this VM) installed at `/usr/local/node24`,
+  symlinked onto `/usr/local/bin/{node,npm,npx}`: the actor's rootfs is
+  this VM's own filesystem, so pi-durable's `node /actor/server-gateway.ts`
+  needed a real `node` binary and `npm ci --omit=dev` (`@earendil-works/*`,
+  90 packages) installed at `/actor` on the host, matching the template's
+  command exactly.
+- `pkill -f <path>` self-matches its own argv (same stage-1 finding,
+  applied again here for the worker subprocess and this run's own `bin/
+  ate-ish serve`); the `[x]` bracket idiom, or killing by PID when the
+  pattern has no leading `/` to bracket, both used across these scripts.
+
+Blockers: none; the gate is green. Carried forward for stage 3, named
+where relevant above: credential replacement inside the gateway (currently
+a pure passthrough, internal/devgateway); wiring runsc fetch into the
+Dockerfile; the two egress-enforcement checks at the end of `gate.sh`
+(`NODE_USE_ENV_PROXY=0` direct-fetch) test v1's HTTPS_PROXY-env-var
+convention, which v2 does not use (egress is transparent nftables capture
+now) — not run this stage, need rewriting for v2's model, not just a
+passing/failing re-run.
+
+Files changed: worker.go, main.go, records.go, bucket.go rewritten;
+sandbox.go, egress.go's callers removed (egress.go itself kept, unreferenced,
+for stage 3's credential-replacement gateway); new bundle.go, actors.go,
+atelet.go, nsdial.go, internal/devgateway/gateway.go; internal/devatelet
+extended (GetActorEgressPolicy, PKI path/cert accessors); third_party/substrate
+six packages moved internal/ -> exported/, VENDOR.md updated; scripts/
+fetch-runsc.sh; demo/template-gateway.yaml (port 8080 -> 80, preferredFidelity
+added); bin/runsc/ staged, bin/ate-ish and bin/ateworker-gvisor built. GCS
+bucket gs://ate-ish-v2-daniel-junk created. No commit made, per the brief.
+
+## v2 stage 1 (2026-10-29): vendor substrate's worker
+
+Brief (docs/V2.md stage 1): copy the named packages and whatever they
+transitively import from go.ate.dev/substrate (commit
+8767e8d62eebe7fe4c94d318b2ee30e8ed80ab82) into
+third_party/substrate/, import paths rewritten only, LICENSE and VENDOR.md
+added; vendor the stage-0 probe's fake atelet and PKI helper into
+ate-ish's own code since stage 2 builds on it; add Go deps; no edits to
+worker.go/sandbox.go. No commit.
+
+Gate: PASS. `go build ./...` and `go vet ./...` clean. `go test` of the
+vendored actornet and ateworker-gvisor (plus its cdiinject and cgroupstats
+subpackages) suites: all four `ok`. Tests needing root and skipped (14,
+all print "needs root: creates network namespaces" or "needs root:
+mount/unmount", each naming `hack/run-root-tests.sh`): actornet's
+TestSandboxSessionDialerConcurrentClose, TestSetupSandboxNetwork,
+TestActorEgressIsFailClosedWithoutAtunnel,
+TestIngressCrossesThePairWhileEgressIsCaptured,
+TestSetupSandboxNetworkWithoutVeth, TestSetupSucceedsOverALeftoverNamespace,
+TestActorUDPHasNowhereToGoBeyondTheNamespacePair,
+TestCleanupClosesEachDescriptorOnce, TestSessionCloseWaitsForServingToStop,
+TestSessionCloseReportsAWaitItCouldNotFinish,
+TestSandboxNamespacesDoNotForward,
+TestGatewayDoesNotRouteActorTrafficOverAStrayLink,
+TestSandboxEgressReachesAtunnelOnAnyPort,
+TestSandboxLinkLocalDoesNotReachAtunnel; ateworker-gvisor's
+TestResetRunscStateAndPidFileDirs_DetachesMounts. Not re-run as root (the
+gate only asked for the non-root run and a report of what it skipped).
+
+60 upstream packages copied (320 .go files on the first pass, 187 after
+pruning test files from the 58 packages the gate does not exercise; full
+per-package list with line counts in third_party/substrate/VENDOR.md),
+plus cmd/ateworker-gvisor/kodata/internal_flags.json (the runsc flag
+config stage 0 found was required and correct, copied verbatim). go.mod
+grew from 2 direct deps to the full transitive closure `go mod tidy`
+resolved from the module proxy (same versions upstream's own graph picks):
+k8s.io/apimachinery + client-go + controller-runtime + cel.dev (the
+generated validators' dependency), the full OpenTelemetry SDK and
+exporters (serverboot's tracing/metrics/logging init), aws-sdk-go-v2
+(pkg/objectstorage's S3 backend), google-containerregistry, nftables,
+vishvananda/netlink+netns, go-spiffe. go.mod 129 lines, go.sum 301 lines.
+
+One patch, not to a vendored file: the import-path rewrite is line-anchored
+(whole-line quoted imports only), not a blanket substring replace, because
+three generated .pb.go files embed the pre-rewrite path inside a
+length-prefixed protobuf descriptor byte literal — the first, broader
+rewrite attempt corrupted those bytes and crashed every vendored binary at
+package init with "slice bounds out of range [-1:]" in
+google.golang.org/protobuf's desc_init.go. Fixed by re-copying clean and
+redoing the rewrite with a line-anchored regex; verified by grep that the
+only remaining "go.ate.dev/substrate" occurrences are the three descriptor
+literals (cosmetic, upstream's own go_package option bytes, unrelated to
+this module's import resolution), two inert `//go:generate`/doc-comment
+mentions, and one real but harmless string constant
+(`internal/actorevent.ScopeName`, an OTel scope label) — detail in
+VENDOR.md.
+
+Blocker found and resolved, documented in VENDOR.md's last section: the
+coordinator's ate-ish/internal/devatelet location for the vendored fake
+atelet/PKI helper does not compile. Go's internal-import rule only allows
+code rooted under third_party/substrate/ to import
+third_party/substrate/internal/* packages (credbundle, proto/ateletpb,
+substratex509 — everything devatelet needs), and that boundary is the
+import-path string itself, unrelated to which module owns the code.
+Relocated to third_party/substrate/ateish/devatelet (the only
+non-upstream directory under third_party/substrate/, clearly marked as
+such in VENDOR.md) to satisfy the rule while staying visibly separate from
+vendored content; exported generatePKI/serveFakeAtelet as
+GeneratePKI/ServeFakeAtelet (nothing else behavioral changed) so another
+package can call them. This same wall will block stage 2's worker.go and
+sandbox.go the moment they import a vendored internal package directly
+(ocispec, nodepath, ateworkerpb's request types) — flagged for that stage,
+not solved here, since stage 1 does not touch worker.go/sandbox.go.
+
+Files: third_party/substrate/ (new, 187 vendored .go files + LICENSE +
+VENDOR.md + kodata/internal_flags.json; ateish/devatelet/ is ours, 2 files,
+~340 lines, adapted from /tmp/substrate/cmd/ateish-probe/{pki,fakeatelet}.go);
+go.mod, go.sum (deps added, nothing removed). No commit made, per the
+brief.
+
+## v2 stage 0 (2026-10-29): substrate's gVisor worker, local, no control plane
+
+Brief (docs/V2.md stage 0): build ateworker-gvisor from the substrate clone,
+fetch runsc, run the worker as root with a unix socket, drive RunWorkload by
+hand, gate on HTTP reachability, egress confinement to the gateway, and
+checkpoint/restore round-trip. No ate-ish code touched; everything lives
+under /tmp/substrate (clone) and /tmp/ate-ish-probe (working dirs).
+
+Gate: PASS, all four, on two independent runs.
+
+1. `sudo ip netns exec <actor-uid>-at busybox wget http://169.254.17.2/`
+   from the host answers 200 (through the actor's own gateway namespace,
+   since the sandbox's veth lives in named netns the host's root netns does
+   not route to).
+2. No `egress_gateway` on the request: a raw HTTP/1.0 GET to 1.1.1.1:80 from
+   inside the sandbox (`runsc exec`, busybox nc) gets zero bytes back
+   (atunnel accepts the nftables-redirected TCP locally, then closes it:
+   "like a network failure", per internal/atunnel/egress/egress.go). With
+   `egress_gateway` set to the probe's fake CONNECT gateway, the same
+   request gets a real `HTTP/1.1 301 Moved Permanently ... Server: cloudflare`
+   back, round-tripped through the gateway's own dial to 1.1.1.1:80.
+3. CheckpointWorkload (MEMORY fidelity) then RestoreWorkload: the durable-dir
+   file written before checkpoint survives (`counter=1`, a plain host bind
+   mount, untouched by the snapshot) and the in-memory counter continues
+   from where it left off (1 before checkpoint, 2 after restore, not reset).
+4. atunnel's CONNECT, captured by the probe's fake gateway:
+   `CONNECT //1.1.1.1:80 HTTP/1.1`, header `User-Agent: Go-http-client/1.1`,
+   TLS client certificate `subject="CN=actor" issuer="CN=ate-ish-probe node CA"`
+   (no URI SAN; the worker's egress.Client mints this from the credential
+   broker's CSR response, with no SPIFFE identity of its own).
+
+Timings (two runs): RunWorkload without a gateway 80-103 ms; RunWorkload with
+one 87-101 ms; CheckpointWorkload 118-133 ms; RestoreWorkload 156-191 ms.
+runsc version: `release-20261019.0`, spec 1.2.1, platform systrap (default;
+confirmed via `runsc flags`, no override needed). `-allow-connected-on-save`
+is present in that release's `runsc flags` output and already wired into
+production's `cmd/ateworker-gvisor/kodata/internal_flags.json` (the `start`
+command's globalFlags) — copied verbatim via `KO_DATA_PATH`, not
+hand-written.
+
+Commands: `gh release download -R google/gvisor release-20261019.0 -p
+'gvisor-x86_64.tar.zstd'`, extracted with `tar --zstd -xf`.
+`cd /tmp/substrate && go build -o ateworker-gvisor ./cmd/ateworker-gvisor`
+(no errors, no vendor changes). Driver: `go build -o ateish-probe
+./cmd/ateish-probe`, a new package added under the substrate clone (not
+ate-ish) so it could import substrate's own internal packages; it generates
+its own PKI, the worker binary, and drives it.
+
+What stage 0 needed beyond the files named in the brief, found by reading
+error output rather than guessing:
+
+- `internal/ateworker/cgroup.Delegate` requires `/proc/self/cgroup` to read
+  `0::/`: a private cgroup namespace whose root is the caller's own cgroup
+  at unshare(2) time, plus a fresh cgroup2 mount taken inside that namespace
+  (otherwise the existing host mount still shows the full tree). Done with
+  `CLONE_NEWCGROUP|CLONE_NEWNS` plus `mount --make-rprivate / && umount
+  /sys/fs/cgroup && mount -t cgroup2 cgroup2 /sys/fs/cgroup` in the child,
+  after moving the launching process into a fresh leaf
+  (`/sys/fs/cgroup/ate-ish-probe-worker/cgroup.procs`). Needs cleanup between
+  runs: cgroup's "no internal processes" rule refuses a second run's `echo
+  $$ > cgroup.procs` once the first run enabled subtree_control and left a
+  `worker` child leaf behind.
+- Unexpected side effect of that same private mount namespace: actornet's
+  named network namespaces (`/run/netns/<name>`, `<name>-at`) are bind-mounted
+  from inside it, so they are invisible to the driver's own (host) mount
+  namespace — `/run/netns/<name>` there is an empty regular file, and `ip
+  netns exec` on it fails `EINVAL`. Fixed by `nsenter
+  --mount=/proc/<workerpid>/ns/mnt -- ip netns exec <name> ...` before every
+  host-side HTTP check.
+- `validateRunscPath` requires `runsc_path` to live under
+  `nodepath.ActorSandboxAssetsDir(actorUID)` (`/var/lib/ate/actors/<uid
+  >/sandbox-assets`, not configurable — `nodepath.ActorsDir` is a package
+  var atelet normally owns, the worker never takes a flag for it), and
+  runsc's sentry sidecars (`gvisor_sentry` etc.) are looked up in a
+  `gvisor-bin/` directory next to the `runsc` binary itself: staging only
+  the `runsc` file (not the whole release layout) fails `runsc create` with
+  "sidecar \"gvisor_sentry\" not usable: ... no such file or directory".
+- `EgressGateway.address` needs a live actor TLS client certificate, minted
+  by dialing `nodepath.WorkerSupportSocket` (atelet's credential broker, not
+  reused per the brief) over mTLS matching `ateletdial.TLSConfig`: a SPIFFE
+  URI SAN plus a JSON-encoded Pod-identity X.509 extension with matching
+  NodeName/NodeUID on both the worker's own credential and the peer's. The
+  probe stands in a ~90-line fake `WorkerSupportServer` (AcquireWorkerEpoch,
+  RegisterWorker, SetWorkerSandboxRuntimes, MintActorCertificate) with its
+  own throwaway CA for exactly this; `--dns-egress-policy=enforce-in-atunnel`
+  is required (empty is rejected) but never exercised (the probe's addresses
+  are literal IPs, no DNS lookups).
+- `--readiness-listen-address` collided with an unrelated process already on
+  :18080; the worker's health server treats a bind failure as fatal
+  (`os.Exit(1)`) with no process-level indication beyond the log line, so
+  the gRPC socket silently stopped accepting.
+- A fully static Go binary (`CGO_ENABLED=0`) as the container's one process
+  (serves `/counter` in-memory and `/volwrite`+`/volread` under a
+  durable-dir bind mount) plus `/usr/bin/busybox` (already static on this
+  VM) for ad hoc `runsc exec` checks; no docker image needed; the bundle
+  rootfs is a plain directory (no `rootfs-overlay.json`), so composing it by
+  hand is exactly what `imagecache.SetupBundleRootfs` does for an
+  atelet-less caller.
+- `pkill -f <path>` matches its own argv (the pattern string is literally
+  present in the `pkill` process's own command line) and can SIGKILL itself
+  before reaching the real target; fixed with the `[a]teworker-gvisor`
+  bracket idiom in both ad hoc shell cleanup and the probe's own
+  between-runs cleanup.
+- Gate 2's egress check needed two iterations: `busybox wget` to
+  `http://1.1.1.1/` follows 1.1.1.1's redirect to `:443` and then fails in
+  busybox's own mbedtls stack ("TLS error from peer (alert code 20): bad
+  MAC"), unrelated to the tunnel; and a bare TCP connect-only check (`nc` to
+  port 443 with no payload) passes even with no egress gateway configured,
+  because nftables REDIRECTs the SYN to atunnel's local listener either way
+  — the distinguishing signal is whether real response bytes come back, not
+  whether the handshake completes. Settled on a raw HTTP/1.0 GET to port 80
+  over `busybox nc`, checked for an actual `HTTP/` response line.
+
+Cleanup: `ip netns delete` on every leftover `worker-actor:*` namespace,
+`pkill -9 -f '[a]teworker-gvisor'`; the probe's own graceful run leaves none
+behind (confirmed: the final run's actor netns is absent from `ip netns
+list` after its own TerminateWorkload). Files: the substrate clone keeps a
+new, additive-only `cmd/ateish-probe/` package (pki.go, fakeatelet.go,
+fakegateway.go, dirs.go, worker.go, netns.go, egress.go, main.go); nothing
+under it is vendored or copied into ate-ish. No ate-ish source files were
+touched, per the stage-0 rule.
+
+Blockers: none; stage 0's gate is green. A note for stage 1 (vendoring): the
+worker's own gRPC surface carries no TLS (plaintext over the unix socket)
+and the CredentialBroker/atelet dependency only activates when
+`egress_gateway` is set — a template with no egress gets a much shorter
+path to RunWorkload.
+
 ## Run 4 (2026-10-29): the binary and CLI are ate-ish
 
 Brief: rename the binary and command from `ate` to `ate-ish` (subcommands,
