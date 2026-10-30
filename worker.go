@@ -56,12 +56,14 @@ type worker struct {
 	dir    string // base dir for actor state, e.g. /var/lib/ate-ish
 	bucket *bucket
 
-	pki        *devatelet.PKI
-	ateletSrv  *grpc.Server
-	gateway    *egressGateway
-	workerPID  int
-	workerConn *grpc.ClientConn
-	client     ateworkerpb.WorkerClient
+	pki         *devatelet.PKI
+	ateletSrv   *grpc.Server
+	gateway     *egressGateway
+	workerPID   int
+	workerConn  *grpc.ClientConn
+	client      ateworkerpb.WorkerClient
+	cgroupLeaf  string // removed on graceful shutdown; see removeWorkerCgroupLeaf
+	rootfsLower string // every actor's runsc overlay lowerdir; see rootfsLowerDir
 
 	mu    sync.Mutex
 	slots []*hosted
@@ -99,6 +101,13 @@ func newWorker(ctx context.Context, b *bucket, addr string, capacity int, dir st
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
+	// Stage 5d: resolved once per node instance, before anything else
+	// needs it (the first actor boot would otherwise pay the one-time
+	// copy cost, on gen2, inside its own placement request).
+	rootfsLower, err := rootfsLowerDir(dir)
+	if err != nil {
+		return nil, fmt.Errorf("preparing the actor rootfs lowerdir: %w", err)
+	}
 	ateletSPIFFE := installdefaults.AteletSPIFFEID(installdefaults.SystemNamespace)
 	pki, err := devatelet.GeneratePKI(filepath.Join(dir, "pki"), ateletSPIFFE)
 	if err != nil {
@@ -128,7 +137,7 @@ func newWorker(ctx context.Context, b *bucket, addr string, capacity int, dir st
 	connectPort, _ := strconv.Atoi(env("ATE_CONNECT_PORT", "28444"))
 
 	podUID := "ate-ish-" + randomHex(4)
-	cmd, err := startAteworker(ateworkerConfig{
+	cmd, cgroupLeaf, err := startAteworker(ateworkerConfig{
 		binary:      workerBinaryInBin,
 		kodata:      workerKodataPath,
 		podUID:      podUID,
@@ -156,7 +165,9 @@ func newWorker(ctx context.Context, b *bucket, addr string, capacity int, dir st
 		id: "w-" + randomHex(4), addr: addr, dir: dir, bucket: b,
 		pki: pki, ateletSrv: ateletSrv, gateway: gateway,
 		workerPID: cmd.Process.Pid, workerConn: conn, client: ateworkerpb.NewWorkerClient(conn),
-		slots: make([]*hosted, capacity),
+		cgroupLeaf:  cgroupLeaf,
+		rootfsLower: rootfsLower,
+		slots:       make([]*hosted, capacity),
 	}
 	if err := w.writeLease(ctx); err != nil {
 		return nil, err
@@ -200,6 +211,17 @@ func (w *worker) routes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /reap", func(rw http.ResponseWriter, r *http.Request) {
 		idle, _ := strconv.Atoi(r.URL.Query().Get("idleSeconds"))
 		reply(rw, w.reap(context.WithoutCancel(r.Context()), time.Duration(idle)*time.Second), nil)
+	})
+	// Stage 5d diagnostic: Cloud Run's own log capture of this container's
+	// stdout has, more than once, simply dropped lines the vendored
+	// worker subprocess wrote through ate-ish's io.MultiWriter tee
+	// (atelet.go), for reasons not fully root-caused (see docs/PROGRESS.md).
+	// The file that same tee writes to is never affected, so serving it
+	// back answers "what did the worker actually log" when Cloud Logging
+	// does not show it. Admin-only (same bearer-token gate as every other
+	// /admin route).
+	mux.HandleFunc("GET /admin/workerlog", func(rw http.ResponseWriter, r *http.Request) {
+		http.ServeFile(rw, r, filepath.Join(w.dir, "ateworker-gvisor.log"))
 	})
 	mux.HandleFunc("/actors/{as}/{actor}/{path...}", w.proxy)
 }
@@ -342,7 +364,7 @@ func (w *worker) boot(ctx context.Context, h *hosted, rec Actor) error {
 	if err := stageRunsc(runscReleaseDir, dirs); err != nil {
 		return fmt.Errorf("staging runsc: %w", err)
 	}
-	if err := mountBundleRootfs(w.workerPID, dirs, h.cname); err != nil {
+	if err := mountBundleRootfs(w.workerPID, dirs, h.cname, w.rootfsLower); err != nil {
 		return fmt.Errorf("mounting bundle rootfs: %w", err)
 	}
 
@@ -572,6 +594,9 @@ func (w *worker) suspendAll(ctx context.Context) {
 			}
 			time.Sleep(100 * time.Millisecond)
 		}
+	}
+	if w.cgroupLeaf != "" {
+		removeWorkerCgroupLeaf(w.cgroupLeaf)
 	}
 }
 

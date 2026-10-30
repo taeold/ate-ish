@@ -1,14 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/taeold/ate-ish/third_party/substrate/exported/nodepath"
 	"github.com/taeold/ate-ish/third_party/substrate/exported/proto/ateworkerpb"
@@ -130,14 +133,121 @@ func copyFile(path, dst string, mode os.FileMode) error {
 	return err
 }
 
+// overlayfsSuperMagic is statfs(2)'s f_type for an overlayfs mount
+// (uapi/linux/magic.h's OVERLAYFS_SUPER_MAGIC).
+const overlayfsSuperMagic = 0x794c7630
+
+// rootIsOverlayfs reports whether "/" itself is an overlayfs mount.
+func rootIsOverlayfs() (bool, error) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs("/", &st); err != nil {
+		return false, fmt.Errorf("statfs /: %w", err)
+	}
+	return int64(st.Type) == overlayfsSuperMagic, nil
+}
+
+// rootfsLowerDir returns the directory to use as every actor's runsc
+// overlay lowerdir. On a plain filesystem (every local/VM run so far),
+// that is "/" itself, unchanged from stage 0 onward.
+//
+// Stage 5d: Cloud Run gen2's own "/" is already an overlayfs mount (the
+// container runtime's own image layer), and the kernel's overlay driver
+// refuses to stack a second overlay past its maximum depth — stage 5c
+// confirmed this is not a mount-option problem (index=off and friends made
+// no difference; removed here, since they are moot once lowerdir is never
+// overlayfs again). The fix: copy the node filesystem once per node
+// instance onto a real, non-overlay directory (locally a plain
+// subdirectory; on Cloud Run gen2, a mounted ephemeral-disk volume), and
+// use that copy as lowerdir for every actor on this node, instead of "/".
+// ATE_ROOTFS_COPY=1 forces this path even when "/" is not overlayfs, so it
+// can be exercised and gated locally before relying on it on gen2.
+func rootfsLowerDir(dir string) (string, error) {
+	if env("ATE_ROOTFS_COPY", "") != "1" {
+		isOverlay, err := rootIsOverlayfs()
+		if err != nil {
+			return "", err
+		}
+		if !isOverlay {
+			return "/", nil
+		}
+	}
+	dest := filepath.Join(dir, "rootfs")
+	if _, err := os.Stat(filepath.Join(dest, "bin")); err == nil {
+		// A previous boot of this same node instance already copied it;
+		// the copy outlives one actor (or even one worker subprocess
+		// restart) and only needs to happen once per node instance.
+		slog.Info("rootfs lowerdir already copied", "dest", dest)
+		return dest, nil
+	}
+	t0 := time.Now()
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		return "", err
+	}
+	// Exclude: pseudo-filesystems that make no sense to snapshot; ate-ish's
+	// own data directory (dir), which is where dest itself lives, and
+	// nodepath.BasePath ("/var/lib/ate"), the vendored worker's own shared
+	// socket/state directory — neither should be part of the actor's
+	// rootfs image, and dir in particular would otherwise have the copy
+	// try to copy itself into itself. The last four are container-runtime
+	// and dev-workspace storage that is never part of a real actor's
+	// rootfs on any host; added once local testing measured this dev VM's
+	// own docker/containerd state and home directory at ~50GB (more than
+	// its free disk), which a slim Cloud Run image never has in the first
+	// place — a harmless no-op exclude there, since those paths do not
+	// exist in the gen2 container.
+	exclude := []string{"./proc", "./sys", "./dev", "./run", "./tmp",
+		"." + nodepath.BasePath, "." + dir,
+		"./var/lib/docker", "./var/lib/containerd", "./home", "./snap"}
+	args := []string{"-C", "/", "--xattrs", "-cf", "-"}
+	for _, e := range exclude {
+		args = append(args, "--exclude="+e)
+	}
+	args = append(args, ".")
+	create := exec.Command("tar", args...)
+	extract := exec.Command("tar", "-C", dest, "--xattrs", "-xpf", "-")
+	pr, pw := io.Pipe()
+	create.Stdout, extract.Stdin = pw, pr
+	var createErr, extractErr bytes.Buffer
+	create.Stderr, extract.Stderr = &createErr, &extractErr
+	if err := extract.Start(); err != nil {
+		return "", fmt.Errorf("starting tar extract: %w", err)
+	}
+	if err := create.Start(); err != nil {
+		return "", fmt.Errorf("starting tar create: %w", err)
+	}
+	go func() { create.Wait(); pw.Close() }()
+	if err := extract.Wait(); err != nil {
+		return "", fmt.Errorf("copying the node filesystem for %s: %w (create: %s) (extract: %s)",
+			dest, err, createErr.String(), extractErr.String())
+	}
+	size := dirSize(dest)
+	slog.Info("copied the node filesystem as the actor rootfs lowerdir", "dest", dest,
+		"took_ms", time.Since(t0).Milliseconds(), "bytes", size)
+	return dest, nil
+}
+
+// dirSize sums file sizes under dir (an approximation of its disk usage,
+// for the log line above; errors are swallowed since this is informational).
+func dirSize(dir string) int64 {
+	var total int64
+	filepath.Walk(dir, func(_ string, info os.FileInfo, err error) error {
+		if err == nil && !info.IsDir() {
+			total += info.Size()
+		}
+		return nil
+	})
+	return total
+}
+
 // mountBundleRootfs builds containerName's OCI bundle rootfs as a runsc
-// overlay of the node's own filesystem (v1 ran actors from the node image
-// the same way): lowerdir "/" read-only, upperdir/workdir on a fresh tmpfs
-// (overlayfs refuses an upperdir nested under its own lowerdir, which a
-// plain subdirectory of "/" always is on this single-filesystem VM — the
-// worker needs a writable upper regardless of how little the node image
-// itself needs to change, since setupAppRootfs rewrites /etc/resolv.conf
-// and /etc/hosts inside it on every boot).
+// overlay of lowerDir (the node's own filesystem, or a copy of it — see
+// rootfsLowerDir — v1 ran actors from the node image the same way):
+// lowerdir read-only, upperdir/workdir on a fresh tmpfs (overlayfs refuses
+// an upperdir nested under its own lowerdir, which a plain subdirectory of
+// lowerDir always is when lowerDir is "/" on this single-filesystem VM —
+// the worker needs a writable upper regardless of how little the node
+// image itself needs to change, since setupAppRootfs rewrites
+// /etc/resolv.conf and /etc/hosts inside it on every boot).
 //
 // The mounts must land in the worker subprocess's own mount namespace, not
 // this process's: ateworker-gvisor runs in a private mount namespace (see
@@ -152,7 +262,7 @@ func copyFile(path, dst string, mode os.FileMode) error {
 // EINVAL — also measured. What does work, and is what this uses: `nsenter`
 // as a short-lived external process, which is single-threaded at the
 // moment it calls setns(2).
-func mountBundleRootfs(workerPID int, d *actorDirs, containerName string) error {
+func mountBundleRootfs(workerPID int, d *actorDirs, containerName, lowerDir string) error {
 	bundle := filepath.Join(d.pb.GetOciBundleDir(), containerName)
 	rootfs, ovl := filepath.Join(bundle, "rootfs"), filepath.Join(bundle, "ovl")
 	for _, dir := range []string{rootfs, ovl} {
@@ -162,8 +272,8 @@ func mountBundleRootfs(workerPID int, d *actorDirs, containerName string) error 
 	}
 	script := fmt.Sprintf(
 		"set -e; mount -t tmpfs tmpfs %[1]q; mkdir -p %[1]s/upper %[1]s/work; "+
-			"mount -t overlay overlay -o lowerdir=/,upperdir=%[1]s/upper,workdir=%[1]s/work %[2]q",
-		ovl, rootfs)
+			"mount -t overlay overlay -o lowerdir=%[3]s,upperdir=%[1]s/upper,workdir=%[1]s/work %[2]q",
+		ovl, rootfs, lowerDir)
 	if out, err := nsenterSh(workerPID, script).CombinedOutput(); err != nil {
 		nsenterSh(workerPID, fmt.Sprintf("umount -l %q 2>/dev/null; umount -l %q 2>/dev/null", rootfs, ovl)).Run()
 		return fmt.Errorf("mounting overlay rootfs at %s: %w (%s)", rootfs, err, out)

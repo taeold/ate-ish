@@ -1,0 +1,16 @@
+metadata:
+  atespace: ate-ish-probe
+  name: probe
+containers:
+- name: probe
+  command:
+  - python3
+  - -m
+  - http.server
+  - "80"
+  wakeupProbe:
+    httpGet:
+      path: /
+      port: 80
+    timeoutSeconds: 30
+preferredFidelity: VOLUMES

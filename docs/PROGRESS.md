@@ -1,5 +1,670 @@
 # ate-node progress
 
+## v2 stage 5f (2026-10-30): the subcontainer cgroup path, patched; `gate.sh play` green on real gen2
+
+Brief (coordinator): get past the subcontainer cgroup wall, in order of
+preference: (1) a non-vendored route, measured not guessed; (2) a
+documented, one-line vendored patch if (1) is truly closed; (3) the real
+gen2 deploy and gate.
+
+**Route taken: 2 (documented patch).** Route 1 was conclusively closed by
+reading the actual vendored source, not by assumption: `ate-ish` never
+writes an actor's `config.json` itself (the worker generates it
+internally, inside `ateworker-gvisor`, at `RunWorkload` time), so there
+is no file of ours to strip `linux.cgroupsPath` from. Every vendored
+`ocispec` file was read to confirm `ocispec.Build` never sets
+`spec.Linux.CgroupsPath`; `exported/ocispec/gvisor.go`'s `ShapeGVisor` is
+the only call site that ever does, unconditionally once the field reads
+empty, and nothing in `ateworkerpb`'s `WorkloadSpec`/`ContainerSpec` (the
+wire API ate-ish's own, non-vendored code controls) reaches that
+assignment. The "match the sandbox's own cgroupsPath" idea was also
+dead on arrival: `GVisorCgroupLeaf(ActorUID, ContainerName)` always
+differs between `_sandbox` and an actor's own container name, which
+ate-ish's own code cannot override to force a collision.
+
+**Patch 1**, `third_party/substrate/exported/ocispec/gvisor.go`: a
+package-level `noCgroupsPath = os.Getenv("ATE_ISH_NO_CGROUP_PATH") == "1"`
+(read once), and `if spec.Linux.CgroupsPath == "" && !noCgroupsPath` in
+`ShapeGVisor` — the only line touched. Documented in `VENDOR.md` as
+"Patch 1," with the diff, the measured reason (stage 5d/5e/5f's own
+findings, not restated here), and an upstream proposal: an explicit
+`WorkloadSpec` or worker-flag opt-out for hosts whose cgroup v2 root
+exposes no usable controllers, degrading limits/stats the same way
+`--ignore-cgroups` already does for the sandbox cgroup, instead of
+refusing the container outright. `atelet.go`'s `startAteworker` now sets
+`ATE_ISH_NO_CGROUP_PATH=1` on the worker subprocess's own env whenever it
+also sets `--ignore-cgroups` (the same `ignoreCgroups` bool, same
+detection, same `ATE_IGNORE_CGROUPS=1` local-test override).
+
+**Local verification, both green**, `ATE_IGNORE_CGROUPS=1` forced on a
+host that has the controllers: single-node `gate.sh play` (full
+sequence, suspend/tag/fork, both egress checks); a MEMORY-fidelity
+variant of the pi-durable template (`preferredFidelity: MEMORY`, built
+by copying `demo/template-gateway.yaml`) checkpointed and restored with
+its conversation history intact (5 messages after one suspend/resume
+cycle) — quick enough to run both locally and on gen2 (below), so not
+left untested.
+
+**Real gen2 deploy: green.** `gate.sh play` against `ate-ish-v2`: **exit
+0, the first full pass on real Cloud Run gen2 this project** (every
+prior round from stage 5 on stopped at a different point before this).
+One unrelated snag surfaced only once execution got this far: the
+pi-durable image's own base (`Dockerfile`) never installed `curl`, which
+one of `gate.sh`'s own checks (added stage 3, always run with `node -e
+fetch` for the DNS-refusal checks but a raw `curl` for the no-header-401
+check) needs; every prior stage's local runs never noticed because
+local `lowerdir=/` is this dev VM's own filesystem, which already has
+`curl`. Added `curl` to `Dockerfile`'s apt list; redeployed; green.
+
+Also ran the MEMORY-fidelity check again on gen2 directly (a separate
+atespace, cleaned up before the final redeploy): turn 1 (2.1s),
+suspend/checkpoint (12.3s), restore+turn 2 (1.6s, `ate-resume-ms: 762`),
+5 messages carried through the cycle — confirmed working, not left
+untested.
+
+**Timings, gen2 vs. local** (this round's final, green gen2 run vs.
+stage 2/3's local numbers, same `pi-durable` template, `VOLUMES`
+fidelity): boot (`RunWorkload`, fresh actor) 1015 ms gen2 vs. 1335-1716
+ms local; checkpoint 44 ms gen2 vs. 69-107 ms local; restore (own
+snapshot) 1015 ms gen2 vs. 1427 ms local; restore (fork) 1014 ms gen2 vs.
+1432 ms local — gen2 is at least as fast as local on every measured
+step, not slower. Rootfs copy: 44.6-47.4 s / 578-588 MB across this
+round's gen2 deploys (vs. local's 120 s / 8.9 GB in stage 5d, almost
+entirely this dev VM's own bloat, not the mechanism). Full `gate.sh
+play` wall time on gen2: 54-56 s.
+
+**Resources left running: `ate-ish-v2` (green).** `ate-node` (v1)
+untouched throughout.
+
+Files changed: `third_party/substrate/exported/ocispec/gvisor.go`
+(Patch 1, see above); `third_party/substrate/VENDOR.md` (Patch 1
+documented); `atelet.go` (`ATE_ISH_NO_CGROUP_PATH` set alongside
+`--ignore-cgroups`); `Dockerfile` (added `curl`); `deploy.sh` (`play`
+targets gen2: `INSTANCE` defaults to `ate-ish-v2`, no
+`--sandbox-launcher`, `--add-volume=type=in-memory` for the rootfs copy,
+`ATE_SECRET_MAP`/`SECRET_URI` plumbing removed — the worker's own egress
+gateway reads Secret Manager directly via ADC, never through an injected
+env var, so that plumbing was never wired to anything real); `README.md`
+(new limits bullet: no per-actor cgroup limits on gen2, why, and the
+rootfs-copy mechanism/size). No commit made, per the brief.
+
+## v2 stage 5e (2026-10-30): --ignore-cgroups fixes the sandbox; the subcontainer path does not honor it
+
+Brief (coordinator): stage 5d's finding is a real platform fact (gen2 is
+a hybrid cgroup host; memory/cpu are bound to v1 hierarchies this
+container cannot reach, so the v2 mount it controls can only offer
+hugetlb). Make the worker run without them: runsc's own
+`--ignore-cgroups` global flag, staged into our own copy of
+`kodata/internal_flags.json` (configuration we ship, not vendored
+source), automatically when the host lacks memory/cpu.
+
+**Part 1, local, `ATE_IGNORE_CGROUPS=1` forced on a host that has the
+controllers: fully green.** `atelet.go` gained `hostLacksMemoryOrCPU`
+(checks the worker leaf's parent's `cgroup.controllers` for `memory`/
+`cpu`) and `stageKodata` (copies the vendored `internal_flags.json` into
+`<ATE_DIR>/kodata`, adding `--ignore-cgroups` to `globalFlags` when
+needed, then points `KO_DATA_PATH` at the staged copy — the vendored
+tree under `third_party/substrate` is never written to). Single-node
+`gate.sh play`: exit 0, full sequence including suspend/tag/fork
+(checkpoint) and both forked-and-original turns (restore), both egress
+checks. No `GetWorkloadStats`/memwatch errors; `"Actor usage sampled"`
+logged with `ate.stats.source: unspecified` (a graceful degrade, not a
+failure) instead of real cgroup-backed numbers. Stage 4's two-node
+check (node A `ATE_CAPACITY=0`, node B under `unshare --mount`, both
+`ATE_IGNORE_CGROUPS=1`): cross-node resume, history carried across two
+turns, same as every prior round.
+
+**Part 2, automatic detection: works exactly as specified.** On this VM
+(has the controllers), nothing changes. On gen2, `startAteworker` logs
+`"this host exposes no memory/cpu cgroup controllers to the container;
+staging ateworker-gvisor with --ignore-cgroups"` on its own, after the
+existing 5-second retry (stage 5d) confirms the shortfall is not
+transient, and the vendored worker's own `runsc create` for the sandbox
+(`_sandbox`) container succeeded — for the first time this project,
+`cgroup delegation ready` no longer blocks anything downstream of it.
+
+**Part 3, real gen2 deploy: progressed one more step, then a different
+wall.** `--add-volume=type=in-memory,size-limit=2Gi` (ephemeral-disk
+still unsupported, per stage 5d) at the same mount path; copy 47-48s /
+578MB, consistent with stage 5d. `gate.sh play`'s first `/submit`
+now fails with:
+```
+RunWorkload: ... while creating "pi-durable" application container: while running `runsc create`: exit status 128
+```
+Read via the kept `/admin/workerlog` diagnostic: the `_sandbox`
+container's own `runsc create` (with `--ignore-cgroups` present in its
+args) **succeeded this time** — confirmed by its absence from the error
+log and the next step actually running. The failure is one level deeper:
+the actor's own application container ("pi-durable", a gVisor
+*subcontainer* within the already-running sandbox) fails with
+```
+configuring subcontainer cgroup: mandatory cgroup controller "memory" is missing for "/sys/fs/cgroup/<uid>-pi-durable"
+```
+despite `--ignore-cgroups` being present verbatim in that exact `runsc
+create` invocation's own argv (confirmed by grepping the worker's own
+log line for it). `--ignore-cgroups` suppresses the *sandbox's* own
+cgroup setup but not a subcontainer's: traced to vendored
+`exported/ocispec/gvisor.go`'s `if spec.Linux.CgroupsPath == ""` —
+it unconditionally assigns a per-container `CgroupsPath` whenever the
+OCI spec doesn't already carry one, and nothing in `ateworkerpb`'s
+`WorkloadSpec`/`ContainerSpec` (what our own, non-vendored `actors.go`
+controls) has a field to leave it unset or opt out. This is exactly the
+brief's own stop condition ("if something in the vendored worker refuses
+to proceed without an actor cgroup, record the exact error and stop
+there"): fixing it would mean editing vendored `ocispec` or runsc's own
+subcontainer cgroup-configuration path, not `atelet.go`/`bundle.go`.
+
+**Gate result: not green, past a new point.** Sandbox-level cgroup setup
+now works on gen2 for the first time; the per-container (subcontainer)
+cgroup setup inside the sandbox does not, and `--ignore-cgroups` does
+not reach it. No turn completed, so no boot/checkpoint/restore/turn
+timing exists to compare against local beyond the copy time (47-48s on
+gen2 vs. local's 120s/8.9GB — both consistent with stage 5d).
+
+**Resources left running: none.** `ate-ish-v2` deleted (not green).
+`ate-node` (v1) untouched. No local stray processes.
+
+Files changed: `atelet.go` (`hostLacksMemoryOrCPU`, `stageKodata`, wired
+into `startAteworker` with `ATE_IGNORE_CGROUPS` as the local-test
+override). `bundle.go`/`worker.go` unchanged from stage 5d.
+`Dockerfile`/`deploy.sh`/README not updated this round: the brief asked
+for those once gen2's gate passes, which it does not yet. No commit
+made, per the brief.
+
+## v2 stage 5d (2026-10-30): rootfs overlay fixed; a hard cgroup-controller limit found one layer deeper
+
+Brief (coordinator): fix the overlay-on-overlay depth problem (gen2's "/"
+is itself overlayfs) by copying the node filesystem once per instance to
+a real, non-overlay directory and using that as every actor's lowerdir;
+verify locally with `ATE_ROOTFS_COPY=1`; deploy to gen2 with a volume at
+the copy path; record timings; leave `ate-ish-v2` running if green.
+
+**Part 1: the rootfs copy — works, confirmed on real gen2.** `bundle.go`
+gained `rootIsOverlayfs` (statfs(2), `OVERLAYFS_SUPER_MAGIC`) and
+`rootfsLowerDir`: on a plain filesystem (every local/VM run), returns "/"
+unchanged; on overlayfs (or with `ATE_ROOTFS_COPY=1` forcing it locally),
+tars "/" once per node instance into `<ATE_DIR>/rootfs` (excluding
+`/proc /sys /dev /run /tmp`, `nodepath.BasePath`, and `ATE_DIR` itself —
+the last two to avoid copying ate-ish's own data, including the
+destination, into itself) and uses that copy as lowerdir from then on.
+`mountBundleRootfs` takes the resolved lowerdir as a parameter instead of
+a hardcoded "/"; the earlier `index=off,metacopy=off,redirect_dir=off`
+mount options (stage 5c, unproven) are gone — moot once lowerdir is never
+overlayfs again.
+
+Local: `ATE_ROOTFS_COPY=1`, copy took 120s / 8.9GB (this dev VM's own "/"
+is unusually large — docker/containerd state and the home directory
+alone are ~50GB, excluded as container-runtime/dev-workspace storage
+that is never part of a real actor's rootfs on any host, a harmless
+no-op exclude on gen2 where those paths do not exist); `gate.sh play`
+green (exit 0, full sequence, both egress checks), confirming
+`setupAppRootfs`'s `/etc/resolv.conf` rewrite still works (the overlay
+upper is still tmpfs, unchanged).
+
+gen2: `--add-volume=type=ephemeral-disk` is **not supported for Cloud Run
+Instances** ("spec.volumes: Ephemeral-disk volumes are not supported");
+switched to `type=in-memory,size-limit=2Gi` as the brief's own fallback
+anticipated. Copy took 42-49s / **578MB** (the real pi-durable image,
+unlike this dev VM, has none of that bloat) — comfortably inside the 2Gi
+volume. The overlay mount itself then succeeded on gen2 for the first
+time this project: no more "wrong fs type, bad option, bad superblock on
+overlay."
+
+**Part 2: a new, different, hard blocker one layer deeper.** Past the
+overlay fix, `runsc create` for the actor's sandbox failed:
+```
+cannot set up cgroup for root: configuring cgroup: mandatory cgroup controller "memory" is missing for "/sys/fs/cgroup/<uid>-_sandbox"
+```
+(seen as `"cpu"` missing on a later run too — see below). Added a
+diagnostic `GET /admin/workerlog` route (kept; same bearer-token gate as
+every other `/admin` route; answers "what did the worker actually log"
+when Cloud Run's own log capture drops lines, which recurred here) and
+read it directly: the vendored `cgroup.Delegate`'s own
+`"cgroup delegation ready"` line showed `"controllers":["hugetlb"]` —
+only one of the seven controllers runsc needs, with **zero** write
+failures logged for the other six, meaning they were never even in
+`cgroup.controllers`' available list to try, not refused.
+
+First suspected a startup race (one gen2 deploy showed all seven,
+"memory" missing; the very next, identical, deploy showed only one, with
+no code change in between) and added a bounded retry
+(`enableAvailableControllersWithRetry`, 20 attempts / 250ms apart / 5s
+total, re-reading `cgroup.controllers` until the full set it wants
+appears or the budget runs out) around ate-ish's own controller-enabling
+step. Redeployed: the retry ran its full 5 seconds (confirmed in the log,
+`attempt=0` through `attempt=19`) and **`have=[hugetlb]` the entire
+time** — not a race that more waiting resolves. This reads as a hard
+platform limit: Cloud Run gen2 exposes only the `hugetlb` cgroup
+controller to this container's own cgroup v2 root; `cpuset cpu io memory
+pids rdma` are simply not present in `cgroup.controllers` at any level
+this process can reach, root included (`nearestDomainAncestor` returns
+`/sys/fs/cgroup` itself here, since ate-ish is the container's PID 1 at
+the real `0::/`) — not a permissions or ordering problem our own code
+can work around, since there is no ancestor above the one we already
+tried, inside this sandbox, that could have them to delegate down.
+
+Also tried, then reverted before it could even be tested: enabling
+controllers on the leaf itself (not just its parent) before the worker's
+`CLONE_INTO_CGROUP` birth — reverted because it risks the same "no
+internal process" conflict this project's whole leaf design exists to
+avoid (a cgroup can't both be born into and have a non-empty
+`subtree_control` already). Documented in `atelet.go` rather than
+silently dropped, since it is the next thing to re-examine if this
+constraint turns out to be partial rather than absolute.
+
+**Not attempted this round, out of time:** the coordinator's named
+fallback (`--overlay2=root:memory` via the worker's own staged
+`internal_flags.json`, config not vendored source) addresses the
+filesystem-overlay-depth problem, which is already fixed; it would not
+by itself add the missing cgroup controllers, so it was not tried.
+
+**Gate result: still not green.** The rootfs-copy fix is fully validated
+(overlay mount succeeds on real gen2 for the first time); actor boot now
+fails one step later, at `runsc create`'s own cgroup setup, on a cgroup
+controller exposure limit this process has no ancestor cgroup available
+to fix from inside the container.
+
+Timings: gen2 rootfs copy 42-49s / 578MB (vs. 120s / 8.9GB locally, the
+difference being almost entirely this dev VM's own bloat, not the
+mechanism); no actor turn completed on gen2 this round, so no
+boot/checkpoint/restore/turn timing exists to compare against local yet.
+
+**Resources left running: none.** `ate-ish-v2` deleted (not green). No
+local stray processes. `ate-node` (v1) untouched throughout.
+
+Files changed: `bundle.go` (`rootIsOverlayfs`, `rootfsLowerDir`, `dirSize`,
+`mountBundleRootfs` takes `lowerDir`); `worker.go` (`rootfsLower` field,
+computed once in `newWorker`; new `GET /admin/workerlog` diagnostic
+route, kept); `atelet.go` (`enableAvailableControllersWithRetry` replacing
+the single-shot enable, `wantControllers`). `Dockerfile`/`deploy.sh` not
+updated this round: the brief asked for this once gen2's gate passes,
+which it does not yet. No commit made, per the brief.
+
+## v2 stage 5c (2026-10-30): cgroup topology fixed; a second, different gen2 blocker found at actor boot
+
+Brief (coordinator): fix stage 5b's cgroup-drain root cause in atelet.go
+(not vendored code), verify locally (single-node `gate.sh play`, then
+stage 4's two-node check), then the real stage 5 deploy and `gate.sh play`
+against `ate-ish-v2` on gen2.
+
+**Part 1 — identify the stray (one gen2 cycle).** A throwaway diagnostic
+(reverted after; never committed) moved ate-ish into a test leaf exactly
+as the old code did and dumped `/sys/fs/cgroup/<leaf>/cgroup.procs` plus
+each PID's `cmdline`/`Name`, and `/proc/self/cgroup` of both ate-ish and
+the bash wrapper. On gen2: ate-ish itself runs as the container's PID 1,
+and its own `/proc/self/cgroup` is `0::/` — the real root. The leaf's
+`cgroup.procs` held exactly one entry: PID 1, `/usr/local/bin/ate-ish
+serve`. This matches the brief's candidate #1 exactly (`moveSelfIntoLeafCgroup`
+puts ate-ish's own process in the leaf the worker inherits as its cgroup
+namespace root) and is consistent with stage 5b's strace (ate-ish's real
+PID moves out cleanly on the first pass; something else, reading back as
+PID "0", blocks the remaining 99).
+
+**Part 2 — the fix, in atelet.go only (no vendored file touched).**
+Replaced "move ate-ish's own PID into the worker's leaf" with: find
+ate-ish's own current cgroup (`/proc/self/cgroup`'s `0::` entry); walk up
+to the nearest ancestor whose `cgroup.type` is plain `domain` (a cgroup
+namespace can only root at a domain cgroup — this VM's own dev-harness
+cgroup turned out to be `domain threaded`, which makes every direct child
+`domain invalid`; clone3 refuses to use those outright, "operation not
+supported" — found by hitting it locally, not anticipated); create a
+leaf as a *child* of that ancestor, enabling available controllers in the
+ancestor's own `subtree_control` (best-effort, one at a time, matching
+the vendored `Delegate`'s own style); launch the worker with
+`SysProcAttr{Cloneflags: CLONE_NEWCGROUP|CLONE_NEWNS, UseCgroupFD: true,
+CgroupFD: <leaf dir fd>}` (clone3's `CLONE_INTO_CGROUP`, kernel 5.7+) so
+it is born directly into that leaf — nothing else, ever, is a member.
+`removeWorkerCgroupLeaf` runs on graceful shutdown (`worker.suspendAll`).
+Also found and fixed along the way: ate-ish's own *default* `/sys/fs/cgroup`
+view on gen2 has no `cgroup.controllers` file at all ("no such file or
+directory") until explicitly remounted — unlike every local/VM run, where
+the ambient mount is already fully functional. Fixed by running the same
+lazy-umount-then-remount dance stage 5 already uses for the worker's own
+script, once more, for ate-ish's own process, before reading any cgroup
+file.
+
+**Local verification, both green:**
+- Single node: fresh `ATE_CAPACITY=4` instance, `cgroup delegation ready`
+  logs all seven controllers (`cpuset cpu io memory hugetlb pids rdma`,
+  zero failures — contrast stage 5c's own first, buggy attempt, which
+  logged four `ENOTSUP` warnings from reading the wrong ancestor), then
+  `ATE_URL=http://127.0.0.1:8080 AS=ate-5c-single ./gate.sh`: exit 0, full
+  sequence including both egress-enforcement checks.
+- Two nodes (stage 4's shape: node A `ATE_CAPACITY=0` to force the
+  cross-node path, node B under `unshare --mount` with its own
+  `/var/lib/ate`): actor created and run via node B directly, suspended,
+  then a second turn submitted through node A's own ingress — resumed on
+  node B (`Ate-Worker: w-59731482`), history carried (9 messages across
+  two turns). Confirms stage 4's cross-node placement and the new cgroup
+  leaf scheme compose correctly (each node still gets its own leaf, under
+  its own ambient cgroup, independent of the other).
+- Graceful shutdown removed both leaves; confirmed by listing
+  `/sys/fs/cgroup/system.slice/claude-remote.service/` after both
+  processes stopped (empty of `ate-ish-worker-*` entries).
+
+**Part 3 — the real stage 5 deploy.** Rebuilt `Dockerfile` (unchanged
+from stage 5) and `demo/pi-durable/Dockerfile`'s image, deployed
+`ate-ish-v2` (`us-west1`, 2 vCPU/4GiB, `ATE_ROLE=all`, no
+`--sandbox-launcher`). The cgroup fix is confirmed working on real gen2:
+`ate-ish` (PID 1) now logs `cgroup delegation ready` immediately, the
+worker registers, and the Cloud Run startup probe succeeds on the first
+attempt (contrast every stage-5/5b attempt, which never got this far).
+`ate-ish create` and the first `/submit` reached the worker's `/resume`
+endpoint and got as far as booting the actor's sandbox — then hit a
+**second, different, gen2-only blocker**, found only once the cgroup fix
+let execution reach this far:
+```
+mounting bundle rootfs: mounting overlay rootfs at .../bundle/pi-durable/rootfs: exit status 32
+(mount: .../rootfs: wrong fs type, bad option, bad superblock on overlay, missing codepage or helper program, or other error.)
+```
+`bundle.go`'s `mountBundleRootfs` overlays the actor's rootfs with
+`lowerdir=/` — on every local/VM run so far, "/" is a plain ext4
+filesystem; on Cloud Run gen2, "/" is itself the container runtime's own
+overlayfs mount, and overlay-on-overlay nesting is a well-known source of
+kernel-version- and feature-dependent `mount(2)` refusals. Tried
+`index=off,metacopy=off,redirect_dir=off` (drops overlay feature
+negotiation that often trips on a non-uniform lower layer) — verified
+harmless locally (ext4 lowerdir, same successful mount, same actor turn
+completing end to end), then redeployed to gen2: **identical error**, so
+this was not the specific mismatch. Not further root-caused: ran out of
+this round's budget past the point of safely attempting another blind
+mount-option guess at the cost of another full image-build-deploy cycle
+each time, the same reasoning stage 5 used to stop rather than keep
+guessing. The `index=off,metacopy=off,redirect_dir=off` addition is kept
+in `bundle.go` (harmless, same successful mount locally) as a real step
+toward whatever the actual fix turns out to be, not reverted.
+
+**Gate result: cgroup fix confirmed (atelet/worker boot, registration,
+and the ingress-to-worker `/resume` request path all succeed on real
+gen2 for the first time this project). `./gate.sh play` against
+`ate-ish-v2`'s URL still fails, now at actor boot's overlay mount, not at
+worker startup. Local gates (single-node, two-node) both green.**
+
+Timings: gen2 image import ~4-5s (base) warm, instance start ~10s,
+first log line ~15-20s after create; the full failing `gate.sh` run to
+its first FAILED step: 6.2-6.5s (just the four admin calls plus the one
+`/submit` that reaches the overlay-mount failure). No successful turn
+timing to compare against local yet, since no turn completed.
+
+**Resources left running: none.** `ate-ish-v2` deleted (gate.sh did not
+pass, so there is no working deployment to leave up — redeploying for a
+next attempt is one more build-push-create cycle, not a teardown-and-setup
+from scratch, given the images are already in Artifact Registry).
+`ate-node` (v1) untouched throughout. No local stray processes.
+
+Files changed: `atelet.go` (`cgroupLeafFor` two-arg, `currentCgroupPath`,
+`nearestDomainAncestor`, `prepareWorkerCgroupLeaf`/`cleanupStaleLeaf`/
+`removeWorkerCgroupLeaf`, the ate-ish-side remount-before-reading-cgroup-files
+fix, `UseCgroupFD`/`CgroupFD` on the worker's `SysProcAttr`); `worker.go`
+(threads the returned leaf path into the `worker` struct, removes it on
+shutdown); `bundle.go` (overlay mount options, kept though unproven on
+gen2 yet); `Dockerfile`/`.dockerignore` unchanged from stage 5.
+`demo/probe-template.yaml` still present from stage 5, untouched. No
+commit made, per the brief.
+
+## v2 stage 5b (2026-10-30): root cause found — cgroup delegation never drains on gen2
+
+Brief (coordinator): one diagnostic round on stage 5's silent `exit 1,
+zero bytes` finding, cheapest first — local repro under
+`capsh --drop=cap_mknod`, then under gen2's exact `CapEff`, then (if
+neither reproduces) an `strace`-wrapped, file-redirected (not Go pipes)
+launch on one real gen2 cycle. Timebox 90 minutes, no vendored-file edits.
+
+**Root cause found, with the exact log line and strace evidence:**
+`cgroup.Delegate` (vendored, `internal/ateworker/cgroup`) tries to drain
+`/sys/fs/cgroup`'s own `cgroup.procs` into a child `worker` cgroup by
+repeatedly writing `"0"` (move self) to
+`/sys/fs/cgroup/worker/cgroup.procs`, polling up to 100 times for the
+parent to empty out. On gen2, every single write succeeds (`write(3, "0",
+1) = 1`, confirmed over 100 consecutive attempts in the strace capture —
+not one `EPERM`/`EACCES`/`ENOENT`) but the parent never drains, so it
+gives up and logs, verbatim:
+```
+{"level":"ERROR","msg":"Error while executing","err":"while setting up cgroup delegation: while moving worker processes into \"/sys/fs/cgroup/worker\": \"/sys/fs/cgroup/cgroup.procs\" did not drain after 100 iterations"}
+```
+exits 1 about 3.5s after its first log line. This rules out every
+syscall-denial theory stage 5 flagged as the headline risk (seccomp
+filter, missing capability): nothing is refused at the syscall level:
+the writes succeed, the binary just never sees the drain condition it
+polls for, which reads as a cgroup *topology* difference — gen2 most
+likely keeps another process (its own supervisor/sidecar) pinned in the
+same cgroup node this code assumes it fully owns, so the parent's
+`cgroup.procs` can never go empty no matter how many times this process
+moves itself.
+
+**Why stage 5 saw zero bytes instead of this message:** reproduced
+locally once the real cause was suspected to be a capture problem, not a
+worker problem — redirecting the worker's stdout/stderr to files
+*inside the launch script itself* (`> /tmp/worker.out 2> /tmp/worker.err`,
+bypassing Go's `cmd.Stdout`/`cmd.Stderr` pipe plumbing entirely) made the
+exact same gen2 instance print this message every time, where stage 5's
+Go-side `io.MultiWriter(logFile, os.Stdout)` tee reliably produced
+nothing for this same failure. Not fully root-caused *why* the pipe path
+drops it (most likely: the process's writes to the pipe's write end race
+its own `exit_group(1)` closely enough, combined with gen2's own log
+sidecar reading container stdout, that the dying process's last writes
+never reach `gcloud logging read`'s backing store before the container
+is torn down) — but the fix (redirect to files, not pipes, when
+debugging a process that might die fast) is now confirmed, not guessed.
+
+**Step 1, local reproduction attempts (both negative, both informative):**
+- `capsh --drop=cap_mknod --` wrapping the real `atelet.go` launch
+  (patched in locally, reverted after, never committed): worker started
+  and registered normally (`"worker up" ... capacity=1`). MKNOD alone
+  does not reproduce the failure.
+- The *exact* gen2 `CapEff` mask `0x1fff7fcffff` decoded (missing three
+  capabilities, not the one the original brief named: `cap_mknod`,
+  `cap_sys_module`, `cap_sys_rawio`) and dropped together via
+  `capsh --drop=cap_mknod,cap_sys_module,cap_sys_rawio --`: worker again
+  started and registered normally. The full gen2 capability set, exactly
+  matched, does not reproduce the failure either — consistent with the
+  strace finding that no syscall was ever refused.
+- Hybrid cgroup v1+v2 layout: not attempted with confidence. This VM's
+  own host cgroup setup is pure v2 (`cat /proc/self/cgroup` →
+  `0::/system.slice/...`; `/proc/mounts` shows one `cgroup2` mount, no v1
+  controllers at all), so synthesizing an accurate hybrid layout to test
+  against would have been a guess at gen2's real internals, not a
+  measurement — skipped once the `--caps=` match above still passed,
+  and skipped entirely once the file-redirect fix (below) found the real
+  cause with higher confidence than a low-fidelity local hybrid-cgroup
+  mockup would have given.
+
+**Step 2 (confirm capture) and 3 (one gen2 cycle):** built a throwaway,
+never-committed diagnostic (`strace_probe.go` + a `main.go` hook behind
+`ATE_STRACE_PROBE=1`, both reverted after; `strace` added to the
+Dockerfile's apt list, also reverted after): starts an HTTP server
+immediately (so gen2's own startup probe passes regardless of whether the
+worker launch succeeds), runs `ateworker-gvisor --version` first, then
+the real launch under
+`strace -f -tt -e trace=process,execve,openat,mount,unshare,setns,prctl,capset,write`
+with stdout/stderr redirected to files by the script itself, and serves
+all four files back over `/debug/version.out|worker.out|worker.err|worker.strace`.
+Verified working locally first (`--version` RC=0; the full launch
+registered normally, confirming the harness itself has no bug), then one
+`gcloud beta run instances create ate-ish-v2-probe` cycle (`us-west1`, 2
+vCPU/4GiB, `ATE_STRACE_PROBE=1`, no other env needed): `--version` RC=0
+on gen2 too (rules out "the Go runtime or pflag can't even run here");
+the real launch's `worker.out`/`worker.err` carried the message quoted
+above; the last strace lines before exit (`/tmp/gen2-strace.txt`,
+not committed) are the ~30 repeated
+`openat(.../worker/cgroup.procs, O_WRONLY|O_CREAT|O_TRUNC|O_CLOEXEC) = 3`
+/ `write(3, "0", 1) = 1` pairs immediately preceding the error log line
+and `exit_group(1)`.
+
+**Timings:** `--version` + full strace-wrapped launch together took
+~3.6s wall on the gen2 instance from first log line to `exit_group`;
+image build-to-first-log-line for this round's single gen2 cycle was
+about 35-40s (import) + 15s (first log line), one cycle total, well
+inside the 90-minute budget (local repro + harness build/verify + this
+one cycle: approximately 55 minutes).
+
+**Resources left running: none.** `ate-ish-v2-probe` deleted again; its
+`:strace-probe` image tag deleted from Artifact Registry. All local
+diagnostic processes, `/tmp` scratch files, and the two
+repro-specific cgroup leaves (`ate-ish-worker-ate-ish-repro{,2}`) cleaned
+up. `ate-node` (v1) untouched throughout.
+
+**Files changed, net of this round:** `docs/PROGRESS.md` only. Every
+diagnostic edit used to find the root cause (`main.go`'s `ATE_STRACE_PROBE`
+hook, the new `strace_probe.go`, the `atelet.go` `capsh` wrapping used for
+the two local repro attempts, the Dockerfile's temporary `strace` package)
+was reverted once its answer was in hand — none of it has lasting value
+the way stage 5's `umount -l` fallback and `cmd.Wait()` logging did, so it
+was removed rather than left as inert diagnostic cruft. `atelet.go` keeps
+only stage 5's two permanent changes (lazy-unmount fallback, exit-status
+logging), unchanged by this round. No commit made, per the brief. The
+actual fix for the drain-timeout (the next round's work, not this one)
+still needs to either patch the vendored `cgroup.Delegate` call site (a
+documented `VENDOR.md` patch) or find an atelet-side workaround that
+avoids relying on that drain check at all — not attempted here, out of
+scope for a diagnostic-only round.
+
+## v2 stage 5 (2026-10-30): Cloud Run gen2 probe — stopped on a fundamental finding
+
+Brief (docs/V2.md stage 5, coordinator's follow-up): one gen2 Cloud Run
+instance, role all, same binary. "Measure before you build": probe first
+with a throwaway instance before committing to the full pi-durable image.
+Timebox three hours; stop and record verbatim if something fundamental
+(runsc under the seccomp filter, nftables in the gateway netns) fails.
+
+**Result: stopped at the probe, on a fundamental finding, per the brief's
+own explicit permission to do so. No real deploy attempted (`ate-ish-v2`
+was never created). `ate-node` (v1) and its bucket untouched.**
+
+What was built for the probe: the root `Dockerfile` (previously v1-only:
+just the `ate-ish` binary) now also builds the vendored `ateworker-gvisor`
+from source and stages `bin/runsc` and its `kodata`, plus
+`nftables`/`iproute2`/`util-linux`/`python3` in the final Debian image —
+the same layout the real deploy needs, reused as the probe image directly
+(no separate probe binary written; ate-ish's own HTTP admin/ingress API
+already "reports over HTTP", so driving the deployed probe instance with
+`curl`/`ate-ish create ...` exactly like `gate.sh` does was the fastest
+way to exercise runsc+cgroup+netns+checkpoint end to end). Deployed as a
+throwaway `gcloud beta run instances create ate-ish-v2-probe` (`us-west1`,
+2 vCPU/4GiB, `ATE_ROLE=all`, no `--sandbox-launcher`, the v2 bucket,
+no secrets needed for this probe). The compute service account was
+granted `roles/storage.objectAdmin` on `gs://ate-ish-v2-daniel-junk`
+(missing going in; `ai-gateway-token`'s `secretAccessor` binding already
+existed from v1).
+
+**Finding, in order, each confirmed from `gcloud logging read` on the
+live instance, verbatim:**
+
+1. First failure (original, unmodified atelet.go script): the instance
+   never got past 30s, repeatedly:
+   ```
+   ate-ish: waiting for ateworker-gvisor's socket: socket "/var/lib/ate/workers/ate-ish-<uid>/worker.sock" did not appear within 30s
+   Container called exit(1).
+   Default STARTUP TCP probe failed 1 time consecutively for container "worker" on port 8080. The instance was not started.
+   ```
+   `cmd.Start()` for the `bash -c "mount --make-rprivate / && umount /sys/fs/cgroup && mount -t cgroup2 ... && exec ateworker-gvisor ..."` script was succeeding (no error returned to Go), but nothing further ever happened — ateworker-gvisor's own log file (previously the only place its output went, per stage 0-4) stayed empty. Diagnosed by teeing `ateworker-gvisor`'s stdout/stderr to this process's own stdout/stderr too (Cloud Run only captures the container's own fds, not an arbitrary file on disk) and by logging `cmd.Wait()`'s result (`atelet.go`), since a silently-killed process is otherwise indistinguishable from a slow one.
+2. With the tee in place: the real error surfaced immediately —
+   ```
+   umount: /sys/fs/cgroup: target is busy.
+   ATELET_STEP=wait-returned err=exit status 1 state=exit status 1
+   ```
+   Every prior environment (this VM, locally, across stages 0-4) had
+   `/sys/fs/cgroup` freely unmountable inside the private mount namespace
+   `mount --make-rprivate /` set up; gen2's own container runtime holds a
+   live reference to it (an additional bind mount or an open fd from the
+   platform's own process supervision), so a plain `umount` is refused
+   with `EBUSY`. This is a genuine environment difference, not a seccomp
+   or capability denial.
+3. Fixed with `umount -l` (lazy unmount: detach now, the mount goes away
+   once nothing still references it) as a fallback when the plain
+   `umount` fails — confirmed by the next run reaching every subsequent
+   step: `rprivate-done rc=0`, `umount-busy-retrying-lazy`,
+   `umount-done rc=0`, `cgroup2-done rc=0`, `exec-start`. This part of the
+   atelet.go script is kept (see "Files changed" below) since the lazy
+   fallback is strictly safer than the old unconditional `umount` even on
+   a VM, not a Cloud-Run-only patch.
+4. **The fundamental finding**, past the cgroup2 remount: `ateworker-gvisor`
+   itself, execed with the exact argv that works on this VM (stages 0-4),
+   exits with status 1 and produces **zero** bytes of output on either
+   stdout or stderr — not even its own first startup log line
+   (`"initializing preview gates"`, confirmed present as the literal first
+   line of every successful local run's log file, e.g.
+   `/var/lib/ate-ish-a/ateworker-gvisor.log` from this same session's
+   stage 4 testing). Isolated by replacing the script's final `exec
+   ateworker-gvisor ...` with a plain (non-exec) invocation followed by an
+   explicit `echo rc=$?`, to rule out the exit code being bash's own (a
+   bad `exec` target reports differently and prints its own message).
+   Verbatim:
+   ```
+   ATELET_STEP=exec-start
+   ATELET_STEP=binary-exited rc=1
+   ATELET_STEP=wait-returned err=<nil> state=exit status 0
+   ```
+   (`state=exit status 0` there is the *bash* process's own exit, which
+   is 0 because the script's last command, the `echo`, succeeded — `rc=1`
+   is `ateworker-gvisor`'s own exit code, captured by `$?` in the line
+   right after it ran.) A clean, intentional `exit(1)` is not what a
+   seccomp `SECCOMP_RET_KILL`/`RET_TRAP` produces (those terminate by
+   signal — Go's `exec.ExitError` would read `signal: bad system call`,
+   and bash would report exit code 128+31, not a bare 1) — so this reads
+   as the binary choosing to exit, before it reaches its own first log
+   line, for a reason not yet identified: not the cgroup2 remount (fixed,
+   confirmed reached), not a missing argument (identical argv to the
+   working local runs), and not a signal-based kill (rules out the
+   obvious seccomp-filter-blocks-a-syscall story the brief flagged as the
+   headline risk). Candidates not yet distinguished, given the probe
+   budget ran out: an early self-reexec/unshare step inside
+   `ateworker-gvisor`'s own `main()` (common for binaries that enter a new
+   namespace before their own logger is set up) landing in a child process
+   whose stderr does not inherit the same fd, or a sandboxed syscall gen2
+   permits for `clone()`/`mount()` (used above, successfully) but denies
+   for something `ateworker-gvisor` tries immediately after — e.g.
+   `prctl(PR_SET_NO_NEW_PRIVS)` or a capability probe for `CAP_MKNOD`
+   (confirmed missing from gen2's `CapEff` per the coordinator's brief)
+   that the vendored binary's own startup path checks eagerly rather than
+   deferring to the point it is actually needed.
+
+**Why this stops the stage rather than getting one more fix**: the brief
+budgeted "under an hour" for the probe and three hours total; reaching
+this point (cgroup2 remount working, the binary itself failing opaquely)
+took the whole probe budget across five build/push/deploy/log-read
+cycles (~35-45s container-import plus ~20-40s to first log line, each
+round). Guessing at the real cause blind (no strace available in the
+image, no shell access to the running gen2 instance, and each hypothesis
+costs one more full image-build-and-deploy cycle to test) is exactly what
+the brief's stop condition exists to prevent. Per the brief: "stop after
+recording it with the exact errors and the probe's full output; that
+result is a finding, not a failure of the stage."
+
+**Not attempted, per the above:** the real pi-durable image build,
+`ate-ish-v2` deploy, `./gate.sh play` against a Cloud Run URL, and
+`deploy.sh`'s update to v2 image/flags — all gated on the probe passing,
+which it did not.
+
+**Resources left running: none.** `ate-ish-v2-probe` instance deleted;
+its image tag (`us-central1-docker.pkg.dev/daniel-junk/ate-ish/ate-ish:v2`)
+deleted from Artifact Registry. `ate-node` (v1) and its bucket were never
+touched. The IAM binding granted to the compute service account
+(`roles/storage.objectAdmin` on `gs://ate-ish-v2-daniel-junk`) was left in
+place (needed for any future attempt at this stage; harmless, no
+resources behind it incur cost).
+
+Timings: image build ~2.5 min (first, cold Go module cache) down to
+~15-20s (cached layers) per iteration; `gcloud beta run instances create`
+~45-70s to "successfully created"; first log line after that, 15-20s.
+Total wall time for the probe loop (five iterations, each a full
+build+push+delete+create+log-read cycle): approximately 50 minutes.
+
+Files changed: `Dockerfile` (builds and stages `ateworker-gvisor`/
+`bin/runsc`/`kodata`; adds `nftables`/`iproute2`/`util-linux`/`python3`
+to the final image — needed for the real deploy regardless of this
+stage's outcome, so kept); `.dockerignore` (`bin/runsc` no longer
+excluded, only the two binaries that get rebuilt fresh); `atelet.go`
+(the `umount -l` fallback, kept; the `cmd.Wait()` exit-status logging to
+both the log file and this process's own stdout/stderr, kept — both are
+genuinely useful beyond this one debugging session: the lazy-unmount
+fallback is strictly safer everywhere, and silent-subprocess-death
+visibility has no cost and would have caught this immediately on a
+future, different silent failure); `demo/probe-template.yaml` (new; the
+minimal `python3 -m http.server 80` actor template used to drive the
+probe instance — left in the tree, costs nothing, useful for any retry).
+No commit made, per the brief.
+
 ## v2 stage 4 (2026-10-30): two nodes, one bucket
 
 Brief (docs/V2.md stage 4): two ate-ish processes on this VM, different

@@ -15,12 +15,24 @@
 package ocispec
 
 import (
+	"os"
 	"path/filepath"
 
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/taeold/ate-ish/third_party/substrate/exported/proto/ateworkerpb"
 	"github.com/taeold/ate-ish/third_party/substrate/internal/sizing"
 )
+
+// noCgroupsPath is ate-ish's own patch (see VENDOR.md "Patch 1"): on a
+// host whose cgroup v2 root exposes no memory/cpu controller to this
+// container at all (Cloud Run gen2 is a hybrid cgroup host that binds
+// those controllers to v1 hierarchies this process cannot reach), runsc's
+// own subcontainer cgroup setup fails outright even with --ignore-cgroups
+// set, because it unconditionally tries to configure whatever
+// spec.Linux.CgroupsPath names below. Read once at package init, not on
+// every call, since it only ever reflects this process's own host, fixed
+// for its whole lifetime.
+var noCgroupsPath = os.Getenv("ATE_ISH_NO_CGROUP_PATH") == "1"
 
 // SandboxID is the runsc ID of the sandbox. runsc creates it with
 // -no-root-container, so it has no process and no rootfs. The underscore
@@ -68,7 +80,7 @@ func ShapeGVisor(spec *specs.Spec, o GVisorOptions) {
 		spec.Linux = &specs.Linux{}
 	}
 	// Set a colon-free default cgroupsPath relative to the pod scope.
-	if spec.Linux.CgroupsPath == "" {
+	if spec.Linux.CgroupsPath == "" && !noCgroupsPath {
 		spec.Linux.CgroupsPath = "/" + GVisorCgroupLeaf(o.ActorUID, o.ContainerName)
 	}
 	o.Size.ApplyToOCISpec(spec)

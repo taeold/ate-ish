@@ -7,8 +7,18 @@
 #   ./deploy.sh url play|scale
 #   ./deploy.sh down play|scale
 #
-# SECRET is the Secret Manager secret that holds the model key, if the actor
-# needs one. SECRET_URI is the credentialUri in the egress policy that maps to it.
+# SECRET is the Secret Manager secret an egress policy's credentialUri names
+# (e.g. ate-secret://secretmanager.googleapis.com/$PROJECT/$SECRET); the
+# worker's own egress gateway reads it directly from the Secret Manager API
+# at request time (ADC, not an injected env var), so this only grants IAM,
+# it does not plumb the secret's value through any flag.
+#
+# play's instance is gen2 (v2 stage 5): no --sandbox-launcher (ate-ish brings
+# its own gVisor worker, not the platform's). Cloud Run gen2's own "/" is
+# itself overlayfs and exposes no memory/cpu cgroup controller to the
+# container (stage 5d/5e/5f); ate-ish copies the node filesystem once per
+# instance onto the --add-volume below and runs actors without per-actor
+# cpu/memory/pids limits there automatically (see README's limits section).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -16,15 +26,19 @@ PROJECT=${PROJECT:-$(gcloud config get project)}
 REGION=${REGION:-us-west1}
 REPO=${REPO:-us-central1-docker.pkg.dev/daniel-junk/ate-ish}
 IMAGE=${IMAGE:-$REPO/pi-durable:latest}
-INSTANCE=${INSTANCE:-ate-node}
+INSTANCE=${INSTANCE:-ate-ish-v2}
 # Each deployment has its own bucket, so none places actors on another's workers.
 BUCKET=${BUCKET:-$INSTANCE-$PROJECT}
 [[ ${1:-} == scale || ${2:-} == scale ]] && BUCKET=${SCALE_BUCKET:-ate-node-scale-$PROJECT}
 WORKERS=${WORKERS:-2}
 CAPACITY=${CAPACITY:-4}
-SECRET=${2:-}
-SECRET_URI=${SECRET_URI:-ate-secret://k8s.io/default/ate-demo-pi/llm-credentials/gemini-api-key}
-ENV="ATE_BUCKET=$BUCKET,ATE_CAPACITY=$CAPACITY,ATE_SECRET_MAP=$SECRET_URI=$PROJECT/$SECRET"
+SECRET=${2:-ai-gateway-token}
+# ephemeral-disk volumes are not supported for Cloud Run Instances (measured,
+# stage 5d); in-memory is the documented fallback. 2Gi comfortably fits the
+# pi-durable image's own copied rootfs (measured 578-588MB across several
+# gen2 runs).
+ROOTFS_VOLUME_SIZE=${ROOTFS_VOLUME_SIZE:-2Gi}
+ENV="ATE_BUCKET=$BUCKET,ATE_CAPACITY=$CAPACITY"
 GC=(--project "$PROJECT" --region "$REGION" --quiet)
 
 sa() {
@@ -47,7 +61,9 @@ play)
     gcloud beta run instances update "$INSTANCE" "${GC[@]}" --image "$IMAGE" --update-env-vars "ATE_ROLE=all,$ENV"
   else
     gcloud beta run instances create "$INSTANCE" "${GC[@]}" --image "$IMAGE" --service-account "$(sa)" \
-      --sandbox-launcher --cpu 2 --memory 4Gi --port 8080 --set-env-vars "ATE_ROLE=all,$ENV"
+      --cpu 2 --memory 4Gi --port 8080 \
+      --add-volume=name=rootfs,type=in-memory,size-limit="$ROOTFS_VOLUME_SIZE",mount-path=/var/lib/ate-ish/rootfs \
+      --set-env-vars "ATE_ROLE=all,$ENV"
   fi
   echo "export ATE_URL=$("$0" url play) PATH=$PWD/bin:\$PATH"
   ;;

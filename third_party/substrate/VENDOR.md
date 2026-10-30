@@ -43,10 +43,80 @@ runs (`internal/testenv`, `api/credprovider/v1`, `api/objectstore/v1`,
 `internal/proto/grpcechopb`, `internal/proto/objectstoreexchangepb`,
 `pkg/proto/ateconfigpb`), none of which this codebase otherwise needs.
 
-No vendored file needed a source edit to compile. `go.mod`/`go.sum` gained
-whatever these packages import transitively, via `go mod tidy` (same
-versions upstream's own `go.mod` resolves to, since the module proxy serves
-one answer for the same packages at the same commit's dependency graph).
+`go.mod`/`go.sum` gained whatever these packages import transitively, via
+`go mod tidy` (same versions upstream's own `go.mod` resolves to, since
+the module proxy serves one answer for the same packages at the same
+commit's dependency graph).
+
+## Patch 1 (stage 5f, 2026-10-30): `exported/ocispec/gvisor.go`
+
+**File:** `exported/ocispec/gvisor.go`
+
+**Diff** (the only change to any vendored file in this tree):
+
+```diff
+ import (
++	"os"
+ 	"path/filepath"
+ 
+ 	"github.com/opencontainers/runtime-spec/specs-go"
+ 	"github.com/taeold/ate-ish/third_party/substrate/exported/proto/ateworkerpb"
+ 	"github.com/taeold/ate-ish/third_party/substrate/internal/sizing"
+ )
+ 
++// noCgroupsPath is ate-ish's own patch: on a host whose cgroup v2 root
++// exposes no memory/cpu controller to this container at all, runsc's own
++// subcontainer cgroup setup fails even with --ignore-cgroups set, because
++// it unconditionally tries to configure whatever spec.Linux.CgroupsPath
++// names below. Read once at package init.
++var noCgroupsPath = os.Getenv("ATE_ISH_NO_CGROUP_PATH") == "1"
++
+ ... (ShapeGVisor, unchanged above this line) ...
+ 	// Set a colon-free default cgroupsPath relative to the pod scope.
+-	if spec.Linux.CgroupsPath == "" {
++	if spec.Linux.CgroupsPath == "" && !noCgroupsPath {
+ 		spec.Linux.CgroupsPath = "/" + GVisorCgroupLeaf(o.ActorUID, o.ContainerName)
+ 	}
+```
+
+**Reason:** hosts whose cgroup v2 root exposes no memory/cpu controller to
+the container at all — Cloud Run gen2 is the one found so far: it is a
+hybrid cgroup host that binds memory and cpu to v1 hierarchies this
+process cannot reach from inside the container, so the v2 mount it does
+control can only offer `hugetlb` (stage 5d/5e's own measurement, not a
+guess: a 5-second, 20-attempt retry confirmed this is not transient).
+`ateworker-gvisor`'s own `--ignore-cgroups` global flag (staged into
+`kodata/internal_flags.json`, not this file — stage 5e) suppresses the
+*sandbox*'s own cgroup setup, but a `runsc create` for an actor's
+*application subcontainer* still unconditionally tries to configure the
+cgroup at `spec.Linux.CgroupsPath` (measured: `--ignore-cgroups` present
+verbatim in that exact invocation's own argv, confirmed by reading the
+worker's own log, and the failure happening anyway — `"configuring
+subcontainer cgroup: mandatory cgroup controller \"memory\" is
+missing"`). `exported/ocispec/gvisor.go`'s `ShapeGVisor` is the only call
+site that ever writes `spec.Linux.CgroupsPath` (confirmed by reading
+every vendored `ocispec` file: `ocispec.Build` never sets it, so it is
+always empty going into `ShapeGVisor`), and nothing in `ateworkerpb`'s
+`WorkloadSpec`/`ContainerSpec` — the wire-level API ate-ish's own,
+non-vendored code controls — has a field that reaches this assignment.
+That ruled out a non-vendored fix (ate-ish's stage 5f own first attempt,
+per the brief's ordering): ate-ish never writes the container's
+`config.json` itself (the worker generates it internally, inside
+`ateworker-gvisor`, at `RunWorkload` time), so there is no file of ours
+to strip the field from either.
+
+**Upstream proposal:** an explicit opt-out on `WorkloadSpec` (or a
+worker-wide flag, matching `--ignore-cgroups`'s own scope) to run actor
+subcontainers without a per-container cgroup when the host's cgroup v2
+root does not expose the controllers a sandbox's resource limits need —
+degrading per-actor cpu/memory/pids accounting and limits to "none" on
+such hosts, the same way `--ignore-cgroups` already documents doing for
+the sandbox cgroup itself, rather than refusing to start the container at
+all.
+
+**Drift check:** compares every vendored file against the pinned upstream
+commit except this one; `exported/ocispec/gvisor.go` is diffed against
+the block above instead.
 
 ## Packages copied (non-test unless noted), line counts of their own `*.go` files
 
