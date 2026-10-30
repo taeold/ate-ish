@@ -55,7 +55,7 @@ func (f *fakeAtelet) MintActorCertificate(ctx context.Context, req *ateletpb.Min
 	if err != nil {
 		return nil, fmt.Errorf("parsing actor CSR: %w", err)
 	}
-	der, err := f.pki.issueActorCertificate(csr)
+	der, err := f.pki.issueActorCertificate(csr, req.GetActorAtespace(), req.GetActorName())
 	if err != nil {
 		return nil, fmt.Errorf("issuing actor certificate: %w", err)
 	}

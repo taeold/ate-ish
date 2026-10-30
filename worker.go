@@ -21,7 +21,6 @@ import (
 	"time"
 
 	"github.com/taeold/ate-ish/internal/devatelet"
-	"github.com/taeold/ate-ish/internal/devgateway"
 	"github.com/taeold/ate-ish/third_party/substrate/exported/installdefaults"
 	"github.com/taeold/ate-ish/third_party/substrate/exported/nodepath"
 	"github.com/taeold/ate-ish/third_party/substrate/exported/proto/ateworkerpb"
@@ -50,7 +49,7 @@ const (
 // worker is ate-ish acting as both atelet and worker-pool node: it runs the
 // vendored ateworker-gvisor as a subprocess, serves it the one atelet RPC
 // surface it needs (internal/devatelet), fronts its own egress gateway
-// (internal/devgateway), and drives actor lifecycle over ateworkerpb.
+// (egress.go), and drives actor lifecycle over ateworkerpb.
 type worker struct {
 	id     string
 	addr   string
@@ -59,7 +58,7 @@ type worker struct {
 
 	pki        *devatelet.PKI
 	ateletSrv  *grpc.Server
-	gateway    *devgateway.Gateway
+	gateway    *egressGateway
 	workerPID  int
 	workerConn *grpc.ClientConn
 	client     ateworkerpb.WorkerClient
@@ -113,7 +112,7 @@ func newWorker(ctx context.Context, b *bucket, addr string, capacity int, dir st
 	if err != nil {
 		return nil, fmt.Errorf("loading the gateway's own credential: %w", err)
 	}
-	gateway, err := devgateway.Start("127.0.0.1:0", gwCert)
+	gateway, err := startEgressGateway("127.0.0.1:0", gwCert, pki.NodeCAPEM(), b)
 	if err != nil {
 		return nil, fmt.Errorf("starting the egress gateway: %w", err)
 	}
@@ -326,7 +325,7 @@ func (w *worker) boot(ctx context.Context, h *hosted, rec Actor) error {
 	if err := prepareActorDirs(dirs, durableNames, systemInfoNames); err != nil {
 		return err
 	}
-	if err := writeSystemInfoFiles(dirs, tmpl, w.pki.GatewayCAPEM()); err != nil {
+	if err := writeSystemInfoFiles(dirs, tmpl, w.gateway.ca.pem); err != nil {
 		return err
 	}
 	if err := stageRunsc(runscReleaseDir, dirs); err != nil {

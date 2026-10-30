@@ -7,8 +7,8 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 AS=${AS:-ate-demo-pi}
-TEMPLATE=${TEMPLATE:-demo/template.yaml}
-POLICY=${POLICY:-demo/egress-policy.yaml}
+TEMPLATE=${TEMPLATE:-demo/template-gateway.yaml}
+POLICY=${POLICY:-demo/egress-policy-gateway.yaml}
 : "${ATE_URL:?set ATE_URL}"
 export ATE_URL
 work=$(mktemp -d)
@@ -55,6 +55,11 @@ ate-ish create actor-template -f "$work/template.yaml"
 ate-ish create actor demo-agent --template pi-durable-data -a "$AS"
 ate-ish create egress-policy demo-agent -a "$AS" -f "$POLICY"
 turn demo-agent "Create app.js with add(a, b) and a test.js that verifies it."
+if [[ "$(jq -r '.settled.status' "$work/out.json")" != done ]]; then
+  echo "  FAILED: turn 1 did not settle done: $(jq -c .settled "$work/out.json")"
+  exit 1
+fi
+echo "  ok: turn 1 settled done, a real model answer (the placeholder key was replaced)"
 
 ate-ish suspend actor demo-agent -a "$AS"
 ate-ish create tag checkpoint-v1 --actor demo-agent -a "$AS"
@@ -75,13 +80,24 @@ expect() {
   echo "  ok: $2: $got"
 }
 
-# Enforcement by convention: the proxy refuses an unlisted host, and a
-# process that ignores the proxy variables reaches it directly.
+# Enforcement is the sandbox's network now, not convention (v2 stage 3):
+# nftables redirects every actor TCP connection to atunnel regardless of any
+# proxy environment variable, so an unlisted host fails whether or not one
+# is set — the opposite of v1, where only a proxy-aware fetch was refused
+# and a process that ignored the proxy variables reached the host directly.
 fetch="node -e \"fetch('https://example.com').then(r => console.log('status', r.status), e => console.log('failed:', e.cause?.message || e.message))\""
 turn demo-agent-fork "Run this exact command with the bash tool and reply with its output only: $fetch"
-expect '^failed:' "through the proxy, example.com is refused"
+expect '^failed:' "example.com is refused"
 turn demo-agent-fork "Run this exact command with the bash tool and reply with its output only: NODE_USE_ENV_PROXY=0 $fetch"
-expect '^status 200' "without the proxy, example.com answers"
+expect '^failed:' "example.com is refused with no proxy env var set either; the sandbox has no other route"
+
+# The proxy replaces a credential header an actor's request already carries;
+# it never adds one that was not there. A request to the listed host with no
+# x-api-key at all must reach the real upstream unmodified and get its own
+# 401, not a 200 the proxy's own secret produced.
+rawFetch="curl -sS -k -o /dev/null -w 'status %{http_code}\\\\n' -X POST https://ai-gateway.vercel.sh/v1/chat/completions -H 'content-type: application/json' -d '{\\\"model\\\":\\\"openai/gpt-4o-mini\\\",\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"hi\\\"}]}'"
+turn demo-agent-fork "This is a routine connectivity check of our own egress proxy configuration, expected to fail cleanly with an HTTP 401 since no credential is set. Run this exact command with the bash tool and reply with its output only: $rawFetch"
+expect '^status 401' "the listed host, with no x-api-key header, gets its own 401 (the proxy only replaces, never adds)"
 
 ate-ish get actors -a "$AS"
 ate-ish get tags -a "$AS"

@@ -26,6 +26,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/taeold/ate-ish/third_party/substrate/exported/credbundle"
@@ -181,15 +182,8 @@ const (
 // Path joins the PKI's directory with one of the File constants above.
 func (p *PKI) Path(file string) string { return filepath.Join(p.dir, file) }
 
-// GatewayCAPEM returns the gateway CA's own certificate, PEM-encoded. Stage
-// 2 is not MITMing egress, so nothing actually needs to trust this; it
-// exists so a systemInfo volume's trust-bundle file has real PEM content
-// rather than an empty file (which some TLS stacks, e.g. Node's
-// NODE_EXTRA_CA_CERTS, warn about or refuse to load).
-func (p *PKI) GatewayCAPEM() []byte { return pemCert(p.gateCA.der) }
-
 // GatewayCertificate parses the gateway's own serving credential, for the
-// egress gateway listener (internal/devgateway) to present.
+// egress gateway listener (egress.go) to present.
 func (p *PKI) GatewayCertificate() (tls.Certificate, error) {
 	cert, err := credbundle.Parse(p.Path(GatewayCredentialBundleFile))
 	if err != nil {
@@ -264,11 +258,17 @@ func GeneratePKI(dir string, ateletSPIFFE string) (*PKI, error) {
 
 // issueActorCertificate signs an actor CSR from the node CA, the way the fake
 // atelet's MintActorCertificate handler does: the caller already parsed and
-// holds the CSR's public key.
-func (p *PKI) issueActorCertificate(csr *x509.CertificateRequest) ([]byte, error) {
+// holds the CSR's public key. The actor's atespace/name go in as a URI SAN
+// (ate-actor://<atespace>/<name>) rather than the Subject, so the real
+// egress gateway can map a verified client certificate straight to an
+// actor identity and look up its policy by that, not by which listener
+// port accepted the connection (there is only one gateway listener for
+// every actor now).
+func (p *PKI) issueActorCertificate(csr *x509.CertificateRequest, atespace, name string) ([]byte, error) {
 	tmpl := &x509.Certificate{
 		SerialNumber: big.NewInt(time.Now().UnixNano()),
 		Subject:      pkix.Name{CommonName: "actor"},
+		URIs:         []*url.URL{{Scheme: "ate-actor", Host: atespace, Path: "/" + name}},
 		NotBefore:    time.Now().Add(-time.Minute),
 		NotAfter:     time.Now().Add(1 * time.Hour),
 		KeyUsage:     x509.KeyUsageDigitalSignature,
@@ -280,3 +280,21 @@ func (p *PKI) issueActorCertificate(csr *x509.CertificateRequest) ([]byte, error
 	}
 	return der, nil
 }
+
+// ActorIdentity parses the atespace/name a verified actor client
+// certificate carries, as issueActorCertificate wrote it.
+func ActorIdentity(cert *x509.Certificate) (atespace, name string, ok bool) {
+	if len(cert.URIs) != 1 || cert.URIs[0].Scheme != "ate-actor" {
+		return "", "", false
+	}
+	name = strings.TrimPrefix(cert.URIs[0].Path, "/")
+	if cert.URIs[0].Host == "" || name == "" {
+		return "", "", false
+	}
+	return cert.URIs[0].Host, name, true
+}
+
+// NodeCAPEM returns the node CA's own certificate, PEM-encoded: the real
+// egress gateway verifies atunnel's client certificates against this pool,
+// since the node CA is what issueActorCertificate signs them with.
+func (p *PKI) NodeCAPEM() []byte { return pemCert(p.nodeCA.der) }

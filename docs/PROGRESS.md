@@ -1,5 +1,120 @@
 # ate-node progress
 
+## v2 stage 3 (2026-10-30): egress through the worker's network, with credential injection
+
+Brief (docs/V2.md stage 3 plus the coordinator's message): replace
+internal/devgateway's passthrough with v1's egress.go, adapted to be the
+real EgressGateway address for every actor: verify atunnel's client
+certificate against the node CA, map it to an actor by identity (not by
+listener port — one gateway now, not one per actor), look up that actor's
+real egress-policy.yaml, MITM its TLS, replace headers from Secret Manager,
+refuse everything else. Gate on local pi-durable Gateway variant with the
+template's placeholder key.
+
+Gate: PASS, on a real, unattended `./gate.sh` run (exit 0) against
+`sudo bin/ate-ish serve`, not just my own manual reproduction of its steps.
+(1) turn 1 settles `status: done` with a genuine model answer (`gate.sh` now
+asserts this explicitly, not just that `.settled` exists) — the gateway
+read the real `ai-gateway-token` secret and replaced the placeholder
+`x-api-key`. (2) from the actor's own bash tool, a `fetch` to
+`example.com` (unlisted) fails `getaddrinfo ENOTFOUND`, identically with
+and without `NODE_USE_ENV_PROXY=0` — DNS itself refuses the name before a
+connection is ever possible, so no proxy variable changes anything, the
+opposite of v1. (3) a raw `curl -k` POST to the listed host with no
+`x-api-key` header at all gets the upstream's own `status 401` ("Missing
+Authorization header") — the gateway left the request exactly as sent,
+proving it replaces an existing header and never adds one that is not
+there. (4) suspend, tag, fork, and a turn on the fork (through a
+RestoreWorkload, not RunWorkload) all still pass, the fork's turn also
+settling `done` with real egress.
+
+Timings (the exit-0 run): turn 1 total 9.2s (resume 1.9s, the rest the real
+model call); suspend 1.5s; a turn after resume (demo-agent, generation 2)
+13.7s; the fork's first turn (RestoreWorkload) 14.2s; the two unlisted-host
+checks 2.9-3.0s each (DNS refusal is near-instant; most of that is still
+resume/ingress overhead); the no-header 401 check 3.1s.
+
+What changed, beyond swapping the listener:
+- `internal/devatelet.issueActorCertificate` now takes atespace/name and
+  embeds them as a URI SAN (`ate-actor://<atespace>/<name>`) instead of a
+  fixed `CN=actor`, so a verified client certificate maps straight to an
+  actor identity — stage 2's certs carried no such information, fine for a
+  passthrough that never needed to know who was calling.
+- The real gateway's `tls.Config` now sets `ClientAuth:
+  RequireAndVerifyClientCert` and `ClientCAs` from the node CA (exported as
+  `PKI.NodeCAPEM`), not just `RequestClientCert` as the dev passthrough
+  did; it looks up the actor's policy from ate-ish's own bucket record per
+  connection (`g.bucket.get(actorKey(...))`), where stage 2's `devgateway`
+  had no bucket access and no policy concept at all.
+- `internal/devatelet/fakeatelet.go`'s `MintActorCertificate` now forwards
+  the request's atespace/name through to the PKI call above.
+
+Found and fixed, each confirmed by a real log line before fixing:
+- atunnel's CONNECT names the transparently-redirected connection's
+  *original destination* (`SO_ORIGINAL_DST`), always an IP — never the
+  hostname the actor's own DNS query resolved, since that query already
+  finished before the TCP connection atunnel intercepts even opens. A
+  hostname-keyed `egress-policy.yaml` allowlist (`ai-gateway.vercel.sh`)
+  cannot be checked against an IP by string equality; this measured as
+  every CONNECT logging `allowed=false` with a bare IP as `host`.
+  Fixed by resolving each allowed hostname and checking the destination IP
+  against that set (`resolvePolicyHost`), not the hostname string.
+- `ai-gateway.vercel.sh` answers from a large, rotating IP pool: a single
+  fresh lookup can disagree with whatever subset the actor's own, separate,
+  resolution landed on, so one request in several still measured
+  `allowed=false` even with the fix above in place. Fixed two ways:
+  up to 3 retried lookups 100ms apart per connection, and an
+  accumulate-only cache of every IP ever seen for an allowed hostname across
+  the gateway's lifetime, so coverage only grows across a run.
+- v1's header replacement used `Header.Set` unconditionally — adding the
+  secret even to a request that never carried the header at all. Stage 3's
+  own gate (3) needs "replace, never add"; fixed by skipping replacement
+  when `req.Header.Get(h.Header)` is empty, confirmed by the 401 ("Missing
+  Authorization header", not a 200) this produces for the no-header case.
+- The gate's own model actor refused to run the no-header probe once
+  phrased as a bare `fetch` to the AI Gateway's own API ("could potentially
+  be used to exfiltrate information") — a model safety heuristic, not a
+  gateway bug (the identical request worked when I ran it directly).
+  Fixed by framing the ask as a routine connectivity check with an expected
+  401, and by using `curl -k` (no `NODE_EXTRA_CA_CERTS` trust needed) once
+  plain `curl` failed TLS trust against the MITM leaf for unrelated reasons
+  (curl reads the system trust store, not Node's env var).
+
+HTTPS_PROXY/trust-bundle plumbing: there was no HTTPS_PROXY plumbing left
+to remove — stage 2 never added it back (the transparent nftables redirect
+makes it unnecessary, same conclusion V2.md names). The systemInfo trust
+bundle still gets a CA's PEM at `/run/ate/trust-bundle.pem`
+(`writeSystemInfoFiles`), now `egress.go`'s own MITM `egressCA`
+(`w.gateway.ca.pem`) instead of stage 2's placeholder gateway CA — this one
+the actor's own TLS genuinely needs to trust, to accept the MITM leaf for
+`ai-gateway.vercel.sh`.
+
+`internal/devgateway` deleted: nothing else referenced it once
+`startEgressGateway` (egress.go) replaced its one call site in worker.go.
+
+DNS: confirmed via gate step (2) above that unlisted names fail to
+resolve (`ENOTFOUND`) and (implicitly, since turn 1 and the fork's turn
+both got real answers) that listed ones do — the worker's DNS relay was
+already wired to `GetActorEgressPolicy` in stage 2; nothing needed to
+change there this stage.
+
+Known, not fixed (cosmetic, not a gate failure): one `ERROR lease
+err="generation changed"` log line after "lease deleted" on graceful
+shutdown — the periodic lease-rewrite goroutine fires once more against an
+already-deleted lease object before the process exits. Harmless; the
+process is exiting anyway.
+
+Files changed: egress.go rewritten (per-actor listener -> one gateway,
+certificate-based identity, bucket-backed policy lookup, IP-to-hostname
+resolution, replace-only-if-present headers); internal/devatelet/pki.go
+(actor identity in the cert, `NodeCAPEM`, `GatewayCAPEM` removed —
+unused once the real gateway writes its own CA into the trust bundle);
+internal/devatelet/fakeatelet.go (pass atespace/name through); worker.go
+(wires `startEgressGateway` in place of `devgateway.Start`, trust-bundle
+source); internal/devgateway/ deleted; gate.sh (Gateway-variant defaults,
+turn-1 real-answer assertion, requirement (2) rewritten to the opposite of
+v1, requirement (3) new). No commit made, per the brief.
+
 ## v2 stage 2 (2026-10-30): the small atelet, on the vendored worker
 
 Brief (docs/V2.md stage 2, with the coordinator's follow-up decisions):
