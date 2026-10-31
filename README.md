@@ -6,15 +6,19 @@ ate-ish is the easiest way to run [Agent Substrate](https://github.com/agent-sub
 export AI_GATEWAY_API_KEY=...   # or a GEMINI_API_KEY, whatever your egress policy names
 
 cd your-actor-directory   # holds Dockerfile, template.yaml, egress-policy.yaml
-sudo ate-ish dev -f template.yaml -e egress-policy.yaml
-```
-
-or, with no local Go toolchain or checkout at all, the same command through Docker:
-
-```bash
-docker run --privileged -v "$PWD":/work -w /work -p 8080:8080 \
+docker run --privileged -v "$PWD":/work -w /work -v /var/run/docker.sock:/var/run/docker.sock \
+  -e AI_GATEWAY_API_KEY -p 8080:8080 \
   us-central1-docker.pkg.dev/daniel-junk/ate-ish/ate-ish:latest \
   dev -f template.yaml -e egress-policy.yaml
+```
+
+or, with a local Go toolchain and no Docker:
+
+```bash
+export AI_GATEWAY_API_KEY=...   # or a GEMINI_API_KEY, whatever your egress policy names
+
+cd your-actor-directory   # holds Dockerfile, template.yaml, egress-policy.yaml
+sudo ate-ish dev -f template.yaml -e egress-policy.yaml
 ```
 
 Run it from the actor's own directory (where its `Dockerfile` lives). `ate-ish dev` builds that Dockerfile, exports the resulting image's filesystem once as the actor's rootfs, fetches `runsc` if it is not already staged, starts one node with a local-directory store under `./.ate-ish/dev`, creates the atespace and one actor from the template, uploads the egress policy, and prints the `export ATE_URL=...` line and a ready-to-paste `curl` with the actor header. It keeps running in the foreground until Ctrl-C, which suspends the actor and exits cleanly. `--clean` wipes `./.ate-ish/dev` first; `--dir` and `--port` override the defaults.
@@ -24,6 +28,7 @@ Before you run it:
 - A template that leaves `command` to the image's own `CMD`/`ENTRYPOINT` (as the upstream demos' templates do) gets it filled in automatically, read from the image `dev` just built; otherwise `ate-ish` does not read the image's configuration.
 - An egress policy's `credentialUri` resolves two ways locally: `ate-secret://secretmanager.googleapis.com/<project>/<secret>`, read through `gcloud`'s Application Default Credentials if you have a GCP project set up, or `ate-secret://env/<VAR>`, read straight from an exported environment variable — no GCP project needed at all.
 - `ate-ish dev` runs the vendored gVisor worker, which needs root (cgroup delegation, network namespaces, nftables): `sudo`, or `--privileged` through Docker.
+- `ate-ish dev` also runs a plain `docker build` on the actor's own `Dockerfile` (no edits needed). The published image carries the `docker` CLI but no daemon of its own, so the Docker quickstart above mounts the host's own daemon socket (`-v /var/run/docker.sock:/var/run/docker.sock`); the actor rootfs export itself needs no daemon at all (`go-containerregistry`'s `crane`, used whenever `docker` is not reachable).
 - The CLI's `get`/`suspend`/`create tag`/fork verbs (see below) work the same way against a local `ate-ish dev` node as against Cloud Run: `export ATE_URL=http://127.0.0.1:8080` and no `gcloud` login is required locally.
 
 ## Targets
@@ -333,7 +338,7 @@ v2 runs substrate's own gVisor worker, so MEMORY fidelity (a runsc checkpoint, n
 | Demo | Fidelity asked | What ran | Changed from the demo as written | Result | Numbers |
 |---|---|---|---|---|---|
 | pi-durable (coding-agents-on-substrate) | VOLUMES (default) | Full README walkthrough: turn 1, suspend, tag, fork, turn 2 on both branches; locally and on gen2 | Gemini key revoked: ran the Gateway variant (`server-gateway.ts`, `AI_GATEWAY_API_KEY`) from `demo/pi-durable` instead of `server.ts`/`GEMINI_API_KEY`. `command` added (not in the upstream template). | Pass, locally and on gen2 | local: turn 1 8.8 s, turn 2 13.4/14.0 s. gen2: turn 1 6.6 s, turn 2 7.2/11.5 s |
-| libfx (coding-agents-on-substrate) | VOLUMES (default) | Turn 1, locally and on gen2 | None to the agent. Egress policy's `credentialUri` rewritten from the demo's `ate-secret://k8s.io/...` form (unsupported) to ate-ish's `ate-secret://secretmanager.googleapis.com/...` form, with a `Bearer ` prefix added. `command` added. | Reproduces the stuck-after-stream issue on both: model and tool calls complete (confirmed in the ndjson locally: `app.js`, `test.js` written, tests run and passed), egress allowed, but the HTTP response stream never closes. `ate-ish suspend actor` still works on the wedged actor. | local: 13 ndjson lines then a 60 s timeout with no close. gen2: 0 further events after `turn_start`, 90 s timeout |
+| libfx (coding-agents-on-substrate) | VOLUMES (default) | Turn 1, locally and on gen2 | None to the agent. Egress policy's `credentialUri` rewritten from the demo's `ate-secret://k8s.io/...` form (unsupported) to ate-ish's `ate-secret://secretmanager.googleapis.com/...` form, with a `Bearer ` prefix added. `command` added. | Streams and completes turns normally under ate-ish v2 (a client drop reaches the actor in about 10 ms; v2 suspends through a filesystem checkpoint with no SIGTERM). The earlier "stuck after a dropped stream" result was a curl timeout during a long turn, not a wedge. The one real hang was on ate-ish v1 on Cloud Run and is the demo's own SIGTERM handler waiting in `server.close()` while an `/events` stream is open; `server.closeAllConnections()` after `server.close()` fixes it (see the libfx note in docs/PROGRESS.md). | turn 1 completes (26 s locally, model-bound) |
 | cursor-agent-sdk (coding-agents-on-substrate) | VOLUMES (default) | Session create and stream, no key, locally only (no key to try on gen2) | None; ran as written, including port 80 | Pass, to the documented stopping point: session created, then `turn.failed` `"Invalid User API Key"` | 5.8 s create, 1.27 s to the failure |
 | substrate `counter` (`/tmp/substrate/demos/counter`) | MEMORY | Built from source, run locally, two suspend/resume cycles | Template's nested `snapshotConfig.preferredFidelity` (a field ate-ish ignores) replaced with a top-level `preferredFidelity: MEMORY`; `--extra-port`/`--tcp-port` args dropped (not needed for this check) | **Pass — the fix for v1's known failure.** The file counter, the in-memory counter, and the rootfs counter all survived two suspend/resume cycles, staying in lockstep | 3 → suspend/resume → 4 → suspend/resume → 5, all three counters equal at each read |
 

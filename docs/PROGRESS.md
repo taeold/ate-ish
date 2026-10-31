@@ -1,5 +1,138 @@
 # ate-node progress
 
+## v2 stage 8 (docker) (2026-10-31): the Docker quickstart, real and gated
+
+Item 4 of stage 8 (round 2 left it "built and documented as untested": the
+host's own `docker run` was wedged by the cgroup incident). The VM was
+rebooted since; `docker run --rm busybox true` passes, cgroup v2 with all
+controllers at the root.
+
+**Base image contents (item 1).** Built from the repo `Dockerfile`
+(`docker build -t ate-ish-base:test .`, ~2m): `/usr/local/bin/ate-ish`,
+`bin/ateworker-gvisor`, the full `bin/runsc` release layout (`runsc`,
+`containerd-shim-runsc-v1`, `gvisor-bin/*`), the vendored kodata, and the
+`argv[1]` entrypoint dispatch (`serve` default, `dev` when named) were all
+present and correct, nothing to fix there. Confirmed the crane-based,
+no-daemon rootfs export path directly: ran `dev` against a public image
+(`busybox:1.36`) with no `Dockerfile` in the work dir and no `docker` CLI
+in the image at all; the actor's rootfs lowerdir landed at
+`rootfs/sha256-<digest>`, matching the image's real content digest, not
+the host's filesystem.
+
+**A real bug, not a flag (item 2's "obvious fix").** The documented
+expectation was "needs `/dev/fuse` or specific mounts"; what actually
+failed was `ateworker-gvisor` itself never starting:
+`fork/exec /usr/bin/bash: operation not supported`. `strace -f -e
+trace=clone3` on the exact same code path isolated it to one syscall:
+`clone3(..., CLONE_INTO_CGROUP, cgroup=<leaf>) = -1 EOPNOTSUPP`, and
+reproduced it standalone, outside any of this code, in about ten
+minutes: cgroup v2's "no internal process constraint"
+(`Documentation/admin-guide/cgroup-v2.rst` §2.3) forbids a domain cgroup
+from having both member tasks of its own and children with controllers
+enabled. On a `docker run` container, `ate-ish`'s own process is a direct
+member of exactly the cgroup `nearestDomainAncestor` picks as the
+worker's leaf's parent (`ancestor == cgroup`, the process's own
+residency) — true on every VM/bare-metal host measured before this one,
+where ate-ish always lives one or more levels below whatever ancestor
+gets touched, so this never fired there. Fix (`cgrouphelper.go`, new
+`selfMigrateOutOf`): when `ancestor == cgroup`, move the calling
+process's own pid into a fresh, dedicated `<ancestor>/ate-ish-self`
+sibling first, so `ancestor` is left task-free before its
+`subtree_control` is touched or anything clones into a child of it.
+Verified by hand before touching the real code (a throwaway Go+strace
+repro, not committed): without the move, `io`/`memory`/`hugetlb`/`rdma`
+all failed to enable too (same constraint); with it, all seven
+controllers enabled and the clone succeeded. Applied to both
+`prepareLeafAt` (the ambient path, every host so far) and
+`runCgroupHelper` (Cloud Run gen2's helper, same risk in principle,
+untested here — gen2 only). `go build ./...`, `go vet ./...`, `gofmt -l`
+(excluding `third_party`) all clean. No vendored files touched.
+
+**The build-inside-the-container gap.** `dev.go`'s own Dockerfile-build
+convenience (`docker build` on the actor's own `Dockerfile`, needed since
+the gate's `pi-durable/agent` files are unchanged except `server.ts`/
+`egress-policy.yaml` — `template.yaml`'s `image: IMAGE` placeholder stays
+untouched, so `ate-ish dev` has to fill it in itself) has no daemon to
+call inside the base image at all. Fix: added the static `docker` CLI
+only (no `dockerd`, `download.docker.com`'s official static tarball,
+~24 MB) to the `Dockerfile`'s final stage; the gate (and the README's
+quickstart, updated) mounts the host's own socket
+(`-v /var/run/docker.sock:/var/run/docker.sock`) so `docker build`,
+`docker create`/`export` (the rootfs path when a daemon is reachable) all
+go through the host's daemon, never one inside this container. Confirmed
+with `docker version` inside the container: client 27.5.1, server 29.1.3
+(the host's), negotiated fine.
+
+**The real gate (item 2).** Fresh clone of
+`https://github.com/taeold/coding-agents-on-substrate`, `pi-durable`.
+Files changed from the clone, exactly as asked: `agent/server.ts`
+(swapped `googleProvider` for `vercelAIGatewayProvider`/
+`anthropicMessagesApi`, model `anthropic/claude-haiku-4.5`, copying
+`GEMINI_API_KEY` into `AI_GATEWAY_API_KEY` since the template's own env
+var name stays untouched) and `../egress-policy.yaml` (hostname
+`ai-gateway.vercel.sh`, header `x-api-key`, credentialUri
+`ate-secret://env/AI_GATEWAY_API_KEY`). `template.yaml` itself untouched.
+
+```bash
+cd pi-durable/agent
+export AI_GATEWAY_API_KEY=<from Secret Manager secret ai-gateway-token>
+docker run --rm --privileged -e AI_GATEWAY_API_KEY \
+  -v "$PWD/..":/work -v /var/run/docker.sock:/var/run/docker.sock \
+  -w /work/agent -p 8080:8080 \
+  us-central1-docker.pkg.dev/daniel-junk/ate-ish/ate-ish:latest \
+  dev -f ../template.yaml -e ../egress-policy.yaml
+```
+
+Adjusted from the brief's own invocation: `-v "$PWD/..":/work` (so
+`../template.yaml`/`../egress-policy.yaml` resolve from `/work/agent`)
+plus the docker-socket mount the build-inside-the-container gap above
+needs. No `--cgroupns=host` needed; plain `--privileged` was enough once
+the cgroup fix landed.
+
+The printed curl answered a real turn
+(`{"settled":{...,"status":"done"}, "view":{...,"text":"pong"}}`, actual
+Claude Haiku 4.5 output via Vercel AI Gateway). Rootfs-is-the-image,
+confirmed two ways: the log line `exported image rootfs
+image=ate-ish-dev/pi-durable-data:latest digest=sha256:d124148... dest=
+.../rootfs/sha256-d124148... docker=true`, and renaming
+`/usr/local/bin/node` on the host (`sudo mv`, restored immediately after
+in a `trap`) and re-running the whole gate from a clean `.ate-ish` dir:
+the turn still answered correctly, proving the actor's own Node comes
+from the image's rootfs, not the host. `ate-ish get actors`, `suspend
+actor`, `create tag`, `create actor --tag` (fork), setting the fork's own
+egress policy (confirmed it does not inherit the source actor's, same as
+round 2's finding), and a turn on the fork all passed against the one
+running container. `docker kill -s INT` suspended the fork cleanly
+(checkpoint 125ms, lease deleted, exit status 0, container removed); one
+`WARN failed to terminate workload after checkpoint ... runsc delete:
+exit status 128` fired during that same shutdown but did not fail the
+suspend (checkpoint had already succeeded) — not re-investigated further
+this round, flagged here rather than hidden. `docker ps -a` and
+`pgrep -af 'runsc|ateworker-gvisor'` scoped to this run's state dir showed
+nothing left over, before and after every run in this round. (This VM is
+shared: another, unrelated `ate-ish`/gVisor session was live throughout,
+left untouched.)
+
+**Timings.** Base image build (cold): ~2m. Container start (its own
+`docker build` of `agent/Dockerfile`, dominated by `npm install`, through
+to "ate-ish dev is running"): ~12s. Rootfs export inside the container
+(`docker create`+`export` via the mounted socket, first actor boot):
+5.40s. First turn (cold sandbox boot + a real model call): 7.81s.
+Suspend: 1.00s. Fork boot (`RestoreWorkload`, volumes-fidelity): 1.22s
+(`snapshot_ms=164`). Turn on the fork, once its own egress policy was
+set: 1.27s (`total_ms=1245`).
+
+**Pushed** `us-central1-docker.pkg.dev/daniel-junk/ate-ish/ate-ish:latest`
+(digest `sha256:abf8c530bfcc0d1fbfad1063659f4ca0e283d15c13f7716da69d5c44e34f6100`).
+README quickstart now shows the Docker line first (verbatim as run, socket
+mount included) and the `sudo` line second.
+
+**Files touched this round:** `cgrouphelper.go` (`selfMigrateOutOf`,
+called from both `prepareLeafAt` and `runCgroupHelper`), `Dockerfile`
+(static `docker` CLI), `README.md` (quickstart order and the socket-mount
+note), `docs/PROGRESS.md` (this entry). No vendored edits. No commit, per
+the brief (the coordinator commits at the gate).
+
 ## v2 stage 8, round 2 (2026-10-31): the cgroup incident, fixed; the real gate
 
 Two fixes and a real gate re-run, ordered by the coordinator ahead of
@@ -2180,3 +2313,7 @@ gateway agent). Bucket gs://ate-node-daniel-junk (us-west1).
   opencode-gemini-key and ai-gateway-token; objectAdmin on the buckets)
 - Deleted: instance ate-node-probe and its image ate-node:probe, worker pool ate-node-workers, service
   ate-node-ingress, bucket gs://ate-node-scale-daniel-junk
+
+## libfx note (2026-10-31, from the separate libfx investigation session)
+
+Not a libfx bug and not an ate-ish v2 bug. The demo's agent/server.ts exits only inside the server.close() callback, and Node's server.close() waits for every open connection; an /events response is a libfx tail that stays open while a client is attached, so under SIGTERM the process never exits. Fix: server.closeAllConnections() after server.close() (one line, in taeold/coding-agents-on-substrate/libfx). Only ate-ish v1 on Cloud Run ever hit it, because the front end held a dropped client's connection for 30 s or more. v2 suspends via fscheckpoint without SIGTERM, and a client drop reaches the actor in about 10 ms. The stage 6 row that said the hang reproduced locally on v2 was wrong: it was a curl timeout during a long turn.

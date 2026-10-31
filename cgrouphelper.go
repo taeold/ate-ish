@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -53,6 +54,23 @@ func prepareLeafAt(base, nodeTag string) (leafFD *os.File, ancestor string, igno
 	if err != nil {
 		return nil, "", false, fmt.Errorf("finding a domain-type ancestor of ate-ish's own cgroup: %w", err)
 	}
+	// Docker finding (this stage): a plain `docker run` container's init
+	// process (ate-ish itself) is a direct member of the container's own
+	// cgroup root, which is exactly the cgroup nearestDomainAncestor picks
+	// (ancestor == cgroup). Enabling subtree_control there and then
+	// clone3'ing the worker CLONE_INTO_CGROUP into a fresh child leaf
+	// under it then fails with EOPNOTSUPP — cgroup v2's "no internal
+	// process constraint" (cgroup-v2.rst §2.3: a domain cgroup cannot have
+	// both member tasks of its own and children with controllers
+	// enabled). Every host measured before this one (VM/bare systemd)
+	// never hit this because ate-ish's own cgroup there already sits one
+	// or more levels below the ancestor subtree_control actually touches.
+	// See selfMigrateOutOf's own comment.
+	if ancestor == cgroup {
+		if err := selfMigrateOutOf(ancestor); err != nil {
+			return nil, "", false, fmt.Errorf("moving ate-ish's own process out of %s: %w", ancestor, err)
+		}
+	}
 	leaf := cgroupLeafFor(ancestor, nodeTag)
 	if err := prepareWorkerCgroupLeaf(leaf); err != nil {
 		return nil, "", false, fmt.Errorf("preparing the worker's cgroup leaf: %w", err)
@@ -73,6 +91,30 @@ func prepareLeafAt(base, nodeTag string) (leafFD *os.File, ancestor string, igno
 		return nil, "", false, fmt.Errorf("checking which cgroup controllers this host exposes: %w", err)
 	}
 	return f, ancestor, lacks, nil
+}
+
+// selfMigrateOutOf moves the calling process (and nothing else; every
+// process measured so far that hits this path is single-threaded-process
+// ate-ish or its own single-process cgroup helper, never a multi-process
+// group) into a dedicated, newly created "ate-ish-self" child of cgroup,
+// so cgroup itself is left with no member tasks of its own before
+// anything enables its subtree_control or clone3's a worker into a
+// sibling child. Verified directly (a throwaway strace repro, not
+// committed): without this, `clone3(..., CLONE_INTO_CGROUP, cgroup=<a
+// fresh, empty sibling>)` under a cgroup still holding this process as a
+// task failed EOPNOTSUPP the moment that cgroup's own subtree_control had
+// any controller enabled; moving this process out first (and only then
+// enabling subtree_control) made every controller enable cleanly and the
+// clone succeed.
+func selfMigrateOutOf(cgroup string) error {
+	self := cgroup + "/ate-ish-self"
+	if err := os.MkdirAll(self, 0o755); err != nil {
+		return fmt.Errorf("creating %s: %w", self, err)
+	}
+	if err := os.WriteFile(self+"/cgroup.procs", []byte(strconv.Itoa(os.Getpid())), 0o644); err != nil {
+		return fmt.Errorf("moving pid %d into %s/cgroup.procs: %w", os.Getpid(), self, err)
+	}
+	return nil
 }
 
 // cgroupHelperResponse is what the helper subprocess sends back over the
@@ -185,6 +227,15 @@ func runCgroupHelper(nodeTag string) error {
 	ancestor, err := nearestDomainAncestor(base, cgroup)
 	if err != nil {
 		return fail("finding a domain-type ancestor: %v", err)
+	}
+	// Same "no internal process constraint" as prepareLeafAt's own
+	// comment: this helper is itself the one process resident in its
+	// fresh private cgroup2 mount's root, which can coincide with
+	// ancestor here too.
+	if ancestor == cgroup {
+		if err := selfMigrateOutOf(ancestor); err != nil {
+			return fail("moving the cgroup helper's own process out of %s: %v", ancestor, err)
+		}
 	}
 	leaf := cgroupLeafFor(ancestor, nodeTag)
 	if err := prepareWorkerCgroupLeaf(leaf); err != nil {

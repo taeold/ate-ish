@@ -19,6 +19,15 @@ FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates nftables iproute2 util-linux kmod python3 curl \
     && rm -rf /var/lib/apt/lists/*
+# Stage 8 (docker path): the static docker CLI only, no dockerd in this
+# image at all. `ate-ish dev`'s own convenience build of an actor's
+# Dockerfile (dev.go) still calls `docker build`; run this image with
+# `-v /var/run/docker.sock:/var/run/docker.sock` so that talks to the
+# HOST's daemon over the mounted socket. The actor's rootfs export itself
+# (bundle.go) never needs this: it uses go-containerregistry's crane
+# library directly, with no daemon at all, whenever one is not reachable.
+RUN curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-27.5.1.tgz \
+    | tar -xz --strip-components=1 -C /usr/local/bin docker/docker
 WORKDIR /ate-ish
 COPY --from=build /ate-ish /usr/local/bin/ate-ish
 COPY --from=build /ateworker-gvisor bin/ateworker-gvisor
