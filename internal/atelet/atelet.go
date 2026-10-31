@@ -281,61 +281,12 @@ type ateworkerConfig struct {
 	logFile     string
 }
 
-// startAteworker launches ateworker-gvisor in a fresh cgroup and mount
-// namespace and a fresh cgroup2 mount, the same way a kubelet-run pod would
-// give it one: born directly into its own leaf cgroup (never ate-ish's own,
-// see prepareWorkerCgroupLeaf's doc comment) via clone3's
-// CLONE_INTO_CGROUP. Returns the leaf path so the caller can remove it on
-// shutdown.
-func startAteworker(cfg ateworkerConfig) (*exec.Cmd, string, error) {
-	// Stage 4: two nodes on this host run the identical binary path, so a
-	// pattern on cfg.binary alone (single-node assumption) would pkill the
-	// OTHER node's live ateworker-gvisor the moment this node starts.
-	// cfg.pki.Path(...) embeds this node's own ATE_DIR, unique per node, so
-	// scoping the kill pattern to it only ever reaps this node's own stale
-	// process from a previous, uncleanly-stopped run.
-	marker := cfg.pki.Path(devatelet.WorkerCredentialBundleFile)
-	selfSafePattern := "[" + marker[:1] + "]" + marker[1:]
-	_ = exec.Command("pkill", "-9", "-f", selfSafePattern).Run()
-	time.Sleep(300 * time.Millisecond)
-
-	// INCIDENT (2026-10-31): this used to unconditionally run `umount
-	// /sys/fs/cgroup || umount -l /sys/fs/cgroup; mount -t cgroup2 ...`
-	// directly in ate-ish's OWN (shared) mount namespace, on every host.
-	// On this dev VM — a general-purpose host with its own live systemd
-	// and dbus, not a single-container sandbox — that lazily detached the
-	// cgroup2 mount systemd (pid 1) holds system-wide; afterward
-	// `systemctl`/`systemd-run --scope`/anything needing dbus activation
-	// hung, and Docker's systemd cgroup driver could no longer start ANY
-	// container (first misread as a Docker/gVisor-specific "cgroup
-	// activation timeout" — see docs/PROGRESS.md's stage 8 notes). Never
-	// remount /sys/fs/cgroup itself in this process's own namespace again:
-	// prepareWorkerCgroupFD below probes the ambient view read-only first
-	// (every local/VM host, this one included) and only reaches for a
-	// mount at all when that probe fails (so far, only Cloud Run gen2);
-	// even then it is a *fresh, separate* cgroup2 instance at a private
-	// path, mounted inside a throwaway helper subprocess's own private
-	// mount namespace (CLONE_NEWNS) — never this one's, and never
-	// /sys/fs/cgroup itself.
-	leafFD, ateishCgroup, ignoreCgroups, err := prepareWorkerCgroupFD(cfg.nodeTag)
-	if err != nil {
-		return nil, "", err
-	}
-	defer leafFD.Close()
-	leaf := cgroupLeafFor(ateishCgroup, cfg.nodeTag)
-
-	stagedKodata, err := stageKodata(filepath.Dir(cfg.logFile), ignoreCgroups)
-	if err != nil {
-		return nil, "", fmt.Errorf("staging the worker's runsc flags: %w", err)
-	}
-	cfg.kodata = stagedKodata
-
-	logFile, err := os.Create(cfg.logFile)
-	if err != nil {
-		return nil, "", err
-	}
-
-	args := []string{
+// workerArgs is ateworker-gvisor's own command-line flags, shared by both
+// launch paths below (the direct, same-process clone3 path and the
+// cgroup-helper path), so the two paths cannot drift apart on what the
+// worker is actually told.
+func workerArgs(cfg ateworkerConfig) []string {
+	return []string{
 		"--pod-uid=" + cfg.podUID,
 		"--pod-ips=127.0.0.1",
 		"--log-level=info",
@@ -349,8 +300,140 @@ func startAteworker(cfg ateworkerConfig) (*exec.Cmd, string, error) {
 		"--atunnel-egress-trust-bundle=" + cfg.pki.Path(devatelet.GatewayTrustBundleFile),
 		"--dns-egress-policy=enforce-in-atunnel",
 	}
+}
+
+// startAteworker launches ateworker-gvisor in a fresh cgroup and mount
+// namespace and a fresh cgroup2 mount, the same way a kubelet-run pod would
+// give it one: born directly into its own leaf cgroup (never ate-ish's own,
+// see prepareWorkerCgroupLeaf's doc comment) via clone3's
+// CLONE_INTO_CGROUP. Returns the leaf path so the caller can remove it on
+// shutdown.
+//
+// FIX (2026-10-31, gen2 boot race): the ambient-view probe used to be one
+// unretried os.ReadFile of cgroup.controllers in cgrouphelper.go, racing
+// Cloud Run gen2's own container cgroup setup (the same non-determinism
+// stage 5d found one layer up, in enableAvailableControllersWithRetry) —
+// most boots won it (ambient path, works fine), some lost it and fell into
+// the helper path, whose old design handed a leaf fd opened in the
+// helper's own private mount namespace back to THIS process for clone3 to
+// consume: a cross-namespace cgroup fd, which made clone3's
+// CLONE_INTO_CGROUP (combined with this process's own CLONE_NEWNS on the
+// spawned "bash -c ... exec ateworker-gvisor" child) land that child in a
+// mount-namespace state where /usr/bin/bash itself resolved to nothing
+// ("fork/exec /usr/bin/bash: no such file or directory"). The fix is two
+// parts: ambientCgroupControllersWithRetry below gives the ambient probe
+// the same 5s/250ms budget as stage 5d's own retry, so "no controllers" is
+// only believed after settling has had time to finish; and the gen2 path
+// itself (startWorkerViaHelper) no longer sends a cgroup fd across a
+// namespace boundary at all — the helper opens the leaf fd and calls
+// clone3 on it itself, in its own process, in its own namespace, and stays
+// alive only to relay the worker's exit code and forward signals.
+func startAteworker(cfg ateworkerConfig) (cmd *exec.Cmd, leaf string, workerPID int, err error) {
+	// Stage 4: two nodes on this host run the identical binary path, so a
+	// pattern on cfg.binary alone (single-node assumption) would pkill the
+	// OTHER node's live ateworker-gvisor the moment this node starts.
+	// cfg.pki.Path(...) embeds this node's own ATE_DIR, unique per node, so
+	// scoping the kill pattern to it only ever reaps this node's own stale
+	// process from a previous, uncleanly-stopped run.
+	marker := cfg.pki.Path(devatelet.WorkerCredentialBundleFile)
+	selfSafePattern := "[" + marker[:1] + "]" + marker[1:]
+	_ = exec.Command("pkill", "-9", "-f", selfSafePattern).Run()
+	time.Sleep(300 * time.Millisecond)
+
+	logFile, err := os.Create(cfg.logFile)
+	if err != nil {
+		return nil, "", 0, err
+	}
+
+	// INCIDENT (2026-10-31): this used to unconditionally run `umount
+	// /sys/fs/cgroup || umount -l /sys/fs/cgroup; mount -t cgroup2 ...`
+	// directly in ate-ish's OWN (shared) mount namespace, on every host.
+	// On this dev VM — a general-purpose host with its own live systemd
+	// and dbus, not a single-container sandbox — that lazily detached the
+	// cgroup2 mount systemd (pid 1) holds system-wide; afterward
+	// `systemctl`/`systemd-run --scope`/anything needing dbus activation
+	// hung, and Docker's systemd cgroup driver could no longer start ANY
+	// container (first misread as a Docker/gVisor-specific "cgroup
+	// activation timeout" — see docs/PROGRESS.md's stage 8 notes). Never
+	// remount /sys/fs/cgroup itself in this process's own namespace again:
+	// the ambient-view probe below is read-only, and the gen2 fallback
+	// mounts a fresh cgroup2 instance inside a helper subprocess's own
+	// private mount namespace (CLONE_NEWNS) — never this one's.
+	ambientReady := ambientCgroupControllersWithRetry()
+	if os.Getenv("ATE_ISH_FORCE_CGROUP_HELPER") == "1" {
+		// Test switch only (documented here and in cgrouphelper.go): forces
+		// the gen2 helper path on a host where the ambient view actually
+		// works, so that path can be exercised and verified without real
+		// Cloud Run gen2 hardware.
+		slog.Info("ATE_ISH_FORCE_CGROUP_HELPER=1: forcing the cross-namespace-safe cgroup helper path for a local test")
+		ambientReady = false
+	}
+
+	if ambientReady {
+		cmd, leaf, err = startWorkerAmbient(cfg, logFile)
+		workerPID = pidOf(cmd)
+	} else {
+		cmd, leaf, workerPID, err = startWorkerViaHelper(cfg, logFile)
+		if err != nil {
+			// Required fallback: a broken gen2 helper path must never take
+			// the node down with it. Log why, then try the ambient view
+			// anyway — if gen2 genuinely has no working cgroup2 view at
+			// all this still fails, but for the reason actually hit, not a
+			// crash.
+			slog.Warn("the gen2 cgroup-helper path failed; falling back to the ambient cgroup view", "err", err)
+			cmd, leaf, err = startWorkerAmbient(cfg, logFile)
+			workerPID = pidOf(cmd)
+		}
+	}
+	if err != nil {
+		return nil, "", 0, err
+	}
+
+	// Stage 5 probe diagnostic: a seccomp SECCOMP_RET_KILL (or RET_TRAP)
+	// terminates the process with a signal and produces no output at all
+	// on the fds above, so waitForSocket's 30s timeout alone would not
+	// distinguish that from "just slow." Logging Wait()'s result (exit
+	// code or killing signal) makes that distinction visible. On the
+	// helper path, cmd here is the helper (see startWorkerViaHelper); its
+	// own exit mirrors the real worker's, since RunCgroupHelper waits on
+	// the real worker and exits with its code.
+	go func() {
+		waitErr := cmd.Wait()
+		fmt.Fprintf(logFile, "ATELET_STEP=wait-returned err=%v state=%v\n", waitErr, cmd.ProcessState)
+		fmt.Fprintf(os.Stderr, "ATELET_STEP=wait-returned err=%v state=%v\n", waitErr, cmd.ProcessState)
+	}()
+	return cmd, leaf, workerPID, nil
+}
+
+// pidOf is startWorkerAmbient's own cmd's pid: on that path cmd itself IS
+// the real ateworker-gvisor process (no helper in between), unlike
+// startWorkerViaHelper, which reports the real worker's pid separately
+// (see its own doc comment on why that must not be cmd.Process.Pid there).
+func pidOf(cmd *exec.Cmd) int {
+	if cmd == nil || cmd.Process == nil {
+		return 0
+	}
+	return cmd.Process.Pid
+}
+
+// startWorkerAmbient is the direct path: the ambient cgroup2 view already
+// works (every local/VM host measured so far), so ate-ish clone3's the
+// worker straight into its leaf itself, in its own process.
+func startWorkerAmbient(cfg ateworkerConfig, logFile *os.File) (*exec.Cmd, string, error) {
+	leafFD, ateishCgroup, ignoreCgroups, err := prepareWorkerCgroupFD(cfg.nodeTag)
+	if err != nil {
+		return nil, "", err
+	}
+	defer leafFD.Close()
+	leaf := cgroupLeafFor(ateishCgroup, cfg.nodeTag)
+
+	stagedKodata, err := stageKodata(filepath.Dir(cfg.logFile), ignoreCgroups)
+	if err != nil {
+		return nil, "", fmt.Errorf("staging the worker's runsc flags: %w", err)
+	}
+
 	cmdLine := cfg.binary
-	for _, a := range args {
+	for _, a := range workerArgs(cfg) {
 		cmdLine += " " + a
 	}
 	// Stage 5 (Cloud Run gen2) found /sys/fs/cgroup already mounted in a
@@ -364,7 +447,7 @@ func startAteworker(cfg ateworkerConfig) (*exec.Cmd, string, error) {
 		"mount -t cgroup2 cgroup2 /sys/fs/cgroup && exec " + cmdLine
 
 	cmd := exec.Command("bash", "-c", script)
-	cmd.Env = append(os.Environ(), "KO_DATA_PATH="+cfg.kodata)
+	cmd.Env = append(os.Environ(), "KO_DATA_PATH="+stagedKodata)
 	if ignoreCgroups {
 		// Stage 5f: --ignore-cgroups (above) only suppresses the sandbox's
 		// own cgroup setup; runsc's subcontainer path unconditionally
@@ -397,16 +480,6 @@ func startAteworker(cfg ateworkerConfig) (*exec.Cmd, string, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, "", fmt.Errorf("starting ateworker-gvisor: %w", err)
 	}
-	// Stage 5 probe diagnostic: a seccomp SECCOMP_RET_KILL (or RET_TRAP)
-	// terminates the process with a signal and produces no output at all
-	// on the fds above, so waitForSocket's 30s timeout alone would not
-	// distinguish that from "just slow." Logging Wait()'s result (exit
-	// code or killing signal) makes that distinction visible.
-	go func() {
-		err := cmd.Wait()
-		fmt.Fprintf(logFile, "ATELET_STEP=wait-returned err=%v state=%v\n", err, cmd.ProcessState)
-		fmt.Fprintf(os.Stderr, "ATELET_STEP=wait-returned err=%v state=%v\n", err, cmd.ProcessState)
-	}()
 	return cmd, leaf, nil
 }
 

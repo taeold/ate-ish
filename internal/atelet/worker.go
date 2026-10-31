@@ -153,7 +153,7 @@ func New(ctx context.Context, b store.Store, addr string, capacity int, dir stri
 	connectPort, _ := strconv.Atoi(env("ATE_CONNECT_PORT", "28444"))
 
 	podUID := "ate-ish-" + randomHex(4)
-	cmd, cgroupLeaf, err := startAteworker(ateworkerConfig{
+	_, cgroupLeaf, workerPID, err := startAteworker(ateworkerConfig{
 		binary:      workerBinaryInBin(),
 		kodata:      workerKodataPath(),
 		podUID:      podUID,
@@ -180,7 +180,7 @@ func New(ctx context.Context, b store.Store, addr string, capacity int, dir stri
 	w := &Worker{
 		id: "w-" + randomHex(4), addr: addr, dir: dir, store: b,
 		pki: pki, ateletSrv: ateletSrv, gateway: gateway,
-		workerPID: cmd.Process.Pid, workerConn: conn, client: ateworkerpb.NewWorkerClient(conn),
+		workerPID: workerPID, workerConn: conn, client: ateworkerpb.NewWorkerClient(conn),
 		cgroupLeaf:  cgroupLeaf,
 		rootfsLower: rootfsLower,
 		slots:       make([]*hosted, capacity),

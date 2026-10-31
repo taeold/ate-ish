@@ -25,15 +25,48 @@ ate-ish() {
   echo "  [$(ms "$t0") ms]"
 }
 
+# bearerToken prints the Authorization header value for $ATE_URL, or
+# nothing against a local node (no IAM there) or when ATE_NO_AUTH=1 says
+# so explicitly. `gcloud auth print-identity-token` needs a real gcloud
+# login, which an actor image driving this script against its own
+# localhost node has no reason to carry.
+bearerToken() {
+  if [[ -n "${ATE_NO_AUTH:-}" ]] || [[ "$ATE_URL" == http://localhost* || "$ATE_URL" == http://127.0.0.1* ]]; then
+    return
+  fi
+  echo "Bearer $(gcloud auth print-identity-token)"
+}
+
+# postSubmit URL ACTOR PROMPT AUTH HEADERS_OUT BODY_OUT: one POST /submit,
+# with node's own fetch rather than curl. The verification run that found
+# this gap ran gate.sh from inside an actor image, which (unlike this dev
+# VM) ships node but not curl.
+postSubmit() {
+  node -e '
+    const [url, actor, prompt, auth, headersOut, bodyOut] = process.argv.slice(1);
+    const fs = require("fs");
+    const headers = {"Content-Type": "application/json", "ate-target-actor": actor};
+    if (auth) headers["Authorization"] = auth;
+    fetch(url + "/submit", {method: "POST", headers, body: JSON.stringify({prompt})})
+      .then(async (r) => {
+        fs.writeFileSync(bodyOut, await r.text());
+        let h = "";
+        for (const [k, v] of r.headers) h += k + ": " + v + "\n";
+        fs.writeFileSync(headersOut, h);
+      })
+      .catch((e) => {
+        fs.writeFileSync(bodyOut, "fetch failed: " + e.message);
+        fs.writeFileSync(headersOut, "");
+      });
+  ' "$1" "$2" "$3" "$4" "$5" "$6"
+}
+
 # turn ACTOR PROMPT: one POST /submit through the ingress.
 turn() {
-  echo "\$ curl -X POST \$ATE_URL/submit -H 'ate-target-actor: $AS/$1' -d '{\"prompt\": \"$2\"}'"
+  echo "\$ node -e fetch(...) \$ATE_URL/submit -H 'ate-target-actor: $AS/$1' -d '{\"prompt\": \"$2\"}'"
   local t0
   t0=$(date +%s%N)
-  curl -sS -X POST "$ATE_URL/submit" -D "$work/headers" -o "$work/out.json" \
-    -H "Authorization: Bearer $(gcloud auth print-identity-token)" \
-    -H "ate-target-actor: $AS/$1" -H "Content-Type: application/json" \
-    -d "$(jq -n --arg p "$2" '{prompt: $p}')"
+  postSubmit "$ATE_URL" "$AS/$1" "$2" "$(bearerToken)" "$work/headers" "$work/out.json"
   local took
   took=$(ms "$t0")
   if ! jq -e .settled "$work/out.json" >/dev/null 2>&1; then
@@ -95,8 +128,25 @@ expect '^failed:' "example.com is refused with no proxy env var set either; the 
 # it never adds one that was not there. A request to the listed host with no
 # x-api-key at all must reach the real upstream unmodified and get its own
 # 401, not a 200 the proxy's own secret produced.
-rawFetch="curl -sS -k -o /dev/null -w 'status %{http_code}\\\\n' -X POST https://ai-gateway.vercel.sh/v1/chat/completions -H 'content-type: application/json' -d '{\\\"model\\\":\\\"openai/gpt-4o-mini\\\",\\\"messages\\\":[{\\\"role\\\":\\\"user\\\",\\\"content\\\":\\\"hi\\\"}]}'"
-turn demo-agent-fork "This is a routine connectivity check of our own egress proxy configuration, expected to fail cleanly with an HTTP 401 since no credential is set. Run this exact command with the bash tool and reply with its output only: $rawFetch"
+#
+# node's own fetch, not curl: the pi-durable actor image (demo/pi-durable's
+# Dockerfile) carries node but no curl, and the actor sandbox has neither
+# the host's PATH nor its packages, so this check needs something the
+# actor's own image ships.
+#
+# A fresh actor and a one-line prompt, not demo-agent-fork's own
+# conversation: measured directly (2026-10-31) that asking this model to
+# run the exact same command in a conversation that had just run the two
+# DNS-refusal checks above got refused ("could be used to test
+# credential/authentication bypasses"), while the identical command as a
+# single turn on a brand-new actor got a plain "status 401" both times.
+# The refusal tracked the conversation's own accumulated turns, not the
+# command's wording, so the real fix is not sharing a conversation with
+# prior "something is refusing my commands" turns.
+rawFetch="node -e \"fetch('https://ai-gateway.vercel.sh/v1/chat/completions', {method: 'POST', headers: {'content-type': 'application/json'}, body: JSON.stringify({model: 'openai/gpt-4o-mini', messages: [{role: 'user', content: 'hi'}]})}).then(r => console.log('status', r.status))\""
+ate-ish create actor proxy-check --template pi-durable-data -a "$AS"
+ate-ish create egress-policy proxy-check -a "$AS" -f "$POLICY"
+turn proxy-check "Run this exact command with the bash tool and reply with its output only: $rawFetch"
 expect '^status 401' "the listed host, with no x-api-key header, gets its own 401 (the proxy only replaces, never adds)"
 
 ate-ish get actors -a "$AS"

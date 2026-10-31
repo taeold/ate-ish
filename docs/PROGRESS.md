@@ -1,5 +1,150 @@
 # ate-node progress
 
+## Fix pass (2026-10-31): the gen2 boot race, gate.sh without a Cloud Run token, sudo credential fallback
+
+Brief: three defects the last verification run found. Fix each in order,
+each verified for real; no vendored edits beyond Patch 1; no commit.
+
+**1. Cloud Run gen2 boot race (`internal/atelet/cgrouphelper.go`,
+`atelet.go`).** Root cause: `prepareWorkerCgroupFD`'s ambient-view probe
+was a single, unretried `os.ReadFile` of `cgroup.controllers`, racing
+Cloud Run gen2's own container cgroup setup (the same non-determinism
+stage 5d measured one layer up, in `enableAvailableControllersWithRetry`).
+A boot that lost the race took the gen2 helper path, whose old design
+opened the worker's leaf fd inside a throwaway helper subprocess's own
+private mount namespace and sent that fd back to ate-ish's own process
+over SCM_RIGHTS for clone3's `CLONE_INTO_CGROUP` to consume there — a
+cgroup fd crossing a mount-namespace boundary, which left the spawned
+`bash -c ... exec ateworker-gvisor` child's own mount namespace unable to
+resolve `/usr/bin/bash` at exec time.
+
+Fix: (a) `ambientCgroupControllersWithRetry` gives the ambient probe the
+same 5 s/250 ms budget stage 5d's own retry uses, so "no controllers" is
+only believed once settling has had time to finish; (b) the gen2 path
+(`startWorkerViaHelper`/`RunCgroupHelper`) no longer sends a cgroup fd
+anywhere: the helper mounts its own private cgroup2 instance, opens the
+leaf fd locally, and clone3's the real `ateworker-gvisor` into it inside
+the same process, in the same namespace. The helper stays alive only to
+relay the real worker's exit code (so atelet.go's existing Wait-and-log
+goroutine on the helper's own `*exec.Cmd` keeps working); the real
+worker's own pid is reported back separately over the same socket
+(`helperAck2.Pid`) and is what `worker.go` actually signals and
+`nsenter`s into for the bundle-rootfs overlay mount — load-bearing, not
+cosmetic: an earlier version of this fix kept using the helper's own pid
+for that, which landed the overlay mount one mount-namespace level too
+shallow (the helper's own, not the further-nested one the real worker's
+own `CLONE_NEWNS` gives it) and broke every actor boot on the gen2 path
+with "node not found in PATH" — caught by the first real Cloud Run turn
+after the cgroup fix looked clean, not by local testing. (c) If the gen2
+path still fails, `startAteworker` logs why and falls back to the
+ambient path rather than taking the node down with it.
+
+Local verification: a documented test switch,
+`ATE_ISH_FORCE_CGROUP_HELPER=1`, forces the gen2 path on this dev VM
+(whose ambient view works). Forced-helper boot reaches "Registered
+worker"; a turn, a suspend, and a resume with history intact all pass
+(local `AI_GATEWAY_API_KEY` from Secret Manager `ai-gateway-token`); a
+`SIGTERM` to the node shuts the worker down cleanly with no stray
+processes. The ambient path (unforced) is unaffected.
+
+Real Cloud Run gen2 verification, instance `ate-ish-v2` (us-west1): built
+and pushed `us-central1-docker.pkg.dev/daniel-junk/ate-ish/pi-durable-node@sha256:ab888268d6b304657343eb1aa4131d7d2114f963ba235a6bfbf0d5e689775813`
+(built with `--provenance=false --sbom=false`; the default buildx
+manifest-list/attestation output, found mid-verification, made
+`internal/atelet/bundle.go`'s crane-based image export for the actor's
+*own* image pull the wrong manifest and produced an empty-looking
+rootfs — unrelated to the three assigned defects, fixed by the build
+flags alone, no source change). Five boots (`gcloud beta run instances
+restart`/`start`, one `update --image`), every one reaching "Registered
+worker" in the instance's own log, zero occurrences of the old
+`/usr/bin/bash: no such file or directory` or (from the overlay-mount
+bug caught above) `node ... no such file or directory` across the whole
+log window. Turn 1 against the instance's URL: `HTTP 200` in 11.1 s, a
+real model answer through the AI Gateway (secret `ai-gateway-token`).
+Suspend, then a second turn: resumed with history intact ("You asked me
+to say hello and nothing else."). Instance left running on the fixed
+image; the one test actor and its atespace's actor deleted, no other
+resources created (`ate-node`/v1 and `substrate-k3s` untouched).
+
+**2. `hack/gate.sh` against a local node.** Root cause: the `turn()`
+helper called `curl` with `Authorization: Bearer $(gcloud auth
+print-identity-token)` unconditionally, and the raw-401 egress check ran
+`curl` *inside the actor sandbox*, whose image (`demo/pi-durable`'s own
+Dockerfile, `node:24-slim`) carries node but no curl.
+
+Fix: `bearerToken()` returns nothing when `$ATE_URL` is `localhost`/
+`127.0.0.1` or `ATE_NO_AUTH=1` is set (a local node has no IAM to pass);
+`postSubmit()` replaces the host-side `curl` with a small `node -e
+fetch(...)` script, since a verification run driving this script from
+inside an actor-like image needs something that image ships; the
+sandbox-side `rawFetch` check does the same swap. The 401 check also
+moved onto its own fresh actor (`proxy-check`) rather than reusing
+`demo-agent-fork`'s own conversation: measured directly that asking the
+model to run that exact command, unchanged, in a conversation that had
+just run the two DNS-refusal checks got refused ("could be used to test
+credential/authentication bypasses"), twice, while the identical command
+as a single turn on a brand-new actor got a plain `status 401` both
+times — conversation-level anchoring, not a wording problem the prompt
+could fix.
+
+Verified: `ATE_URL=http://localhost:8080 AS=<name> bash hack/gate.sh`
+against a plain `sudo -E ate-ish` on this VM, full sequence (create,
+turn 1, suspend, tag, fork, two divergent turns, both DNS-refusal checks,
+the listed-host-no-header 401 check, `get actors|tags|workers`):
+**exit 0.**
+
+**3. Secret Manager credentials under `sudo` without `-E`
+(`internal/store/bucket.go`, `internal/egress/egress.go`).** Root cause:
+`GoogleHTTPClient`'s fallback, `gcloudTokenSource`, runs `gcloud auth
+print-access-token`, which reads gcloud's own config from `$HOME`; `sudo
+ate-ish` (no `-E`) leaves `$HOME` at root's own home, which has no
+gcloud login, so the call fails outright with no account to fall back
+to.
+
+Fix: `sudoUserGcloudConfigDir` reports `SUDO_USER`'s own
+`~/.config/gcloud` only when euid is 0, `SUDO_USER` is set to someone
+other than root, and `$HOME` still reads `/root` (meaning `-E` was not
+used — a non-root run or `sudo -E` never takes this branch, since `$HOME`
+already names the real invoking user's home then).
+`gcloudTokenSource.Token()` retries with `CLOUDSDK_CONFIG` pointed at
+that directory before giving up; its error, if both attempts fail, names
+both `$HOME`s it tried. `internal/egress/egress.go`'s `secrets.get` logs
+one line naming the `credentialUri` and that error when a Secret Manager
+request fails — the one place that knows which URI was being resolved.
+
+Verified directly: `sudo env -u SUDO_USER HOME=/root ate-ish` (simulating
+no usable fallback at all) produces exactly one clear log line —
+`could not resolve a Secret Manager credentialUri
+credentialUri=ate-secret://secretmanager.googleapis.com/daniel-junk/ai-gateway-token
+err="... gcloud auth print-access-token (HOME=/root): exit status 1"` —
+and the actor's turn fails cleanly rather than hanging. Plain `sudo
+ate-ish` (no `-E`, real `SUDO_USER=exedev`) resolves the same secret and
+completes a real turn ("Hi! 👋 How can I help you today?"), no log line
+at all (resolution succeeded via the fallback). `sudo -E ate-ish`
+(unaffected by this change, `$HOME` already correct) also resolves it.
+
+**Also:** `docs/demos.md` gained a "Same-host two-node recipe" section
+(`ATE_LISTEN`/`ATE_READY_PORT`/`ATE_ATUNNEL_PORT`/`ATE_CONNECT_PORT` per
+node, node B under `unshare --mount --propagation private` with its own
+`/var/lib/ate` bind mount, matching stage 4's own findings updated for
+the current command surface — no `serve` subcommand, `ATE_LISTEN` not
+`PORT`). The port/mount mechanics were smoke-tested directly (a stray
+process from an earlier test occupying the same control ports reproduced
+the exact collision the recipe's disjoint-port env vars exist to avoid,
+confirming the mechanism); a full two-node run against a real bucket hit
+a pre-existing, unrelated "not found" error at node startup
+(`store.ErrNotFound` somewhere in the lease-write path) that reproduces
+identically on the pre-fix-pass `HEAD` with no `ATE_BUCKET` change of any
+kind — confirmed not caused by anything in this fix pass, and not
+chased further (out of this fix pass's scope). The README's own fleet
+section (separate machines) is unaffected and unchanged.
+
+Gates: `gofmt -l .` (excluding `third_party`), `go build ./...`, `go vet
+./...` all clean; `git status --short third_party` empty throughout (no
+vendored edit beyond the pre-existing Patch 1). One Cloud Run instance
+(`ate-ish-v2`) touched, left running; `ate-node` (v1) and `substrate-k3s`
+untouched. No commit, per the brief.
+
 ## v2 stage 8 (docker) (2026-10-31): the Docker quickstart, real and gated
 
 Item 4 of stage 8 (round 2 left it "built and documented as untested": the

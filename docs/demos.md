@@ -307,6 +307,45 @@ The v2 worker runs substrate's own gVisor worker, so MEMORY fidelity (a runsc ch
 | cursor-agent-sdk (coding-agents-on-substrate) | VOLUMES (default) | Session create and stream, no key, locally only (no key to try on gen2) | None; ran as written, including port 80 | Pass, to the documented stopping point: session created, then `turn.failed` `"Invalid User API Key"` | 5.8 s create, 1.27 s to the failure |
 | substrate `counter` | MEMORY | Built from source, run locally, two suspend/resume cycles | Template's nested `snapshotConfig.preferredFidelity` (a field ate-ish ignores) replaced with a top-level `preferredFidelity: MEMORY` | Pass, the fix for an earlier known failure. The file counter, the in-memory counter, and the rootfs counter all survived two suspend/resume cycles, staying in lockstep | 3 → suspend/resume → 4 → suspend/resume → 5, all three counters equal at each read |
 
+## Same-host two-node recipe
+
+Two nodes on one machine, sharing one bucket, each reachable on its own
+port. This is what a fix-pass verification run needed to exercise the
+gen2 cgroup-helper path and the credential-resolution fallback side by
+side with an ordinary node, without a second machine. It is distinct from
+"Operate a fleet" in the README, which is about separate machines; two
+nodes sharing one host need the extra steps below because
+`ateworker-gvisor`'s own control ports and the vendored worker's fixed
+`/var/lib/ate` path are not node-aware by themselves.
+
+```bash
+# Node A: the ordinary single-node shape, nothing extra.
+sudo -E ATE_BUCKET=<bucket> ATE_DIR=/var/lib/ate-ish-a ATE_LISTEN=8080 \
+  ATE_CAPACITY=4 ate-ish &
+
+# Node B: a disjoint port triple for ateworker-gvisor's own control
+# ports (they bind on the host network namespace, unlike the actor
+# sandboxes, so node A's and node B's would otherwise collide), and a
+# private /var/lib/ate so the vendored worker's fixed
+# WorkerSupportSocket path (and everything else nodepath.BasePath
+# roots there) does not collide with node A's. `unshare --mount
+# --propagation private` first, so the bind mount inside it is
+# invisible to node A and the host.
+sudo -E unshare --mount --propagation private -- bash -c '
+  mkdir -p /var/lib/ate /var/lib/ate-b
+  mount --bind /var/lib/ate-b /var/lib/ate
+  export ATE_BUCKET=<bucket> ATE_DIR=/var/lib/ate-ish-b ATE_LISTEN=8081 \
+    ATE_CAPACITY=4
+  export ATE_READY_PORT=29080 ATE_ATUNNEL_PORT=29443 ATE_CONNECT_PORT=29444
+  exec ate-ish
+'
+```
+
+Either node's `--endpoint`/`ATE_URL` accepts every verb for every actor on
+the shared bucket; a request that names an actor another node currently
+hosts gets proxied there. `ate-ish get workers` from either node lists
+both.
+
 ## Cleanup (v1/v2-era commands)
 
 ```bash

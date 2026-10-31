@@ -73,7 +73,6 @@ What differs on Cloud Run gen2:
 
 - Cloud Run gen2's own root filesystem is already an overlay, so ate-ish copies the node's filesystem once per instance onto a real (non-overlay) volume and uses that copy as every actor's rootfs base, adding memory and startup time at every instance start; see `docs/measurements.md`. This is why the command above gives it an in-memory volume to land in.
 - gen2 exposes only the `hugetlb` cgroup controller to the container; `memory` and `cpu` are bound to cgroup v1 hierarchies the container cannot reach. ate-ish detects this and runs the worker with `--ignore-cgroups` plus a one-line patch to substrate's own code (`third_party/substrate/VENDOR.md`'s Patch 1), so actors on gen2 get no cpu, memory, or pids accounting or limit at all.
-- An instance's first boot can fail while the node sets up the worker's cgroup and be restarted by Cloud Run's restart policy; the cause is a boot-time race in how the node detects the controllers it has, tracked in `docs/PROGRESS.md`.
 - One instance is one node. A fleet on Cloud Run is more instances, each with the same `--set-env-vars=ATE_BUCKET=<same bucket>`.
 - Credentials for egress policies come from Secret Manager through the instance's service account; grant it `secretAccessor` on each secret the policy names.
 - gen2 gives the container root and all of the worker's capability set except `MKNOD`. Cloud Run does not document this, so it can change.

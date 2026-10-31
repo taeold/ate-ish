@@ -394,6 +394,14 @@ func (s *secrets) get(ctx context.Context, uri string) (string, error) {
 		"https://secretmanager.googleapis.com/v1/projects/"+project+"/secrets/"+secret+"/versions/latest:access", nil)
 	resp, err := s.client.Do(req)
 	if err != nil {
+		// store.GoogleHTTPClient's own token sources (ADC, then `gcloud
+		// auth print-access-token`) describe which account path each one
+		// tried in their own error text (store.gcloudTokenSource's own
+		// doc comment); naming the credentialUri here, in the one place
+		// that knows it, turns that into one line that says both what
+		// failed to resolve and why.
+		slog.Error("could not resolve a Secret Manager credentialUri",
+			"credentialUri", uri, "err", err)
 		return "", err
 	}
 	defer resp.Body.Close()

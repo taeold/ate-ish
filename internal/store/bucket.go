@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/user"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -51,17 +53,62 @@ func GoogleHTTPClient(ctx context.Context) *http.Client {
 // print-access-token` on every call. gcloud caches and refreshes the
 // underlying credential itself, so this just adds one process spawn
 // (tens of milliseconds) to the token refresh path, not to every request.
+//
+// `sudo ate-ish` (no -E) loses the invoking user's own HOME: root's gcloud
+// config at $HOME/.config/gcloud (now /root/.config/gcloud) has no login
+// of its own, so this failed outright until this process also tried
+// SUDO_USER's own gcloud config directory. `sudo -E` (HOME preserved) or a
+// non-root run never takes that branch; sudoUserGcloudConfigDir reports
+// false for either.
 type gcloudTokenSource struct{}
 
 func (gcloudTokenSource) Token() (*oauth2.Token, error) {
-	out, err := exec.Command("gcloud", "auth", "print-access-token").Output()
-	if err != nil {
-		return nil, fmt.Errorf("gcloud auth print-access-token: %w", err)
+	out, primaryErr := exec.Command("gcloud", "auth", "print-access-token").Output()
+	if primaryErr == nil {
+		return tokenFromOutput(out), nil
 	}
+	altConfig, ok := sudoUserGcloudConfigDir()
+	if !ok {
+		return nil, fmt.Errorf("gcloud auth print-access-token (HOME=%s): %w", os.Getenv("HOME"), primaryErr)
+	}
+	cmd := exec.Command("gcloud", "auth", "print-access-token")
+	cmd.Env = append(os.Environ(), "CLOUDSDK_CONFIG="+altConfig)
+	out, altErr := cmd.Output()
+	if altErr != nil {
+		return nil, fmt.Errorf("gcloud auth print-access-token: failed under this process's own HOME=%s (%v), and under SUDO_USER %s's own gcloud config at %s (%v)",
+			os.Getenv("HOME"), primaryErr, os.Getenv("SUDO_USER"), altConfig, altErr)
+	}
+	return tokenFromOutput(out), nil
+}
+
+func tokenFromOutput(out []byte) *oauth2.Token {
 	// A short expiry, well inside gcloud's own ~1h token lifetime, so
 	// oauth2's reuse-until-expired wrapper (which treats a zero Expiry as
 	// "never expires") calls back here instead of using one token forever.
-	return &oauth2.Token{AccessToken: strings.TrimSpace(string(out)), TokenType: "Bearer", Expiry: time.Now().Add(5 * time.Minute)}, nil
+	return &oauth2.Token{AccessToken: strings.TrimSpace(string(out)), TokenType: "Bearer", Expiry: time.Now().Add(5 * time.Minute)}
+}
+
+// sudoUserGcloudConfigDir reports SUDO_USER's own gcloud config directory
+// (~/.config/gcloud), but only when this process is plausibly root under a
+// `sudo` that did not carry HOME through: euid 0, SUDO_USER set to someone
+// other than root, and HOME still reading as root's own home ("/root"),
+// meaning `sudo -E` was not used. `sudo -E` (or a non-root run) never
+// reaches this: HOME already names the real invoking user's home in that
+// case, and google.DefaultTokenSource/gcloud's own default lookup already
+// find whatever is there.
+func sudoUserGcloudConfigDir() (string, bool) {
+	if os.Geteuid() != 0 || os.Getenv("HOME") != "/root" {
+		return "", false
+	}
+	name := os.Getenv("SUDO_USER")
+	if name == "" || name == "root" {
+		return "", false
+	}
+	u, err := user.Lookup(name)
+	if err != nil {
+		return "", false
+	}
+	return filepath.Join(u.HomeDir, ".config", "gcloud"), true
 }
 
 const gcs = "https://storage.googleapis.com"
