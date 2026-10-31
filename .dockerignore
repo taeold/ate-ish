@@ -2,4 +2,4 @@ bin/ate-ish
 bin/ateworker-gvisor
 .git/
 demo/
-runs/
+docs/

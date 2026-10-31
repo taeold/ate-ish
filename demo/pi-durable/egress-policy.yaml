@@ -1,0 +1,8 @@
+rules:
+- https:
+    hostnames:
+    - "generativelanguage.googleapis.com"
+    effects:
+      replaceHeaders:
+      - header: x-goog-api-key
+        credentialUri: ate-secret://secretmanager.googleapis.com/daniel-junk/gemini-api-key

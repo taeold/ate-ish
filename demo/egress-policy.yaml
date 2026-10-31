@@ -1,8 +1,0 @@
-rules:
-- https:
-    hostnames:
-    - "generativelanguage.googleapis.com"
-    effects:
-      replaceHeaders:
-      - header: x-goog-api-key
-        credentialUri: ate-secret://k8s.io/default/ate-demo-pi/llm-credentials/gemini-api-key

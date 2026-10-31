@@ -1,0 +1,39 @@
+metadata:
+  atespace: ate-demo-counter
+  name: counter
+workerSelector:
+  matchLabels:
+    workload: counter
+containers:
+- name: counter
+  image: counter-demo:latest
+  command:
+  - /counter
+  wakeupProbe:
+    httpGet:
+      path: /readyz
+      port: 80
+    timeoutSeconds: 30
+  volumeMounts:
+  - name: data
+    mountPath: /home/counter
+resources:
+  limits:
+  - name: cpu
+    quantity: "1"
+  - name: memory
+    quantity: 512Mi
+# MEMORY, so a suspend captures process memory as well as the durable
+# volume, and the in-memory counter really does continue across
+# suspend/resume. With VOLUMES (ate-ish's default), only the file counter
+# would survive and the in-memory one would restart from zero.
+preferredFidelity: MEMORY
+snapshotConfig:
+  onPause: SNAPSHOT_CONTENT_SCOPE_DATA
+  onCommit: SNAPSHOT_CONTENT_SCOPE_DATA
+sandboxConfig:
+  sandboxClass: SANDBOX_CLASS_GVISOR
+  configName: gvisor-default
+volumes:
+- name: data
+  durableDir: {}
