@@ -34,17 +34,37 @@ ate-ish runs it. When they outgrow ate-ish, the same files go to substrate.
 - Anything about a platform it runs on beyond what the README's limits
   section states for that platform.
 
+## Command surface (decided 2026-10-31)
+
+One binary, one daemon, kubectl-ate's verbs. No `dev`, no `deploy`.
+
+- `ate-ish` with no arguments runs a node: role all, a local directory for
+  state unless ATE_BUCKET names a bucket, runsc fetched if missing. The same
+  invocation on a laptop (root, or a privileged container on macOS), a VM,
+  or a Cloud Run gen2 instance. The node pulls actor images itself: from
+  the local Docker daemon when one is reachable, else from the registry
+  the template names.
+- `ate-ish create actor-template -f template.yaml`, `create actor`,
+  `create egress-policy`, `create tag`, `suspend actor`, `delete actor`,
+  `get actors|tags|workers`, all against `--endpoint` (default
+  http://localhost:8080). Deploying an actor is creating a template and an
+  actor against a node. Nothing else.
+- Putting a node on Cloud Run is one `gcloud beta run instances create`
+  line with the ate-ish image, documented in the README under its own
+  heading with its limits. A fleet is more nodes pointed at one bucket.
+- The user brings an image (a Dockerfile they build). Rebuilding and
+  redeploying is their loop, as with kind. No watch mode, no source mounts.
+
 ## Targets, in the order the README presents them
 
-1. Laptop or dev box: `docker run --privileged ... ate-ish dev`, or
-   `sudo ate-ish dev` on Linux. Local directory store. Actor rootfs from
-   the template's image. This is the primary target and the one the
-   quickstart shows.
+1. Laptop or dev box: `sudo ate-ish` on Linux, or
+   `docker run --privileged ... ate-ish` on macOS. Local directory store.
+   Actor rootfs from the template's image. This is the primary target and
+   the one the quickstart shows.
 2. A VM you own (GCE or anything else): the same binary as a service,
    bucket store, two or three nodes over one bucket. The k3s-style
    "small install you keep".
-3. Cloud Run gen2 instance: `ate-ish deploy`. One command, with its
-   limits stated: in-memory rootfs copy at boot, no per-actor cgroup
+3. Cloud Run gen2 instance: the gcloud line. With its limits stated: in-memory rootfs copy at boot, no per-actor cgroup
    limits, single node, undocumented capability dependency.
 
 Cloud Run is a target, not the design center. Its findings (overlayfs
