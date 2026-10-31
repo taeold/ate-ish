@@ -5,9 +5,19 @@ Cloud Run's constraints.
 
 ## One sentence
 
-ate-ish is the easiest way to run Agent Substrate actors: one binary, a
-directory or a bucket, your Linux box, Docker, a VM, or Cloud Run, and the
-same templates, egress policies and actor contract as Agent Substrate.
+ate-ish is the best of celld and Agent Substrate: celld's shape, one
+daemon per machine and a bucket as the whole control plane, running Agent
+Substrate's actors under Agent Substrate's own worker, with the same
+templates, egress policies and actor contract. It runs on a Linux box, in
+Docker, on a VM, or on Cloud Run, and is exclusive to none of them.
+
+From celld: one binary, a fleet is the nodes sharing a bucket, conditional
+writes are the lock, no database, no membership protocol, a directory for
+local development, idle actors cost nothing. From Agent Substrate: the
+actor, its YAML, its header, and its worker (gVisor isolation, per-actor
+network with egress policy at the edge, checkpoint and restore with memory
+fidelity, tags and forks), vendored rather than reimplemented. Ours is the
+thin layer between them.
 
 ## What it is for
 
