@@ -11,6 +11,15 @@ TEMPLATE=${TEMPLATE:-demo/template-gateway.yaml}
 POLICY=${POLICY:-demo/egress-policy-gateway.yaml}
 : "${ATE_URL:?set ATE_URL}"
 export ATE_URL
+# Stage 8: a template's containers[0].image, previously always ignored, is
+# now the actor's rootfs by default once it is set — and demo/template.yaml
+# and demo/template-gateway.yaml both carry one (a Cloud Run-only image
+# reference, left over from before "image" meant anything). The *server*
+# this gate drives needs ATE_ROOTFS=host to keep the pre-stage-8 behaviour
+# (the node's own filesystem) these demos still depend on: deploy.sh's own
+# play/scale env vars set it; a local `ate-ish serve` run by hand needs
+# ATE_ROOTFS=host added to it too, until these templates name a real,
+# pullable image for `ate-ish dev`'s own path instead.
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 sed "s|atespace: ate-demo-pi|atespace: $AS|" "$TEMPLATE" > "$work/template.yaml"

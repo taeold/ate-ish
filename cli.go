@@ -17,7 +17,7 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
-const usage = `usage: ate-ish VERB KIND [NAME] [flags]     (server: $ATE_URL, auth: gcloud identity token)
+const usage = `usage: ate-ish VERB KIND [NAME] [flags]     (server: $ATE_URL, auth: gcloud identity token if available)
   ate-ish create atespace NAME
   ate-ish create actor-template -f FILE
   ate-ish create actor NAME --template T [--tag TAG] -a ATESPACE
@@ -141,7 +141,10 @@ func yamlFile(path string) ([]byte, error) {
 	return yaml.YAMLToJSON(data)
 }
 
-// call sends one admin request to $ATE_URL with a gcloud identity token.
+// call sends one admin request to $ATE_URL, with a gcloud identity token
+// when gcloud is available and logged in (Cloud Run's own IAM needs it).
+// A local `ate-ish dev` node checks no such token itself, so a laptop with
+// no gcloud at all (or one just not logged in) still drives it fine.
 func call(method, path string, body any) ([]byte, error) {
 	base := os.Getenv("ATE_URL")
 	if base == "" {
@@ -151,12 +154,10 @@ func call(method, path string, body any) ([]byte, error) {
 	if !ok && body != nil {
 		data, _ = json.Marshal(body)
 	}
-	token, err := exec.Command("gcloud", "auth", "print-identity-token").Output()
-	if err != nil {
-		return nil, fmt.Errorf("gcloud auth print-identity-token: %w", err)
-	}
 	req, _ := http.NewRequest(method, strings.TrimSuffix(base, "/")+path, bytes.NewReader(data))
-	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(token)))
+	if token, err := exec.Command("gcloud", "auth", "print-identity-token").Output(); err == nil {
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(token)))
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, err

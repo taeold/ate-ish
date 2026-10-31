@@ -33,17 +33,25 @@ type bucket struct {
 }
 
 func newBucket(ctx context.Context, name string) (*bucket, error) {
+	return &bucket{name: name, client: googleHTTPClient(ctx)}, nil
+}
+
+// googleHTTPClient returns an http.Client authenticated as Google Cloud's
+// own Application Default Credentials, falling back to the gcloud user
+// login's own token when ADC is not set up (no metadata server, no
+// GOOGLE_APPLICATION_CREDENTIALS, no `gcloud auth application-default
+// login`, which needs a browser this shell cannot drive). Used both for
+// the GCS store and, regardless of which store backend is running, for
+// Secret Manager access from the egress gateway (egress.go's secrets type):
+// a local-directory dev node still resolves
+// ate-secret://secretmanager.googleapis.com/... credentials through
+// whichever of these two sources is available on the laptop.
+func googleHTTPClient(ctx context.Context) *http.Client {
 	ts, err := google.DefaultTokenSource(ctx, "https://www.googleapis.com/auth/cloud-platform")
 	if err != nil {
-		// No Application Default Credentials file on this machine (no
-		// metadata server, no GOOGLE_APPLICATION_CREDENTIALS, no `gcloud
-		// auth application-default login`, which needs a browser this
-		// shell cannot drive). Fall back to the gcloud user login's own
-		// token, the same source cli.go's call() already uses for the
-		// admin API's bearer token.
 		ts = gcloudTokenSource{}
 	}
-	return &bucket{name: name, client: oauth2.NewClient(ctx, ts)}, nil
+	return oauth2.NewClient(ctx, ts)
 }
 
 // gcloudTokenSource gets a fresh access token from `gcloud auth

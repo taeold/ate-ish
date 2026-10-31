@@ -39,22 +39,38 @@ var (
 // are stable parts of the vendored worker's own contract, so ate-ish names
 // them directly rather than importing actornet just for two strings.
 const (
-	actorVethIP       = "169.254.17.2"
-	gatewayNSSuffix   = "-at"
-	runscReleaseDir   = "bin/runsc"
-	workerBinaryInBin = "bin/ateworker-gvisor"
-	workerKodataPath  = "third_party/substrate/cmd/ateworker-gvisor/kodata"
+	actorVethIP     = "169.254.17.2"
+	gatewayNSSuffix = "-at"
 )
+
+// ateIshHome is where bin/ateworker-gvisor, bin/runsc and
+// third_party/substrate/.../kodata live: cwd by default (serve and
+// deploy's own ate-ish binary always runs with cwd there already, the
+// repo root locally or /ate-ish in the published image), overridable with
+// ATE_ISH_HOME for `ate-ish dev`, which runs with the actor's own
+// directory as cwd instead (see dev.go).
+func ateIshHome() string { return env("ATE_ISH_HOME", "") }
+
+// runscReleaseDir: ATE_RUNSC_DIR overrides it directly, used by `ate-ish
+// dev` (dev.go) to point at a copy it fetches into the dev dir itself
+// rather than into ateIshHome.
+func runscReleaseDir() string {
+	return env("ATE_RUNSC_DIR", filepath.Join(ateIshHome(), "bin/runsc"))
+}
+func workerBinaryInBin() string { return filepath.Join(ateIshHome(), "bin/ateworker-gvisor") }
+func workerKodataPath() string {
+	return filepath.Join(ateIshHome(), "third_party/substrate/cmd/ateworker-gvisor/kodata")
+}
 
 // worker is ate-ish acting as both atelet and worker-pool node: it runs the
 // vendored ateworker-gvisor as a subprocess, serves it the one atelet RPC
 // surface it needs (internal/devatelet), fronts its own egress gateway
 // (egress.go), and drives actor lifecycle over ateworkerpb.
 type worker struct {
-	id     string
-	addr   string
-	dir    string // base dir for actor state, e.g. /var/lib/ate-ish
-	bucket *bucket
+	id    string
+	addr  string
+	dir   string // base dir for actor state, e.g. /var/lib/ate-ish
+	store store
 
 	pki         *devatelet.PKI
 	ateletSrv   *grpc.Server
@@ -97,7 +113,7 @@ func (h *hosted) key() string { return h.as + "/" + h.name }
 // reachable only from inside its gateway network namespace (see nsdial.go).
 func (h *hosted) addr() string { return fmt.Sprintf("%s:%d", actorVethIP, h.port) }
 
-func newWorker(ctx context.Context, b *bucket, addr string, capacity int, dir string) (*worker, error) {
+func newWorker(ctx context.Context, b store, addr string, capacity int, dir string) (*worker, error) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
@@ -121,7 +137,7 @@ func newWorker(ctx context.Context, b *bucket, addr string, capacity int, dir st
 	if err != nil {
 		return nil, fmt.Errorf("loading the gateway's own credential: %w", err)
 	}
-	gateway, err := startEgressGateway("127.0.0.1:0", gwCert, pki.NodeCAPEM(), b)
+	gateway, err := startEgressGateway("127.0.0.1:0", gwCert, pki.NodeCAPEM(), b, googleHTTPClient(ctx))
 	if err != nil {
 		return nil, fmt.Errorf("starting the egress gateway: %w", err)
 	}
@@ -138,8 +154,8 @@ func newWorker(ctx context.Context, b *bucket, addr string, capacity int, dir st
 
 	podUID := "ate-ish-" + randomHex(4)
 	cmd, cgroupLeaf, err := startAteworker(ateworkerConfig{
-		binary:      workerBinaryInBin,
-		kodata:      workerKodataPath,
+		binary:      workerBinaryInBin(),
+		kodata:      workerKodataPath(),
 		podUID:      podUID,
 		nodeTag:     filepath.Base(dir),
 		maxActors:   capacity,
@@ -162,7 +178,7 @@ func newWorker(ctx context.Context, b *bucket, addr string, capacity int, dir st
 	}
 
 	w := &worker{
-		id: "w-" + randomHex(4), addr: addr, dir: dir, bucket: b,
+		id: "w-" + randomHex(4), addr: addr, dir: dir, store: b,
 		pki: pki, ateletSrv: ateletSrv, gateway: gateway,
 		workerPID: cmd.Process.Pid, workerConn: conn, client: ateworkerpb.NewWorkerClient(conn),
 		cgroupLeaf:  cgroupLeaf,
@@ -275,7 +291,7 @@ func (w *worker) current(ctx context.Context, h *hosted) error {
 		return fmt.Errorf("%w: %s", errStopping, h.key())
 	}
 	var rec Actor
-	if _, err := w.bucket.get(ctx, actorKey(h.as, h.name), &rec); err != nil {
+	if _, err := w.store.get(ctx, actorKey(h.as, h.name), &rec); err != nil {
 		return err
 	}
 	if rec.Owner != w.id || rec.Generation != h.gen {
@@ -291,7 +307,7 @@ func (w *worker) current(ctx context.Context, h *hosted) error {
 func (w *worker) start(ctx context.Context, h *hosted, recordGen int64) error {
 	key := actorKey(h.as, h.name)
 	var rec Actor
-	gen, err := w.bucket.get(ctx, key, &rec)
+	gen, err := w.store.get(ctx, key, &rec)
 	if err != nil {
 		return err
 	}
@@ -299,7 +315,7 @@ func (w *worker) start(ctx context.Context, h *hosted, recordGen int64) error {
 		return fmt.Errorf("%w: the record of %s changed", errConflict, h.key())
 	}
 	rec.Status, rec.Owner, rec.Generation = running, w.id, rec.Generation+1
-	if _, err = w.bucket.put(ctx, key, rec, gen); err != nil {
+	if _, err = w.store.put(ctx, key, rec, gen); err != nil {
 		return err
 	}
 	h.gen = rec.Generation
@@ -314,14 +330,14 @@ func (w *worker) release(ctx context.Context, h *hosted) error {
 	for range 5 {
 		var rec Actor
 		var gen int64
-		if gen, err = w.bucket.get(ctx, actorKey(h.as, h.name), &rec); err != nil {
+		if gen, err = w.store.get(ctx, actorKey(h.as, h.name), &rec); err != nil {
 			return err
 		}
 		if rec.Owner != w.id || rec.Generation != h.gen {
 			return nil
 		}
 		rec.Status, rec.Owner = suspended, ""
-		_, err = w.bucket.put(ctx, actorKey(h.as, h.name), rec, gen)
+		_, err = w.store.put(ctx, actorKey(h.as, h.name), rec, gen)
 		if !errors.Is(err, errConflict) && !errors.Is(err, errRateLimited) {
 			return err
 		}
@@ -335,7 +351,7 @@ func (w *worker) release(ctx context.Context, h *hosted) error {
 func (w *worker) boot(ctx context.Context, h *hosted, rec Actor) error {
 	t0 := time.Now()
 	var tmpl Template
-	if _, err := w.bucket.get(ctx, templateKey(h.as, rec.Template), &tmpl); err != nil {
+	if _, err := w.store.get(ctx, templateKey(h.as, rec.Template), &tmpl); err != nil {
 		return fmt.Errorf("template %s: %w", rec.Template, err)
 	}
 	if len(tmpl.Containers) != 1 {
@@ -361,10 +377,22 @@ func (w *worker) boot(ctx context.Context, h *hosted, rec Actor) error {
 	if err := writeSystemInfoFiles(dirs, tmpl, w.gateway.ca.pem); err != nil {
 		return err
 	}
-	if err := stageRunsc(runscReleaseDir, dirs); err != nil {
+	if err := stageRunsc(runscReleaseDir(), dirs); err != nil {
 		return fmt.Errorf("staging runsc: %w", err)
 	}
-	if err := mountBundleRootfs(w.workerPID, dirs, h.cname, w.rootfsLower); err != nil {
+	lowerDir := w.rootfsLower
+	// Stage 8: a template that names an image gets that image's own
+	// filesystem as its rootfs lower, instead of the node's own
+	// filesystem — the primary, laptop-facing path (`ate-ish dev`).
+	// ATE_ROOTFS=host keeps the pre-stage-8 behaviour for the existing
+	// gate scripts' templates, which name no image at all.
+	if image := tmpl.Containers[0].Image; image != "" && env("ATE_ROOTFS", "") != "host" {
+		var err error
+		if lowerDir, err = imageRootfsDir(w.dir, image); err != nil {
+			return fmt.Errorf("preparing %s's rootfs: %w", image, err)
+		}
+	}
+	if err := mountBundleRootfs(w.workerPID, dirs, h.cname, lowerDir); err != nil {
 		return fmt.Errorf("mounting bundle rootfs: %w", err)
 	}
 
@@ -372,7 +400,7 @@ func (w *worker) boot(ctx context.Context, h *hosted, rec Actor) error {
 	snapshotTar := filepath.Join(dirs.pb.GetRootDir(), "snapshot.tar.gz")
 	fidelity := fidelityOf(tmpl)
 	var bootErr error
-	switch err := w.bucket.downloadFile(ctx, snapshotKey(h.as, h.name), snapshotTar); {
+	switch err := w.store.downloadFile(ctx, snapshotKey(h.as, h.name), snapshotTar); {
 	case err == nil:
 		defer os.Remove(snapshotTar)
 		if err := untarDir(snapshotTar, dirs.pb.GetCheckpointDir()); err != nil {
@@ -500,10 +528,10 @@ func (w *worker) suspend(ctx context.Context, key string) error {
 	}
 	var rec Actor
 	if err == nil {
-		_, err = w.bucket.get(ctx, actorKey(h.as, h.name), &rec)
+		_, err = w.store.get(ctx, actorKey(h.as, h.name), &rec)
 	}
 	if err == nil && rec.Owner == w.id && rec.Generation == h.gen {
-		err = w.bucket.uploadFile(ctx, snapshotKey(h.as, h.name), snapshotTar)
+		err = w.store.uploadFile(ctx, snapshotKey(h.as, h.name), snapshotTar)
 	}
 	uploaded := time.Since(t0)
 	size := fileSize(snapshotTar)
@@ -573,7 +601,7 @@ func (w *worker) suspendAll(ctx context.Context) {
 		wg.Go(func() { slog.Info("suspend on shutdown", "actor", key, "err", w.suspend(ctx, key)) })
 	}
 	wg.Wait()
-	slog.Info("lease deleted", "err", w.bucket.delete(ctx, leaseKey(w.id)))
+	slog.Info("lease deleted", "err", w.store.delete(ctx, leaseKey(w.id)))
 	if w.gateway != nil {
 		w.gateway.Close()
 	}
@@ -655,7 +683,7 @@ func (w *worker) writeLease(ctx context.Context) error {
 		}
 	}
 	w.mu.Unlock()
-	gen, err := w.bucket.put(ctx, leaseKey(w.id), lease, w.leaseGen)
+	gen, err := w.store.put(ctx, leaseKey(w.id), lease, w.leaseGen)
 	if err == nil {
 		w.leaseGen = gen
 	}

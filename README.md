@@ -1,6 +1,42 @@
 # ate-ish
 
-ate-ish is a small [Agent Substrate](https://github.com/agent-substrate/substrate) for Cloud Run: one binary, one bucket, no cluster. Write an Agent Substrate actor (a Dockerfile, a `template.yaml`, and optionally an `egress-policy.yaml`), and deploy it to Cloud Run in one command:
+ate-ish is the easiest way to run [Agent Substrate](https://github.com/agent-substrate/substrate) actors: one binary, a directory or a bucket, your laptop, Docker, a VM, or Cloud Run — the same templates, egress policies, and CLI verbs as Agent Substrate. Write an actor (a Dockerfile, a `template.yaml`, and optionally an `egress-policy.yaml`) and run it locally in one command:
+
+```bash
+export AI_GATEWAY_API_KEY=...   # or a GEMINI_API_KEY, whatever your egress policy names
+
+cd your-actor-directory   # holds Dockerfile, template.yaml, egress-policy.yaml
+sudo ate-ish dev -f template.yaml -e egress-policy.yaml
+```
+
+or, with no local Go toolchain or checkout at all, the same command through Docker:
+
+```bash
+docker run --privileged -v "$PWD":/work -w /work -p 8080:8080 \
+  us-central1-docker.pkg.dev/daniel-junk/ate-ish/ate-ish:latest \
+  dev -f template.yaml -e egress-policy.yaml
+```
+
+Run it from the actor's own directory (where its `Dockerfile` lives). `ate-ish dev` builds that Dockerfile, exports the resulting image's filesystem once as the actor's rootfs, fetches `runsc` if it is not already staged, starts one node with a local-directory store under `./.ate-ish/dev`, creates the atespace and one actor from the template, uploads the egress policy, and prints the `export ATE_URL=...` line and a ready-to-paste `curl` with the actor header. It keeps running in the foreground until Ctrl-C, which suspends the actor and exits cleanly. `--clean` wipes `./.ate-ish/dev` first; `--dir` and `--port` override the defaults.
+
+Before you run it:
+
+- A template that leaves `command` to the image's own `CMD`/`ENTRYPOINT` (as the upstream demos' templates do) gets it filled in automatically, read from the image `dev` just built; otherwise `ate-ish` does not read the image's configuration.
+- An egress policy's `credentialUri` resolves two ways locally: `ate-secret://secretmanager.googleapis.com/<project>/<secret>`, read through `gcloud`'s Application Default Credentials if you have a GCP project set up, or `ate-secret://env/<VAR>`, read straight from an exported environment variable — no GCP project needed at all.
+- `ate-ish dev` runs the vendored gVisor worker, which needs root (cgroup delegation, network namespaces, nftables): `sudo`, or `--privileged` through Docker.
+- The CLI's `get`/`suspend`/`create tag`/fork verbs (see below) work the same way against a local `ate-ish dev` node as against Cloud Run: `export ATE_URL=http://127.0.0.1:8080` and no `gcloud` login is required locally.
+
+## Targets
+
+1. **Laptop or dev box** (above): local directory store, the actor's rootfs exported from its own image. The primary target.
+2. **A VM you own**: the same binary as a service (`ate-ish serve`), a GCS bucket store, two or three nodes over one bucket.
+3. **Cloud Run gen2** (`ate-ish deploy`, below): one command, with its limits stated — in-memory rootfs copy at boot, no per-actor cgroup limits, single node.
+
+Cloud Run is a target, not the design center. Its own findings are documented facts for the platform conversation, not constraints the rest of the design bends around.
+
+## Deploy to Cloud Run
+
+Write an Agent Substrate actor and deploy it to Cloud Run in one command:
 
 ```bash
 go install github.com/taeold/ate-ish@latest   # or: download a release binary
@@ -339,6 +375,7 @@ What bounds them. Booting is Node starting pi-durable inside gVisor, and four bo
 - **No per-sandbox CPU or memory limit.** The launcher sets none. `resources` in the template is stored and ignored, and a worker counts slots (`ATE_CAPACITY`, 4).
 - **On Cloud Run gen2, actors get no per-actor cgroup resource limits at all, by platform design, not by choice.** gen2 is a hybrid cgroup host: it exposes only the `hugetlb` controller to the container's own cgroup v2 root; `memory` and `cpu` are bound to cgroup v1 hierarchies this process cannot reach (measured: a 5-second, 20-attempt retry never saw them appear). ate-ish detects this at node start and runs the worker's own `runsc` with `--ignore-cgroups` plus a one-line patch (`third_party/substrate/VENDOR.md`'s "Patch 1") that skips assigning a per-container cgroup path; actors run with no cpu/memory/pids accounting or limit there, and usage stats report `source: unspecified` instead of real cgroup-backed numbers. On a host that does expose the controllers (this VM, GKE nodes), nothing changes. Cloud Run gen2's own "/" is also already overlayfs, so ate-ish copies the node filesystem once per instance onto an in-memory volume (`--add-volume=type=in-memory`, since `ephemeral-disk` is not supported for Cloud Run Instances) and uses that copy as every actor's rootfs lowerdir; measured 578-588 MB for the `pi-durable` image, comfortably inside a 2Gi volume, taking about 45-50 s once per instance start.
 - **Update a stopped instance after you start it.** On a stopped instance, `instances update --image` changes the spec but does not import the image, and `instances start` runs the previous image (measured once).
+- **`ate-ish dev`'s Docker path needs a docker daemon reachable from inside the container to build the actor's own Dockerfile.** The published `ate-ish` image has no docker daemon inside it (by design: it exports an already-built image's rootfs with `crane`, which needs none), so `docker run --privileged ... dev` can only run an actor whose template already names a pullable image; it cannot build a fresh Dockerfile the way `sudo ate-ish dev` can. See `docs/PROGRESS.md`'s stage 8 notes.
 
 ## Estimated cost
 

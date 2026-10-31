@@ -38,7 +38,12 @@ SECRET=${2:-ai-gateway-token}
 # pi-durable image's own copied rootfs (measured 578-588MB across several
 # gen2 runs).
 ROOTFS_VOLUME_SIZE=${ROOTFS_VOLUME_SIZE:-2Gi}
-ENV="ATE_BUCKET=$BUCKET,ATE_CAPACITY=$CAPACITY"
+# Stage 8: demo/template*.yaml carry a containers[0].image left over from
+# before that field meant anything (a Cloud Run-only reference); now that
+# it does, ATE_ROOTFS=host is this script's explicit opt into the
+# pre-stage-8 behaviour (the node's own filesystem) those demos still
+# depend on, until their templates name a real pullable image instead.
+ENV="ATE_BUCKET=$BUCKET,ATE_CAPACITY=$CAPACITY,ATE_ROOTFS=host"
 GC=(--project "$PROJECT" --region "$REGION" --quiet)
 
 sa() {

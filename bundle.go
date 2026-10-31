@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/go-containerregistry/pkg/crane"
 	"github.com/taeold/ate-ish/third_party/substrate/exported/nodepath"
 	"github.com/taeold/ate-ish/third_party/substrate/exported/proto/ateworkerpb"
 )
@@ -237,6 +239,143 @@ func dirSize(dir string) int64 {
 		return nil
 	})
 	return total
+}
+
+// imageRootfsDir exports image's filesystem once into <dir>/rootfs/<digest>
+// and returns that directory, for use as an actor's runsc overlay
+// lowerdir (stage 8: locally, the actor rootfs stops being the host
+// filesystem once a template names an image). Exporting is keyed by the
+// image's own content digest, so a second actor (or a second `ate-ish
+// dev` run) naming the same image reuses the same export instead of
+// re-pulling or re-exporting it.
+//
+// Two export paths, same output shape (a plain directory holding the
+// image's flattened filesystem): `docker create` + `docker export` when a
+// docker daemon is reachable (the common case on a dev box, and what the
+// brief asks for first); otherwise go-containerregistry's crane library
+// (already a direct dependency; vendored packages transitively use it),
+// which needs no daemon at all — the path the published ate-ish base
+// image itself has to use, since `docker run --privileged` gives it no
+// docker-in-docker.
+func imageRootfsDir(dir, image string) (string, error) {
+	digest, dockerAvailable := imageDigest(image)
+	dest := filepath.Join(dir, "rootfs", sanitizeDigest(digest))
+	marker := filepath.Join(dest, ".ate-ish-complete")
+	if _, err := os.Stat(marker); err == nil {
+		return dest, nil
+	}
+	if err := os.RemoveAll(dest); err != nil {
+		return "", err
+	}
+	if err := os.MkdirAll(dest, 0o755); err != nil {
+		return "", err
+	}
+	t0 := time.Now()
+	var exportErr error
+	if dockerAvailable {
+		exportErr = exportImageDocker(image, dest)
+	} else {
+		exportErr = exportImageCrane(image, dest)
+	}
+	if exportErr != nil {
+		os.RemoveAll(dest)
+		return "", fmt.Errorf("exporting %s's rootfs: %w", image, exportErr)
+	}
+	if err := os.WriteFile(marker, []byte(digest), 0o644); err != nil {
+		return "", err
+	}
+	slog.Info("exported image rootfs", "image", image, "digest", digest, "dest", dest,
+		"docker", dockerAvailable, "took_ms", time.Since(t0).Milliseconds())
+	return dest, nil
+}
+
+// imageDigest returns image's content digest and whether a docker daemon
+// answered the lookup (the caller then uses the same tool to export).
+// `docker inspect` first (works for an image only present locally, e.g.
+// one `ate-ish dev` or `docker build` just produced, which crane's
+// registry-only Pull cannot see at all); crane.Digest as the fallback,
+// which needs no daemon.
+func imageDigest(image string) (digest string, dockerAvailable bool) {
+	// ATE_ROOTFS_EXPORT=crane forces the no-daemon path even when docker
+	// itself answers (e.g. a wedged dockerd whose metadata calls still
+	// work but whose `docker run`/cgroup path does not — see
+	// docs/PROGRESS.md's stage 8 cgroup-helper incident notes): useful to
+	// exercise, and gate, the path the published ate-ish image actually
+	// has to use.
+	if env("ATE_ROOTFS_EXPORT", "") != "crane" {
+		if out, err := exec.Command("docker", "inspect", "--format", "{{.Id}}", image).Output(); err == nil {
+			return strings.TrimSpace(string(out)), true
+		}
+	}
+	if d, err := crane.Digest(image); err == nil {
+		return d, false
+	}
+	// Neither resolved a digest (no docker, and crane could not reach the
+	// registry either, e.g. the demo's own locally-built, unpushed image
+	// name): fall back to the image reference string itself as the cache
+	// key. Still correct, just not shared across a rebuild under the same
+	// tag; exportImageDocker/exportImageCrane's own errors catch a truly
+	// missing image either way.
+	useDocker := env("ATE_ROOTFS_EXPORT", "") != "crane" && exec.Command("docker", "image", "inspect", image).Run() == nil
+	return image, useDocker
+}
+
+func sanitizeDigest(d string) string {
+	return strings.NewReplacer(":", "-", "/", "_").Replace(d)
+}
+
+// exportImageDocker is imageRootfsDir's docker path: create a (never
+// started) container from image, export its filesystem as a tar stream,
+// and extract it into dest, exactly as rootfsLowerDir's node-copy path
+// already extracts its own tar stream.
+func exportImageDocker(image, dest string) error {
+	out, err := exec.Command("docker", "create", image).Output()
+	if err != nil {
+		return fmt.Errorf("docker create: %w", err)
+	}
+	cid := strings.TrimSpace(string(out))
+	defer exec.Command("docker", "rm", cid).Run()
+	export := exec.Command("docker", "export", cid)
+	extract := exec.Command("tar", "-C", dest, "--xattrs", "-xpf", "-")
+	pr, pw := io.Pipe()
+	export.Stdout, extract.Stdin = pw, pr
+	var exportErr, extractErr bytes.Buffer
+	export.Stderr, extract.Stderr = &exportErr, &extractErr
+	if err := extract.Start(); err != nil {
+		return err
+	}
+	if err := export.Start(); err != nil {
+		return err
+	}
+	go func() { export.Wait(); pw.Close() }()
+	if err := extract.Wait(); err != nil {
+		return fmt.Errorf("%w (export: %s) (extract: %s)", err, exportErr.String(), extractErr.String())
+	}
+	return nil
+}
+
+// exportImageCrane is imageRootfsDir's no-daemon path: pull the image with
+// go-containerregistry and stream crane.Export's tar straight into tar
+// -x, the same pipe shape exportImageDocker uses.
+func exportImageCrane(image, dest string) error {
+	img, err := crane.Pull(image, crane.WithContext(context.Background()))
+	if err != nil {
+		return fmt.Errorf("crane pull: %w", err)
+	}
+	extract := exec.Command("tar", "-C", dest, "--xattrs", "-xpf", "-")
+	pr, pw := io.Pipe()
+	extract.Stdin = pr
+	var extractErr bytes.Buffer
+	extract.Stderr = &extractErr
+	if err := extract.Start(); err != nil {
+		return err
+	}
+	exportErr := crane.Export(img, pw)
+	pw.Close()
+	if err := extract.Wait(); err != nil {
+		return fmt.Errorf("%w (export: %v) (extract: %s)", err, exportErr, extractErr.String())
+	}
+	return exportErr
 }
 
 // mountBundleRootfs builds containerName's OCI bundle rootfs as a runsc

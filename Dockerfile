@@ -24,4 +24,14 @@ COPY --from=build /ate-ish /usr/local/bin/ate-ish
 COPY --from=build /ateworker-gvisor bin/ateworker-gvisor
 COPY bin/runsc bin/runsc
 COPY third_party/substrate/cmd/ateworker-gvisor/kodata third_party/substrate/cmd/ateworker-gvisor/kodata
-ENTRYPOINT ["/usr/local/bin/ate-ish", "serve"]
+# Stage 8: ATE_ISH_HOME/ATE_RUNSC_DIR tell worker.go/dev.go where
+# ateworker-gvisor, kodata and this already-staged runsc live, since
+# `docker run ... -w /work ...` (ate-ish dev's own invocation) overrides
+# this WORKDIR as the process's cwd. The entrypoint dispatches on argv[1]
+# (main.go): no args keeps today's Cloud Run behaviour (ate-ish serve);
+# `docker run <image> dev -f template.yaml -e egress-policy.yaml` runs
+# ate-ish dev instead.
+ENV ATE_ISH_HOME=/ate-ish
+ENV ATE_RUNSC_DIR=/ate-ish/bin/runsc
+ENTRYPOINT ["/usr/local/bin/ate-ish"]
+CMD ["serve"]

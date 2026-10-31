@@ -58,11 +58,17 @@ type Template struct {
 	PreferredFidelity string `json:"preferredFidelity,omitempty"`
 }
 
-// Container's image field is ignored: actors run from the node image.
+// Container describes the one container every template carries.
 type Container struct {
 	// Name becomes the container's own OCI bundle subdirectory and the
 	// ateworkerpb.Container name; required by the vendored worker.
-	Name    string   `json:"name"`
+	Name string `json:"name"`
+	// Image, when set, is the actor's rootfs: exported once per node into
+	// <dir>/rootfs/<digest> and used as the runsc overlay's lowerdir
+	// (bundle.go's imageRootfsDir), instead of the node's own filesystem.
+	// Empty means the pre-stage-8 behaviour: the node's own filesystem
+	// (bundle.go's rootfsLowerDir), which gate.sh's own demos still use.
+	Image   string   `json:"image,omitempty"`
 	Command []string `json:"command"`
 	Args    []string `json:"args"`
 	Env     []struct {

@@ -105,7 +105,7 @@ type egressGateway struct {
 	ln      net.Listener
 	Addr    string
 	ca      *egressCA
-	bucket  *bucket
+	store   store
 	secrets *secrets
 
 	// resolved caches every IP ever seen for an allowed hostname, keyed by
@@ -123,7 +123,7 @@ type egressGateway struct {
 // identity (verified by the worker's --atunnel-egress-trust-bundle) and
 // nodeCAPEM as the pool that verifies the actor client certificates
 // atunnel presents (the same CA devatelet mints them from).
-func startEgressGateway(addr string, serverCert tls.Certificate, nodeCAPEM []byte, b *bucket) (*egressGateway, error) {
+func startEgressGateway(addr string, serverCert tls.Certificate, nodeCAPEM []byte, b store, secretsClient *http.Client) (*egressGateway, error) {
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(nodeCAPEM) {
 		return nil, fmt.Errorf("egress gateway: node CA trust bundle has no certificates")
@@ -144,8 +144,8 @@ func startEgressGateway(addr string, serverCert tls.Certificate, nodeCAPEM []byt
 		return nil, err
 	}
 	g := &egressGateway{
-		ln: ln, Addr: ln.Addr().String(), ca: ca, bucket: b,
-		secrets:  &secrets{client: b.client, cache: map[string]string{}},
+		ln: ln, Addr: ln.Addr().String(), ca: ca, store: b,
+		secrets:  &secrets{client: secretsClient, cache: map[string]string{}},
 		resolved: map[string]map[string]bool{},
 	}
 	go g.acceptLoop()
@@ -210,7 +210,7 @@ func (g *egressGateway) handle(conn net.Conn) {
 	dest := req.URL.Hostname()
 
 	var rec Actor
-	_, err = g.bucket.get(context.Background(), actorKey(atespace, name), &rec)
+	_, err = g.store.get(context.Background(), actorKey(atespace, name), &rec)
 	if err != nil {
 		slog.Error("egress: reading actor's record", "actor", actor, "err", err)
 		fmt.Fprint(tlsConn, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
@@ -352,10 +352,11 @@ func (g *egressGateway) resolvedAdd(hostname string, ips []string) {
 	}
 }
 
-// secrets reads credentialUri values from Secret Manager. The native form is
+// secrets reads credentialUri values. The native Secret Manager form is
 // ate-secret://secretmanager.googleapis.com/<project>/<secret>; other URIs,
 // like the demo's k8s.io one, map to that form through ATE_SECRET_MAP
-// ("<uri>=<project>/<secret>,...").
+// ("<uri>=<project>/<secret>,..."). ate-secret://env/<VAR> reads this
+// process's own environment instead, no GCP project needed.
 type secrets struct {
 	client *http.Client
 	mu     sync.Mutex
@@ -367,6 +368,18 @@ func (s *secrets) get(ctx context.Context, uri string) (string, error) {
 	defer s.mu.Unlock()
 	if v, ok := s.cache[uri]; ok {
 		return v, nil
+	}
+	// ate-secret://env/<VAR>: read straight from this process's own
+	// environment. No GCP project needed at all; this is what lets
+	// `ate-ish dev` run the Gateway-key demos on a laptop that has never
+	// touched GCP, with the key as a plain exported env var.
+	if v, ok := strings.CutPrefix(uri, "ate-secret://env/"); ok {
+		val, ok := os.LookupEnv(v)
+		if !ok {
+			return "", fmt.Errorf("unknown credentialUri %q: environment variable %s is not set", uri, v)
+		}
+		s.cache[uri] = val
+		return val, nil
 	}
 	name, ok := strings.CutPrefix(uri, "ate-secret://secretmanager.googleapis.com/")
 	for _, m := range strings.Split(os.Getenv("ATE_SECRET_MAP"), ",") {

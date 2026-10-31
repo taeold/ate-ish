@@ -27,7 +27,7 @@ import (
 // names for its DNS query and its CONNECT to resolve and reach the gateway
 // at all. Replacing a placeholder API key with the real secret, inside the
 // gateway's own TLS termination, is stage 3's job.
-func actorPolicyLookup(b *bucket) devatelet.PolicyLookup {
+func actorPolicyLookup(b store) devatelet.PolicyLookup {
 	return func(ctx context.Context, atespace, name string) (*ateletpb.EgressPolicy, error) {
 		var rec Actor
 		if _, err := b.get(ctx, actorKey(atespace, name), &rec); err != nil {

@@ -39,9 +39,9 @@ var ateletSPIFFE = installdefaults.AteletSPIFFEID(installdefaults.SystemNamespac
 // its own leaf.
 func cgroupLeafFor(parent, nodeTag string) string { return parent + "/ate-ish-worker-" + nodeTag }
 
-// currentCgroupPath returns the absolute /sys/fs/cgroup path of this
-// process's own (cgroup v2, "0::") cgroup.
-func currentCgroupPath() (string, error) {
+// currentCgroupPath returns the absolute path, under base (a cgroup2
+// mountpoint), of this process's own (cgroup v2, "0::") cgroup.
+func currentCgroupPath(base string) (string, error) {
 	b, err := os.ReadFile("/proc/self/cgroup")
 	if err != nil {
 		return "", err
@@ -51,31 +51,31 @@ func currentCgroupPath() (string, error) {
 			// rel is "/" when this process's own cgroup already is the
 			// real root (Cloud Run gen2: ate-ish runs as the container's
 			// PID 1, whose cgroup v2 path is "0::/"); path.Join collapses
-			// that to a bare "/sys/fs/cgroup" instead of the trailing
-			// "/sys/fs/cgroup/" string concatenation left, which made
-			// nearestDomainAncestor's "cgroup == /sys/fs/cgroup" root
-			// check never match and go on to read a nonexistent
-			// "/sys/fs/cgroup//cgroup.type".
-			return path.Join("/sys/fs/cgroup", rel), nil
+			// that to a bare base instead of the trailing "base/" string
+			// concatenation left, which made nearestDomainAncestor's
+			// "cgroup == base" root check never match and go on to read
+			// a nonexistent "base//cgroup.type".
+			return path.Join(base, rel), nil
 		}
 	}
 	return "", fmt.Errorf("no cgroup v2 (0::) entry in /proc/self/cgroup")
 }
 
-// nearestDomainAncestor walks up from cgroup until it finds one whose own
-// cgroup.type is the plain "domain" (a cgroup namespace, and clone3's
-// CLONE_INTO_CGROUP, can only root at a domain cgroup). A cgroup whose own
-// type is "domain threaded" (deliberately hosting threaded children, found
-// in this dev VM's own harness cgroup) forces every direct child to
-// "domain invalid", which clone3 refuses outright ("operation not
-// supported") — walking up one level at a time finds the nearest usable
-// ancestor instead of assuming ate-ish's own immediate cgroup always
-// qualifies. Stops at "/sys/fs/cgroup" itself if nothing closer qualifies.
-func nearestDomainAncestor(cgroup string) (string, error) {
+// nearestDomainAncestor walks up from cgroup (under base, a cgroup2
+// mountpoint) until it finds one whose own cgroup.type is the plain
+// "domain" (a cgroup namespace, and clone3's CLONE_INTO_CGROUP, can only
+// root at a domain cgroup). A cgroup whose own type is "domain threaded"
+// (deliberately hosting threaded children, found in this dev VM's own
+// harness cgroup) forces every direct child to "domain invalid", which
+// clone3 refuses outright ("operation not supported") — walking up one
+// level at a time finds the nearest usable ancestor instead of assuming
+// ate-ish's own immediate cgroup always qualifies. Stops at base itself if
+// nothing closer qualifies.
+func nearestDomainAncestor(base, cgroup string) (string, error) {
 	for {
 		// The real root cgroup has no cgroup.type file (only non-root
 		// cgroups do) and is always usable.
-		if cgroup == "/sys/fs/cgroup" {
+		if cgroup == base {
 			return cgroup, nil
 		}
 		typ, err := os.ReadFile(cgroup + "/cgroup.type")
@@ -144,7 +144,7 @@ func stageKodata(dir string, ignoreCgroups bool) (string, error) {
 	if err := os.MkdirAll(staged, 0o755); err != nil {
 		return "", err
 	}
-	raw, err := os.ReadFile(filepath.Join(workerKodataPath, "internal_flags.json"))
+	raw, err := os.ReadFile(filepath.Join(workerKodataPath(), "internal_flags.json"))
 	if err != nil {
 		return "", fmt.Errorf("reading the vendored internal_flags.json: %w", err)
 	}
@@ -255,6 +255,13 @@ func cleanupStaleLeaf(leaf string) {
 // removeWorkerCgroupLeaf is prepareWorkerCgroupLeaf's inverse, best-effort,
 // called on graceful shutdown so a clean stop does not leave the leaf (and
 // the parent's now-unnecessary subtree_control delegation) behind.
+// On the ambient-cgroup2-works path (every host measured so far) leaf is
+// a real, still-mounted path and this cleans it up. On the cgrouphelper.go
+// path (Cloud Run gen2 only), the helper's own private mount namespace,
+// and the mountpoint leaf names, are already gone by the time this runs
+// (the helper exits right after handing back its fd); best-effort cleanup
+// here is then a silent no-op, not a new leak — the whole container's
+// cgroup tree is torn down with it when the sandbox itself is deleted.
 func removeWorkerCgroupLeaf(leaf string) {
 	cleanupStaleLeaf(leaf)
 }
@@ -292,54 +299,33 @@ func startAteworker(cfg ateworkerConfig) (*exec.Cmd, string, error) {
 	_ = exec.Command("pkill", "-9", "-f", selfSafePattern).Run()
 	time.Sleep(300 * time.Millisecond)
 
-	// Stage 5c, real gen2 deploy: ate-ish's own default /sys/fs/cgroup (the
-	// container's ambient view, before any remount) has no
-	// "cgroup.controllers" file at all on gen2 ("no such file or
-	// directory") even at paths that do exist as directories — unlike
-	// every local/VM run, where the ambient mount is already a fully
-	// functional cgroup2 instance. A fresh, explicit remount (the same
-	// lazy-umount-fallback dance the worker's own launch script already
-	// does for itself, stage 5's fix) makes it one; doing it here too, in
-	// ate-ish's own shared mount namespace before reading any cgroup
-	// file, means the discovery and subtree_control work below can trust
-	// what it reads regardless of what gen2's default view looked like.
-	if out, err := exec.Command("bash", "-c",
-		"umount /sys/fs/cgroup 2>&1 || umount -l /sys/fs/cgroup 2>&1; mount -t cgroup2 cgroup2 /sys/fs/cgroup").CombinedOutput(); err != nil {
-		return nil, "", fmt.Errorf("remounting /sys/fs/cgroup for ate-ish's own process: %w (%s)", err, out)
-	}
-
-	ateishCgroup, err := currentCgroupPath()
+	// INCIDENT (2026-10-31): this used to unconditionally run `umount
+	// /sys/fs/cgroup || umount -l /sys/fs/cgroup; mount -t cgroup2 ...`
+	// directly in ate-ish's OWN (shared) mount namespace, on every host.
+	// On this dev VM — a general-purpose host with its own live systemd
+	// and dbus, not a single-container sandbox — that lazily detached the
+	// cgroup2 mount systemd (pid 1) holds system-wide; afterward
+	// `systemctl`/`systemd-run --scope`/anything needing dbus activation
+	// hung, and Docker's systemd cgroup driver could no longer start ANY
+	// container (first misread as a Docker/gVisor-specific "cgroup
+	// activation timeout" — see docs/PROGRESS.md's stage 8 notes). Never
+	// remount /sys/fs/cgroup itself in this process's own namespace again:
+	// prepareWorkerCgroupFD below probes the ambient view read-only first
+	// (every local/VM host, this one included) and only reaches for a
+	// mount at all when that probe fails (so far, only Cloud Run gen2);
+	// even then it is a *fresh, separate* cgroup2 instance at a private
+	// path, mounted inside a throwaway helper subprocess's own private
+	// mount namespace (CLONE_NEWNS) — never this one's, and never
+	// /sys/fs/cgroup itself.
+	leafFD, ateishCgroup, ignoreCgroups, err := prepareWorkerCgroupFD(cfg.nodeTag)
 	if err != nil {
-		return nil, "", fmt.Errorf("finding ate-ish's own cgroup: %w", err)
+		return nil, "", err
 	}
-	ateishCgroup, err = nearestDomainAncestor(ateishCgroup)
-	if err != nil {
-		return nil, "", fmt.Errorf("finding a domain-type ancestor of ate-ish's own cgroup: %w", err)
-	}
+	defer leafFD.Close()
 	leaf := cgroupLeafFor(ateishCgroup, cfg.nodeTag)
-	if err := prepareWorkerCgroupLeaf(leaf); err != nil {
-		return nil, "", fmt.Errorf("preparing the worker's cgroup leaf: %w", err)
-	}
-	leafDir, err := os.Open(leaf)
-	if err != nil {
-		return nil, "", fmt.Errorf("opening the worker's cgroup leaf: %w", err)
-	}
-	defer leafDir.Close()
 
-	// Stage 5e: a hybrid-cgroup host (Cloud Run gen2) exposes no memory/cpu
-	// controller to this container's v2 cgroup at all (stage 5d's finding,
-	// confirmed non-recoverable by retrying); runsc treats both as
-	// mandatory for a per-actor sandbox cgroup unless told
-	// --ignore-cgroups. ATE_IGNORE_CGROUPS=1 forces the flag locally, to
-	// test this path on a host (like this VM) that actually has the
-	// controllers.
-	ignoreCgroups := env("ATE_IGNORE_CGROUPS", "") == "1"
-	if !ignoreCgroups {
-		lacks, err := hostLacksMemoryOrCPU(ateishCgroup)
-		if err != nil {
-			return nil, "", fmt.Errorf("checking which cgroup controllers this host exposes: %w", err)
-		}
-		ignoreCgroups = lacks
+	if env("ATE_IGNORE_CGROUPS", "") == "1" {
+		ignoreCgroups = true
 	}
 	stagedKodata, err := stageKodata(filepath.Dir(cfg.logFile), ignoreCgroups)
 	if err != nil {
@@ -409,7 +395,7 @@ func startAteworker(cfg ateworkerConfig) (*exec.Cmd, string, error) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags:  syscall.CLONE_NEWCGROUP | syscall.CLONE_NEWNS,
 		UseCgroupFD: true,
-		CgroupFD:    int(leafDir.Fd()),
+		CgroupFD:    int(leafFD.Fd()),
 	}
 	if err := cmd.Start(); err != nil {
 		return nil, "", fmt.Errorf("starting ateworker-gvisor: %w", err)

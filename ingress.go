@@ -27,7 +27,7 @@ var (
 // ingress routes requests by the ate-target-actor header and serves the
 // admin API the CLI calls. It keeps no state beyond in-flight placements.
 type ingress struct {
-	bucket  *bucket
+	store   store
 	mu      sync.Mutex
 	placing map[string]*placement
 }
@@ -70,7 +70,7 @@ func (in *ingress) route(rw http.ResponseWriter, r *http.Request) {
 // live worker. Concurrent requests for one actor share one placement.
 func (in *ingress) locate(ctx context.Context, as, name string) *placement {
 	var rec Actor
-	if _, err := in.bucket.get(ctx, actorKey(as, name), &rec); err != nil {
+	if _, err := in.store.get(ctx, actorKey(as, name), &rec); err != nil {
 		return &placement{err: err}
 	}
 	key := as + "/" + name
@@ -112,7 +112,7 @@ func (in *ingress) place(ctx context.Context, as, name string, p *placement) err
 	var parkedSince time.Time
 	for {
 		var rec Actor
-		gen, err := in.bucket.get(ctx, actorKey(as, name), &rec)
+		gen, err := in.store.get(ctx, actorKey(as, name), &rec)
 		if err != nil {
 			return err
 		}
@@ -172,7 +172,7 @@ func (in *ingress) place(ctx context.Context, as, name string, p *placement) err
 // lease reads a worker's lease; a missing one is nil.
 func (in *ingress) lease(ctx context.Context, id string) (*Lease, error) {
 	var l Lease
-	_, err := in.bucket.get(ctx, leaseKey(id), &l)
+	_, err := in.store.get(ctx, leaseKey(id), &l)
 	if errors.Is(err, errNotFound) {
 		return nil, nil
 	}
@@ -180,7 +180,7 @@ func (in *ingress) lease(ctx context.Context, id string) (*Lease, error) {
 }
 
 func (in *ingress) leases(ctx context.Context) (map[string]*Lease, error) {
-	names, err := in.bucket.list(ctx, "workers/")
+	names, err := in.store.list(ctx, "workers/")
 	if err != nil {
 		return nil, err
 	}
@@ -224,7 +224,7 @@ func (in *ingress) call(ctx context.Context, addr, path string, body, out any) e
 
 func (in *ingress) suspend(ctx context.Context, as, name string) error {
 	var rec Actor
-	gen, err := in.bucket.get(ctx, actorKey(as, name), &rec)
+	gen, err := in.store.get(ctx, actorKey(as, name), &rec)
 	if err != nil || rec.Status == suspended {
 		return err
 	}
@@ -240,12 +240,12 @@ func (in *ingress) suspend(ctx context.Context, as, name string) error {
 	}
 	// The owner is gone or does not host the actor: the last snapshot is what remains.
 	rec.Status, rec.Owner = suspended, ""
-	_, err = in.bucket.put(ctx, actorKey(as, name), rec, gen)
+	_, err = in.store.put(ctx, actorKey(as, name), rec, gen)
 	return err
 }
 
 func (in *ingress) routes(mux *http.ServeMux) {
-	b := in.bucket
+	b := in.store
 	mux.HandleFunc("PUT /admin/atespaces/{as}", func(rw http.ResponseWriter, r *http.Request) {
 		_, err := b.put(r.Context(), atespaceKey(r.PathValue("as")), map[string]time.Time{"created": time.Now()}, 0)
 		reply(rw, map[string]string{"name": r.PathValue("as")}, existsErr(err))
