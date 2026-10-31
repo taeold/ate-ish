@@ -17,10 +17,10 @@ An egress policy names the hosts an actor may reach and the credential each gets
 ## Install
 
 ```bash
-go install github.com/taeold/ate-ish/cmd/ate-ish@latest
+go install github.com/taeold/ate-ish/cmd/ate-ish@latest github.com/taeold/ate-ish/third_party/substrate/cmd/ateworker-gvisor@latest
 ```
 
-No release binary is built yet; `go install` or building from source are the only paths today. The node image builds with a plain `docker build .` from the repo root; it carries the `ate-ish` binary, the vendored `ateworker-gvisor`, and a staged `runsc` release, with no Docker CLI or socket of its own.
+No release binary is built yet; `go install` or building from source are the only paths today. The node fetches gVisor's `runsc` itself on first start, into `/var/lib/ate-ish/runsc` when run as root or `$XDG_STATE_HOME/ate-ish/runsc` otherwise; `ATE_RUNSC_DIR` overrides that location. The node image builds with a plain `docker build .` from the repo root; it carries the `ate-ish` binary, the vendored `ateworker-gvisor`, and a staged `runsc` release, with no Docker CLI or socket of its own.
 
 ## Run it
 

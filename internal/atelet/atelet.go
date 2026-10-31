@@ -126,29 +126,30 @@ func hostLacksMemoryOrCPU(cgroup string) (bool, error) {
 	return !slices.Contains(have, "memory") || !slices.Contains(have, "cpu"), nil
 }
 
-// stageKodata copies the vendored kodata directory's internal_flags.json
-// (the worker's own global/subcommand runsc flags; VENDOR.md's own words:
-// "proven in stage 0 to be the complete, correct set") into dir, adding
-// "--ignore-cgroups" to globalFlags when ignoreCgroups is true. Returns
-// the staged directory for KO_DATA_PATH to point the worker at instead of
-// the vendored tree directly.
+// stageKodata writes the embedded internal_flags.json (vendoredInternalFlags,
+// kodata_embed.go; the worker's own global/subcommand runsc flags;
+// VENDOR.md's own words: "proven in stage 0 to be the complete, correct
+// set") into dir, adding "--ignore-cgroups" to globalFlags when
+// ignoreCgroups is true. Returns the staged directory for KO_DATA_PATH to
+// point the worker at.
 //
-// This is ate-ish's own shipped configuration, not a vendored-source
-// edit (the coordinator's framing, stage 5e): the vendored copy under
-// third_party/substrate is never written to; a fresh copy is staged
-// under dir every time, so a host that gains or loses the flag (a restart
-// on genuinely different hardware) never sees a stale staged file from a
-// previous boot.
+// This is ate-ish's own shipped configuration, not a vendored-source edit
+// (the coordinator's framing, stage 5e): the vendored copy under
+// third_party/substrate is never read from at runtime (only its
+// byte-identical embedded copy is, via go:embed), and a fresh copy is
+// staged under dir every time, so a host that gains or loses the flag (a
+// restart on genuinely different hardware) never sees a stale staged file
+// from a previous boot. Embedding (rather than reading the file off disk
+// at cfg.kodata or similar) is what lets a node start with no checkout of
+// this repo on disk at all.
 func stageKodata(dir string, ignoreCgroups bool) (string, error) {
 	staged := filepath.Join(dir, "kodata")
 	if err := os.MkdirAll(staged, 0o755); err != nil {
 		return "", err
 	}
-	raw, err := os.ReadFile(filepath.Join(workerKodataPath(), "internal_flags.json"))
-	if err != nil {
-		return "", fmt.Errorf("reading the vendored internal_flags.json: %w", err)
-	}
+	raw := vendoredInternalFlags
 	if ignoreCgroups {
+		var err error
 		var flags map[string]any
 		if err := json.Unmarshal(raw, &flags); err != nil {
 			return "", fmt.Errorf("parsing internal_flags.json: %w", err)
@@ -269,8 +270,7 @@ func removeWorkerCgroupLeaf(leaf string) {
 // ateworkerConfig is what startAteworker needs to launch the vendored
 // worker and reach its socket.
 type ateworkerConfig struct {
-	binary      string // bin/ateworker-gvisor
-	kodata      string // third_party/substrate/cmd/ateworker-gvisor/kodata (internal_flags.json)
+	binary      string // resolved by workerBinaryPath (worker.go)
 	podUID      string
 	nodeTag     string // ATE_DIR's base name: scopes the cgroup leaf and the stale-process pkill to this node only
 	maxActors   int

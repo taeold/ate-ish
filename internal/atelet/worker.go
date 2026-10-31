@@ -12,6 +12,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -45,21 +46,64 @@ const (
 	gatewayNSSuffix = "-at"
 )
 
-// ateIshHome is where bin/ateworker-gvisor, bin/runsc and
-// third_party/substrate/.../kodata live: cwd by default (ate-ish's own
-// binary always runs with cwd there already, the repo root locally or
-// /ate-ish in the published image), overridable with ATE_ISH_HOME for a
-// run whose cwd is something else, such as an actor's own directory.
-func ateIshHome() string { return env("ATE_ISH_HOME", "") }
+// ateWorkerBinaryName is the vendored worker's binary name, both on PATH
+// and next to ate-ish's own executable.
+const ateWorkerBinaryName = "ateworker-gvisor"
+
+// workerBinaryPath resolves ateworker-gvisor in the order the README's
+// install documents: ATE_WORKER_BIN first, then next to this process's
+// own executable (symlinks resolved, so a `go install`-placed binary,
+// invoked via GOBIN/bin's symlink or directly, still finds its sibling),
+// then PATH. No step reads cwd: a node started from an arbitrary
+// directory (the whole point of `go install` + `ate-ish`) still finds the
+// worker it was installed alongside.
+func workerBinaryPath() (string, error) {
+	if p := env("ATE_WORKER_BIN", ""); p != "" {
+		return p, nil
+	}
+	if exe, err := os.Executable(); err == nil {
+		if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+			exe = resolved
+		}
+		candidate := filepath.Join(filepath.Dir(exe), ateWorkerBinaryName)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate, nil
+		}
+	}
+	if p, err := exec.LookPath(ateWorkerBinaryName); err == nil {
+		return p, nil
+	}
+	return "", fmt.Errorf(
+		"ateworker-gvisor not found: checked ATE_WORKER_BIN, next to the ate-ish binary, and PATH; " +
+			"install it with `go install github.com/taeold/ate-ish/third_party/substrate/cmd/ateworker-gvisor@latest`")
+}
 
 // runscReleaseDir is where runsc (and its gvisor-bin/ sidecars) are
-// staged: ATE_RUNSC_DIR overrides it directly.
+// staged: ATE_RUNSC_DIR overrides it directly. The default is a state
+// directory, never cwd: root (the worker always runs as root; see
+// serve()'s check in cmd/ate-ish) owns /var/lib/ate-ish/runsc, the same
+// way a root daemon owns the rest of /var/lib; anyone else gets
+// $XDG_STATE_HOME/ate-ish/runsc or ~/.local/state/ate-ish/runsc.
 func runscReleaseDir() string {
-	return env("ATE_RUNSC_DIR", filepath.Join(ateIshHome(), "bin/runsc"))
+	if dir := env("ATE_RUNSC_DIR", ""); dir != "" {
+		return dir
+	}
+	return filepath.Join(runscStateDir(), "runsc")
 }
-func workerBinaryInBin() string { return filepath.Join(ateIshHome(), "bin/ateworker-gvisor") }
-func workerKodataPath() string {
-	return filepath.Join(ateIshHome(), "third_party/substrate/cmd/ateworker-gvisor/kodata")
+
+func runscStateDir() string {
+	if os.Geteuid() == 0 {
+		return "/var/lib/ate-ish"
+	}
+	base := env("XDG_STATE_HOME", "")
+	if base == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			home = "/root"
+		}
+		base = filepath.Join(home, ".local", "state")
+	}
+	return filepath.Join(base, "ate-ish")
 }
 
 // worker is ate-ish acting as both atelet and worker-pool node: it runs the
@@ -153,9 +197,12 @@ func New(ctx context.Context, b store.Store, addr string, capacity int, dir stri
 	connectPort, _ := strconv.Atoi(env("ATE_CONNECT_PORT", "28444"))
 
 	podUID := "ate-ish-" + randomHex(4)
+	workerBin, err := workerBinaryPath()
+	if err != nil {
+		return nil, err
+	}
 	_, cgroupLeaf, workerPID, err := startAteworker(ateworkerConfig{
-		binary:      workerBinaryInBin(),
-		kodata:      workerKodataPath(),
+		binary:      workerBin,
 		podUID:      podUID,
 		nodeTag:     filepath.Base(dir),
 		maxActors:   capacity,

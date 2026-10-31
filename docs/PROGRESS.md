@@ -2462,3 +2462,52 @@ gateway agent). Bucket gs://ate-node-daniel-junk (us-west1).
 ## libfx note (2026-10-31, from the separate libfx investigation session)
 
 Not a libfx bug and not an ate-ish v2 bug. The demo's agent/server.ts exits only inside the server.close() callback, and Node's server.close() waits for every open connection; an /events response is a libfx tail that stays open while a client is attached, so under SIGTERM the process never exits. Fix: server.closeAllConnections() after server.close() (one line, in taeold/coding-agents-on-substrate/libfx). Only ate-ish v1 on Cloud Run ever hit it, because the front end held a dropped client's connection for 30 s or more. v2 suspends via fscheckpoint without SIGTERM, and a client drop reaches the actor in about 10 ms. The stage 6 row that said the hang reproduced locally on v2 was wrong: it was a curl timeout during a long turn.
+
+## Self-contained install (2026-10-31)
+
+Fixed: a node started from any directory other than a repo checkout
+failed (`staging the worker's runsc flags: ... no such file or
+directory`), because `internal_flags.json`, `ateworker-gvisor` and
+`runsc` were all resolved relative to `ATE_ISH_HOME`/cwd, and `runsc` was
+fetched by shelling out to `gh release download` and `tar --zstd`. The
+README's documented install (`go install` then `sudo -E ate-ish`) could
+never have worked.
+
+- `internal_flags.json` is embedded into the `ate-ish` binary
+  (`internal/atelet/kodata_embed.go`, `go:embed kodata/internal_flags.json`),
+  from a byte-identical copy kept in `internal/atelet/kodata/` and checked
+  against the vendored file by `TestEmbeddedInternalFlagsMatchesVendored`.
+  `third_party/substrate` is never read at runtime or written to.
+- `ateworker-gvisor` resolves via `ATE_WORKER_BIN`, then next to the
+  running `ate-ish` binary (symlinks resolved), then `PATH`
+  (`workerBinaryPath`, `internal/atelet/worker.go`). The documented
+  install is now two `go install` targets, `cmd/ate-ish` and
+  `third_party/substrate/cmd/ateworker-gvisor`, into the same `GOBIN`.
+- `runsc` defaults to `/var/lib/ate-ish/runsc` under root (a root daemon
+  owns it, like the rest of `/var/lib`) or
+  `$XDG_STATE_HOME/ate-ish/runsc`/`~/.local/state/ate-ish/runsc`
+  otherwise; `ATE_RUNSC_DIR` still overrides it directly. Fetching moved
+  from `hack/fetch-runsc.sh` (gh/curl + shell tar) into Go
+  (`internal/atelet/runsc.go`): plain HTTPS GET of the release asset for
+  the running GOARCH, verified against the release's own `SHA512SUMS`,
+  decompressed with `github.com/klauspost/compress/zstd`, extracted with
+  `archive/tar` into a temp dir, renamed into place. The hidden
+  `ate-ish fetch-runsc` subcommand runs the same code, so the Dockerfile
+  and a bare node share one implementation; `hack/fetch-runsc.sh` is
+  deleted.
+- `ATE_ISH_HOME` is gone; nothing is resolved relative to cwd anymore.
+  The Dockerfile places `ateworker-gvisor` next to `ate-ish` in
+  `/usr/local/bin` and runs `fetch-runsc` at build time into
+  `/ate-ish/bin/runsc` (`ATE_RUNSC_DIR`).
+
+Verified for real: from a temp directory with only the two `go install`ed
+binaries on `PATH` and no `runsc` anywhere, `sudo -E ate-ish` fetched
+`runsc` into `/var/lib/ate-ish/runsc` and ran the counter demo's full
+suspend/resume sequence (counters 1, 2, suspend, 3), with the temp
+directory empty throughout and after. The same two-node-on-one-bucket
+scenario from `docs/demos.md`'s same-host recipe passed from outside the
+repo: node B created `c2`, a request through node A proxied to it,
+suspend, SIGTERM to node B, a request through node A resumed `c2` there
+with the counter continuing. `docker build .` and
+`docker run --privileged -p 8090:8080 <image>` still serve with no
+actor.

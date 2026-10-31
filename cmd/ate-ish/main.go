@@ -38,6 +38,13 @@ func main() {
 		// Hidden: internal/atelet's own private-mount-namespace child,
 		// re-exec'd by its cgroup helper. Not a user-facing command.
 		err = atelet.RunCgroupHelper(os.Args[2])
+	case "fetch-runsc":
+		// Hidden: stages the pinned gVisor release at ATE_RUNSC_DIR (or
+		// its default), the same code serve() calls on worker startup.
+		// Not part of the kubectl-ate CLI surface; exists so the
+		// Dockerfile build and anyone pre-staging runsc share this one
+		// implementation instead of a second, shell-script copy.
+		err = atelet.EnsureRunsc()
 	default:
 		err = cli.Run(os.Args[1:])
 	}
