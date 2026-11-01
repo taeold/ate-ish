@@ -49,18 +49,35 @@ func (n *Namespace) MultiIDMapping() bool { return n != nil && n.multiID }
 // (docs/ROOTLESS-SPIKE.md): Ubuntu's AppArmor profile for unprivileged
 // user namespaces, and the sysctl that controls it directly.
 const unprivilegedHint = `ate-ish could not create an unprivileged user+mount+network namespace.
-On Ubuntu 23.10+, AppArmor restricts unprivileged user namespaces by default. Either:
-  sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-or install a profile that allows this binary, e.g.:
-  cat <<'EOF' | sudo tee /etc/apparmor.d/ate-ish-userns
+On Ubuntu 23.10 and later, AppArmor restricts unprivileged user namespaces by default.
+Allow them for a private copy of unshare that only ate-ish uses (sudo once):
+  sudo install -D -m 0755 /usr/bin/unshare ` + privateUnshare + `
+  sudo tee /etc/apparmor.d/ate-ish-unshare >/dev/null <<'EOF'
 abi <abi/4.0>,
 include <tunables/global>
-profile ate-ish-userns flags=(unconfined) {
+profile ate-ish-unshare ` + privateUnshare + ` flags=(unconfined) {
   userns,
 }
 EOF
-  sudo systemctl reload apparmor
+  sudo apparmor_parser -r /etc/apparmor.d/ate-ish-unshare
 Then retry.`
+
+// privateUnshare is where the Ubuntu setup above puts ate-ish's own copy of
+// unshare. Granting userns to this path, not /usr/bin/unshare, keeps the
+// restriction in place for every other program on the machine.
+const privateUnshare = "/usr/local/libexec/ate-ish/unshare"
+
+// unshareBinary picks ATE_UNSHARE, else the private copy when it exists, else
+// unshare from PATH.
+func unshareBinary() string {
+	if p := os.Getenv("ATE_UNSHARE"); p != "" {
+		return p
+	}
+	if _, err := os.Stat(privateUnshare); err == nil {
+		return privateUnshare
+	}
+	return "unshare"
+}
 
 // ATE_SANDBOX_NO_USERNS, set to any non-empty value, skips namespace
 // creation and fails immediately: the test switch G1 uses to exercise the
@@ -130,7 +147,7 @@ func openHolder(mapping idMapping) (*Namespace, error) {
 		args = append(args, "--map-root-user")
 	}
 	args = append(args, "--net", "--mount", "--pid", "--fork", "--propagation=private", "sleep", "infinity")
-	holder := exec.Command("unshare", args...)
+	holder := exec.Command(unshareBinary(), args...)
 	holder.Stderr = os.Stderr
 	if err := holder.Start(); err != nil {
 		return nil, fmt.Errorf("unshare: %w\n%s", err, unprivilegedHint)

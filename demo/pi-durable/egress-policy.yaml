@@ -5,4 +5,4 @@ rules:
     effects:
       replaceHeaders:
       - header: x-goog-api-key
-        credentialUri: ate-secret://secretmanager.googleapis.com/daniel-junk/gemini-api-key
+        credentialUri: ate-secret://env/GEMINI_API_KEY

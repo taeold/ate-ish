@@ -5,4 +5,4 @@ rules:
     effects:
       replaceHeaders:
       - header: x-api-key
-        credentialUri: ate-secret://secretmanager.googleapis.com/daniel-junk/ai-gateway-token
+        credentialUri: ate-secret://env/AI_GATEWAY_API_KEY

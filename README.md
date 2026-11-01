@@ -1,12 +1,12 @@
 # ate-ish
 
-ate-ish runs [Agent Substrate](https://github.com/agent-substrate/substrate) actors on your own machine, celld's shape, one binary over a directory or a bucket, as an ordinary user with no sudo.
+ate-ish runs [Agent Substrate](https://github.com/agent-substrate/substrate) actors on your own machines without Kubernetes: one binary, a directory or a bucket for state, and no root.
 
 ## How it works
 
 ate-ish is one binary: a node, and a `kubectl-ate`-style CLI against it. The node runs as both an ingress (routes a request by its `ate-target-actor` header, serves the admin API) and a worker (runs actors), or either role alone. All control-plane state, an atespace, its templates, its actors' records, their snapshots and tags, and worker leases, lives as JSON and tar objects in one store: a local directory by default, or one GCS bucket when `ATE_BUCKET` names one. There is no database. Every record write is conditional on the generation it read, so two nodes sharing a store never clobber each other's writes.
 
-Each actor runs in its own gVisor sandbox, under a user, mount and network namespace the node holds for itself with no root. The sandbox gets no network of its own: every outbound connection it opens goes through the node's egress gateway over a per-destination Unix socket, which enforces the actor's egress policy and can replace a header (such as an API key) before forwarding. `ate-ish suspend actor` checkpoints the sandbox and uploads the result to the store as the actor's snapshot; the next request for that actor resumes it on a worker with a free slot. At `preferredFidelity: MEMORY`, the snapshot includes the sandbox's process memory, not just its durable directories, so an in-process counter or an open connection's state survives suspend and resume. A tag is a copy of a suspended actor's snapshot, and an actor created with `--tag` starts as a fork of it, sharing history up to that point and diverging from there.
+Each actor runs in its own gVisor sandbox, under a user, mount and network namespace the node holds for itself with no root. The sandbox gets no network of its own: every outbound connection it opens goes through the node's egress gateway over a per-destination Unix socket, which enforces the actor's egress policy and can replace a header (such as an API key) before forwarding. `ate-ish suspend actor` checkpoints the sandbox and uploads the result to the store as the actor's snapshot; the next request for that actor resumes it on a worker with a free slot. At `preferredFidelity: MEMORY`, the snapshot includes the sandbox's process memory, not just its durable directories, so an in-process counter survives suspend and resume. A tag is a copy of a suspended actor's snapshot, and an actor created with `--tag` starts as a fork of it, sharing history up to that point and diverging from there.
 
 ## Install
 
@@ -14,19 +14,16 @@ Each actor runs in its own gVisor sandbox, under a user, mount and network names
 go install github.com/taeold/ate-ish/cmd/ate-ish@latest
 ```
 
-Verify it from outside the repo, with a throwaway `GOBIN`:
-
-```bash
-GOBIN=$(mktemp -d) go install ./cmd/ate-ish
-```
-
 The node fetches gVisor's `runsc` itself on first start, into `$XDG_STATE_HOME/ate-ish/runsc` or `~/.local/state/ate-ish/runsc`; `ATE_RUNSC_DIR` overrides that location.
 
 ## Run it
 
-As yourself, no sudo:
+As yourself, no sudo, from a clone of this repository (the demos live in `demo/`):
 
 ```bash
+git clone https://github.com/taeold/ate-ish && cd ate-ish
+docker build -t counter-demo:latest demo/counter
+
 ate-ish &
 
 export ATE_URL=http://127.0.0.1:8080
@@ -38,9 +35,10 @@ curl -H "ate-target-actor: ate-demo-counter/counter1" $ATE_URL/
 
 Each request bumps the counter's in-process, file, and rootfs-overlay counts; `ate-ish suspend actor counter1 -a ate-demo-counter` checkpoints it, and the next request resumes it where it left off.
 
-pi-durable, the quickstart coding-agent actor:
+pi-durable, a coding-agent actor. Its model key comes from the node's environment, so export it before you start the node:
 
 ```bash
+export AI_GATEWAY_API_KEY=...   # then restart ate-ish so it sees the key
 ate-ish create atespace ate-demo-pi
 ate-ish create actor-template -f demo/pi-durable/template-gateway.yaml
 ate-ish create actor demo-agent --template pi-durable-data -a ate-demo-pi
@@ -51,26 +49,27 @@ curl -X POST $ATE_URL/submit -H "ate-target-actor: ate-demo-pi/demo-agent" \
   -d '{"prompt": "Create app.js with add(a, b) and a test.js that verifies it."}'
 ```
 
-An egress policy's `credentialUri` can name a Secret Manager secret, as the committed `egress-policy-gateway.yaml` does, or `ate-secret://env/GEMINI_API_KEY` or `ate-secret://env/AI_GATEWAY_API_KEY` to read the key from the node's own environment instead; either way the actor's own process never sees the real key, only the gateway that replaces it on the way out. `ate-ish suspend actor demo-agent -a ate-demo-pi`, `ate-ish create tag`, `ate-ish get actors|tags|workers`, and creating a second actor with `--tag` run the same way against the same node; `hack/gate.sh` runs the whole sequence end to end, including a fork and an egress check.
+The actor holds a placeholder key; the node's gateway replaces it with the real one on the way out, so the actor's own process never sees it. A policy's `credentialUri` reads the key from the node's environment (`ate-secret://env/<VAR>`) or from Secret Manager (`ate-secret://secretmanager.googleapis.com/<project>/<secret>`). `demo/pi-durable/template.yaml` and `egress-policy.yaml` are the same actor against Gemini with `GEMINI_API_KEY`. `ate-ish suspend actor demo-agent -a ate-demo-pi`, `ate-ish create tag`, `ate-ish get actors|tags|workers`, and creating a second actor with `--tag` run the same way against the same node; `hack/gate.sh` runs the whole sequence end to end, including a fork and an egress check.
 
 ## Requirements
 
-Linux, with unprivileged user namespaces enabled. Ubuntu 23.10 and later restrict them by default through AppArmor; the node's own error names the fix, which needs `sudo` once, to install a profile for the `unshare` binary it calls:
+Linux, with unprivileged user namespaces enabled. Ubuntu 23.10 and later restrict them by default through AppArmor, and the node's error says so. The fix takes sudo once: give ate-ish its own copy of `unshare` and allow user namespaces for that copy only, so the restriction stays in place for every other program.
 
-```
+```bash
+sudo install -D -m 0755 /usr/bin/unshare /usr/local/libexec/ate-ish/unshare
+sudo tee /etc/apparmor.d/ate-ish-unshare >/dev/null <<'EOF'
 abi <abi/4.0>,
 include <tunables/global>
-
-profile ate-ish-unshare /usr/bin/unshare flags=(unconfined) {
+profile ate-ish-unshare /usr/local/libexec/ate-ish/unshare flags=(unconfined) {
   userns,
-
-  include if exists <local/ate-ish-unshare>
 }
+EOF
+sudo apparmor_parser -r /etc/apparmor.d/ate-ish-unshare
 ```
 
-Load it with `apparmor_parser -r` against the profile file, then `systemctl reload apparmor`; this lifts the restriction for every user's `unshare`, not only ate-ish's own invocations, since the node calls the system binary rather than a private copy.
+The node uses that copy when it exists; `ATE_UNSHARE` names another path.
 
-An actor image whose Dockerfile declares a non-root `USER` needs `newuidmap`/`newgidmap` (the `uidmap` package) and an `/etc/subuid`/`/etc/subgid` range for your user; without them, the node maps only root and logs that non-root images will fail. Per-actor memory/CPU/task limits need a systemd user session (`systemd-run --user --scope`); without one, the node runs actors without limits and logs that once. macOS has no unprivileged Linux namespaces at all, so it runs the node image in a privileged container instead (`docker build -t ate-ish .`, then `docker run --privileged -p 8080:8080 ate-ish`).
+An actor image whose Dockerfile declares a non-root `USER` needs `newuidmap`/`newgidmap` (the `uidmap` package) and an `/etc/subuid`/`/etc/subgid` range for your user; without them, the node maps only root and logs that non-root images will fail. Per-actor memory/CPU/task limits need a systemd user session (`systemd-run --user --scope`); without one, the node runs actors without limits and logs that once. macOS has no unprivileged Linux namespaces at all, so it runs the node image in a privileged container instead (`docker build -t ate-ish .`, then `docker run --privileged -p 8080:8080 -e ATE_LISTEN=0.0.0.0:8080 ate-ish`). The node inside the container pulls actor images from a registry, since your local Docker images are not visible to it, so push the actor image somewhere the container can reach.
 
 ## Operate a fleet
 
@@ -78,17 +77,19 @@ The node listens on `127.0.0.1:8080` by default; it has no authentication, so ke
 
 ## Compatibility
 
-| Works as on substrate | Evidence |
+| | |
 |---|---|
-| Unprivileged start, `runsc` fetch, clear error when user namespaces are refused | G1 |
-| MEMORY fidelity: in-process, file, and rootfs state all survive suspend/resume and a full node restart | G2 |
-| A real model turn through the AI Gateway, suspend, tag, fork, divergent turns after the fork | G3 |
-| `http` rules, `https` on a non-443 port, wildcard hostnames (`*.vercel.sh`, bare `*`), an unlisted hostname refused under a specific policy | G4 |
-| A non-root actor image (`USER node`), both under multi-ID mapping and the root-only fallback | G5 |
-| An in-flight request during checkpoint: the checkpoint itself succeeds | G6 |
-| The first request after restore, measured end to end | G7 |
+| Start as an ordinary user; a clear error when user namespaces are refused | works |
+| Snapshots at `MEMORY` fidelity: process memory, files and the writable layer survive suspend, resume and a node restart | works |
+| Suspend, tag, fork, and divergent turns after the fork | works |
+| `http` rules, `https` on any port, wildcard hostnames (`*.example.com` and bare `*`) | works |
+| An unlisted hostname under a specific policy | refused |
+| Actor images with a non-root `USER` | works with `uidmap` and a subuid range |
+| `tls_passthrough` rules and `actorJwt` | not supported; the node logs one line per rule that uses them |
+| A request in flight when its actor is suspended | not supported; the request ends in an error |
+| The first request after a restore | takes 1 to 3 seconds |
 
-Not supported yet: `tls_passthrough` rules and `actorJwt` (both parse but do nothing; the node logs one line per rule that uses either). An in-flight request does not survive its own actor's suspend: G6 found the checkpoint succeeds, but that original request ends in an error, not a resumed response. The first request after a restore can take 1 to 3 seconds (G7) rather than resuming instantly. An actor sees no network of its own, only loopback inside its sandbox; every outbound connection goes through the gateway, and a program that bypasses the system resolver (hardcoding a raw IP, say) gets no route at all.
+An actor has no network of its own, only loopback; every outbound connection goes through the gateway, and a program that bypasses the system resolver, for example by connecting to a raw IP address, has no route at all.
 
 ## Limits
 
