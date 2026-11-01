@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -51,10 +52,13 @@ func Dispatch(args []string) (handled bool, err error) {
 // ATE_EGRESS entry ("listenIP:port:destSocketPath", space-separated),
 // starts the ingress dial-out forwarder against ATE_INGRESS_TARGET (if
 // set), then execs args as the actor's own command, forwarding
-// SIGTERM/SIGINT and reaping. SIGUSR1/SIGUSR2 are relayed to the egress
-// forwarders only (Namespace.Checkpoint sends USR1 before checkpointing,
-// since gVisor refuses to save a sandbox holding a bound host socket;
-// Namespace.Restore sends USR2 after restoring).
+// SIGTERM/SIGINT and reaping. SIGUSR1/SIGUSR2 are relayed to every
+// egress forwarder and the ingress outforwarder alike (Namespace.
+// Checkpoint sends USR1 before checkpointing, since gVisor refuses to
+// save a sandbox holding a bound host socket, or (outforwarder's own
+// doc comment) one of its own dial-out connections sitting idle in the
+// node's pool; Namespace.Restore sends USR2 after restoring, and
+// nothing redials or re-listens before that).
 func RunInit(args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf("usage: ate-ish %s <cmd> [args...]", sandboxInitArg)
@@ -118,8 +122,8 @@ func RunInit(args []string) error {
 	for s := range sigs {
 		if s == syscall.SIGUSR1 || s == syscall.SIGUSR2 {
 			fwds.signal(s)
-			if s == syscall.SIGUSR2 && ing != nil {
-				ing.restart()
+			if ing != nil {
+				ing.signal(s)
 			}
 			continue
 		}
@@ -366,21 +370,24 @@ func serveForward(ln net.Listener, dnet, daddr string) {
 	}
 }
 
-// outforwarder is init's own child-process wrapper around
-// RunOutForwarder (the ATE_INGRESS_TARGET dial-out pool, started once
-// per boot): restart stops the current one and starts a fresh one. A
-// connection one of its workers already had open when checkpoint saved
-// state is itself restored as part of the sandbox's own process tree,
-// but nothing on the OTHER end survives restore: the node-side gateway
-// socket (ingressBridge) for a restored generation is a brand-new bind
-// mount at a brand-new path, so the restored connection is simply
-// stale, and nothing inside this sandbox notices until it is actually
-// used and errors or hangs. That gap (found empirically: the first
-// request after restore hung past the 10s the bridge waits for a fresh
-// connection) is G7's own "redial on restore" fix, docs/ROOTLESS.md:
-// restart forces a fresh dial immediately on SIGUSR2, the same signal
-// that reopens every egress forwarder's listener after restore, instead
-// of waiting for the stale one to fail on its own.
+// outforwarder is init's own handle on RunOutForwarder (the
+// ATE_INGRESS_TARGET dial-out pool, started once per boot): signal
+// relays SIGUSR1/SIGUSR2 to it, exactly as fwds.signal does for every
+// egress forwarder. RunOutForwarder's own signal loop is what used to
+// live here as restart (kill the old process, start a new one): a
+// SIGKILLed pool still left its idle connections to be resumed, as
+// part of the sandbox's own process tree, by gVisor's restore, and
+// killing the pool from outside could lose the race against that
+// resume (round D's own review: a resumed, about-to-be-killed worker
+// could still dial into the node's new-generation ingressBridge and
+// get pooled a moment before dying, leaving it stuck with a connection
+// that looks fine but is already dead). Quiescing the pool itself on
+// SIGUSR1 — closing every connection and dialing nothing more, instead
+// of waiting to be killed — means there is nothing left running to
+// resume by the time checkpoint actually saves state, so restore has
+// nothing stale to inherit in the first place; RunOutForwarder only
+// dials again once SIGUSR2 says restore is done. ingressBridge's own
+// generation drop (worker.go) stays as a second line of defense.
 type outforwarder struct {
 	self, target string
 	cmd          *exec.Cmd
@@ -396,15 +403,11 @@ func (o *outforwarder) start() error {
 	return nil
 }
 
-// restart kills the previous pool (best effort; it may already be
-// gone) and starts a replacement.
-func (o *outforwarder) restart() {
+// signal relays sig to the running pool, same as fwdSet.signal does
+// per forwarder.
+func (o *outforwarder) signal(sig os.Signal) {
 	if o.cmd != nil && o.cmd.Process != nil {
-		o.cmd.Process.Kill()
-		o.cmd.Wait()
-	}
-	if err := o.start(); err != nil {
-		log.Printf("outforwarder: restart: %v", err)
+		o.cmd.Process.Signal(sig)
 	}
 }
 
@@ -412,8 +415,14 @@ func (o *outforwarder) restart() {
 // only ever connects out to dialAddr (the node's own ingress.sock,
 // bind-mounted at /run/ate-ish/ingress.sock) and relays that connection to
 // tcpAddr (the actor's own server). Unlike a listening socket, an
-// outbound connection does not block checkpoint, so it needs no signal
-// handling at all (docs/ROOTLESS-SPIKE.md round 3, Q5).
+// outbound connection does not block checkpoint on its own
+// (docs/ROOTLESS-SPIKE.md round 3, Q5), but one sitting idle, dialed
+// and pooled on the node side yet never used, is exactly the stale
+// connection outforwarder's own doc comment describes if it survives
+// into a restored generation. SIGUSR1 here, same as every egress
+// forwarder's own listener close, quiesces this pool instead of
+// leaving that question to restart: every active connection is closed
+// and no worker dials again until SIGUSR2.
 func RunOutForwarder(args []string) error {
 	if len(args) != 3 {
 		return fmt.Errorf("usage: ate-ish %s <dial-unix-addr> <pool-size> <dial-tcp-addr>", outforwarderArg)
@@ -423,23 +432,94 @@ func RunOutForwarder(args []string) error {
 	if err != nil || n < 1 {
 		return fmt.Errorf("bad pool size %q", args[1])
 	}
-	for i := 0; i < n; i++ {
-		go outforwarderWorker(dialAddr, tcpAddr)
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGUSR1, syscall.SIGUSR2)
+	for {
+		cs := newConnSet()
+		ctx, cancel := context.WithCancel(context.Background())
+		var wg sync.WaitGroup
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				outforwarderWorker(ctx, cs, dialAddr, tcpAddr)
+			}()
+		}
+		for s := <-sigs; s != syscall.SIGUSR1; s = <-sigs {
+		}
+		cancel()
+		cs.closeAll()
+		wg.Wait()
+		log.Printf("outforwarder: quiesced for checkpoint, every connection closed")
+		for s := <-sigs; s != syscall.SIGUSR2; s = <-sigs {
+		}
 	}
-	select {}
 }
 
-func outforwarderWorker(dialAddr, tcpAddr string) {
+// connSet is every connection an outforwarderWorker currently has
+// dialed to the node, whether idle in the node's own pool or actively
+// relaying: closeAll is what quiesce uses to end all of them at once.
+type connSet struct {
+	mu sync.Mutex
+	m  map[net.Conn]struct{}
+}
+
+func newConnSet() *connSet { return &connSet{m: map[net.Conn]struct{}{}} }
+
+func (cs *connSet) add(c net.Conn) {
+	cs.mu.Lock()
+	cs.m[c] = struct{}{}
+	cs.mu.Unlock()
+}
+
+func (cs *connSet) remove(c net.Conn) {
+	cs.mu.Lock()
+	delete(cs.m, c)
+	cs.mu.Unlock()
+}
+
+func (cs *connSet) closeAll() {
+	cs.mu.Lock()
+	for c := range cs.m {
+		c.Close()
+	}
+	cs.m = map[net.Conn]struct{}{}
+	cs.mu.Unlock()
+}
+
+// outforwarderWorker dials, relays, and redials in a loop until ctx is
+// done. It tracks its own connection to the node (dialAddr) in cs for
+// the whole time it might sit idle, dialed but not yet picked up by
+// the node's own pool — exactly the one closeAll needs to be able to
+// end on quiesce — and checks ctx right after adding it, in case
+// quiesce landed in the gap between the dial and the add: ctx is
+// always cancelled before closeAll runs, so this is never racy, only
+// possibly one extra dial per worker that gets closed immediately.
+func outforwarderWorker(ctx context.Context, cs *connSet, dialAddr, tcpAddr string) {
 	for {
+		if ctx.Err() != nil {
+			return
+		}
 		c, err := net.Dial("unix", dialAddr)
 		if err != nil {
 			log.Printf("outforwarder: dial %s: %v", dialAddr, err)
-			time.Sleep(time.Second)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+			}
 			continue
+		}
+		cs.add(c)
+		if ctx.Err() != nil {
+			cs.remove(c)
+			c.Close()
+			return
 		}
 		d, err := dialRetry(tcpAddr)
 		if err != nil {
 			log.Printf("outforwarder: dial %s: %v", tcpAddr, err)
+			cs.remove(c)
 			c.Close()
 			continue
 		}
@@ -450,6 +530,7 @@ func outforwarderWorker(dialAddr, tcpAddr string) {
 			}
 		}()
 		io.Copy(c, d)
+		cs.remove(c)
 		c.Close()
 		d.Close()
 	}

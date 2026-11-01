@@ -65,16 +65,16 @@ bash hack/smoke.sh  # one command, no network or Secret Manager needed
   range via newuidmap/newgidmap after `unshare` (`ATE_SANDBOX_FORCE_ROOT_ONLY_MAPPING=1`
   forces root-only). `imageRootfsDir`'s export cache keys on the mode too.
 - **The ingress outforwarder's connection does not survive restore on
-  its own**; `RunInit` kills and restarts it on SIGUSR2 for an instant
-  redial. Restore resumes the *previous* generation's workers before
-  SIGUSR2 lands, so one can dial in and get pooled by `ingressBridge`
-  first; `Restarted` (right after `Restore`, before SIGUSR2) tags
-  pooled connections with a generation and drops whatever is queued.
-  `RoundTrip` retries only a write-side EPIPE/ECONNRESET, never after a
-  response started reading (a broader retry turned one counter request
-  into two, live: counter 3 to 4). A straggler whose write lands but
-  whose read then hits "unexpected EOF" still fails outright; not
-  fixed, since retrying there isn't provably safe.
+  its own**; SIGUSR1 now quiesces its own dial-out pool (closes every
+  connection, dials nothing more), the same as every egress forwarder's
+  listener closing for checkpoint, so nothing it held survives into the
+  restored process tree to resume and race its own redial; SIGUSR2
+  redials fresh (`init.go`'s `outforwarder`/`RunOutForwarder`; no more
+  kill-and-restart from outside). `ingressBridge.Restarted` (node side,
+  right after `Restore`) still drops whatever is queued, as a second
+  line of defense; `RoundTrip` retries only a write-side EPIPE/ECONNRESET
+  on top of that, never after a response started reading (a broader
+  retry turned one counter request into two, live: not landed).
 - **`ATE_LISTEN` is a full `host:port`** (default `127.0.0.1:8080`, no
   auth); `advertiseAddr` picks a lease address: `ATE_ADVERTISE` if set,
   else `ATE_LISTEN` when not a wildcard, else the first non-loopback IPv4.
@@ -88,10 +88,10 @@ bash hack/smoke.sh  # one command, no network or Secret Manager needed
 - `demo/pi-durable/egress-policy.yaml` (the non-gateway variant) names
   a Secret Manager secret that does not exist (404); README uses the
   gateway variant instead. Not fixed this stage.
-- `hack/smoke.sh`'s counter-resume request can still fail right after a
-  restore (the residual ingress-pool race above): 1 failure in 5 runs
-  in this stage's final check, never a double-execution. Every
-  assertion now prints what it got and the node log's last 40 lines
+- `hack/smoke.sh` five-in-a-row, after the outforwarder quiesce fix:
+  5/5 PASS (an unrelated flake or two surfaced in between runs from
+  this VM's disk filling to 100% under repeated runs; not a code bug).
+  Every assertion prints what it got and the node log's last 40 lines
   on failure (also `/tmp/ate-ish-smoke-last.log`).
 
 ## Where the detail lives

@@ -676,3 +676,34 @@ is already gone, the response read gets "unexpected EOF" — with full
 diagnostics (node log, `/tmp/ate-ish-smoke-last.log`) now capturing it
 instead of dying silently, and no double-execution. `hack/gate.sh`
 with the real model, from a clean shell per #3 above: PASS.
+
+## Stage E follow-up: quiesce the ingress outforwarder at the source
+
+The review that found stage E's ingress-pool race also asked for the
+real fix, not just the node-side generation drop and the narrow retry:
+the restored sandbox's process tree still held the previous
+generation's outforwarder connections from before the checkpoint, so
+anything surviving to redial into the new generation's pool was the
+real bug, not a side effect to filter out after the fact.
+
+Fixed at the source: `RunOutForwarder` (`internal/sandbox/init.go`)
+now quiesces itself on SIGUSR1, the same signal that already closes
+every egress forwarder's listener for checkpoint — it closes every
+connection it is holding (`connSet.closeAll`, tracked per worker from
+the moment each one dials) and dials nothing more, then only resumes
+dialing on SIGUSR2 after restore. `RunInit` relays both signals
+straight to it (`outforwarder.signal`), the same way `fwdSet.signal`
+already does per egress forwarder; the old kill-and-restart `restart`
+method, racing the resumed process tree from outside, is gone.
+`ingressBridge.Restarted` (node side) stays as a second line of
+defense; `RoundTrip`'s write-side-only retry stays as a guard, never
+a primary fix.
+
+Verified: `hack/smoke.sh` five times in a row, 5/5 PASS. Two earlier
+five-run batches (4/5, then 3/5) hit unrelated flakes tied to this VM's
+disk filling to 100% from the volume of runs this stage and the last
+one made (a G4 DNS-wildcard bind race, a `g2c` node that never came
+up, a tar-extraction failure) — none of them the ingress-restore race;
+`docker builder prune` freed ~10 GB and the next five-run batch was
+clean. `hack/gate.sh` with the real model from a clean shell: PASS, no
+key leak, nothing left running.

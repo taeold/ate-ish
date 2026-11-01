@@ -29,8 +29,8 @@ import (
 // process itself, so per-actor limits come from the systemd user scope
 // wrapped around that runsc call (scope.go), not from this namespace.
 type Namespace struct {
-	holder   *exec.Cmd
-	holderW  *os.File // write end of the pipe the holder blocks reading (see openHolder);
+	holder  *exec.Cmd
+	holderW *os.File // write end of the pipe the holder blocks reading (see openHolder);
 	// closing it, or this process dying for any reason including SIGKILL (which makes the
 	// kernel close every fd it still holds on its own), is what makes the holder's read
 	// return and the holder exit, tearing the namespace it is pid 1 of down with it.
