@@ -580,3 +580,99 @@ access latest --secret ai-gateway-token --project daniel-junk` into
 the environment only: every step green, a real model turn, suspend,
 tag, fork, divergent turns, both DNS-refusal checks, the 401 check.
 PASS, no regression.
+
+## Stage E: review fix pass (namespace holder leak, smoke.sh diagnostics, gate.sh standalone)
+
+Three defects from review, fixed in order.
+
+**1. The namespace holder leaked.** `sleep infinity`, `unshare`'s
+`--fork` child, was the held namespace; `Namespace.Close` killed
+`n.holder.Process` — the `unshare` wrapper, already a different
+process once it forked — never `n.pid`, so SIGINT/SIGTERM shutdown
+left it running, and a SIGKILLed node left it running too, with the
+reaper only handling runsc sandboxes. 107 orphaned `sleep infinity`
+processes, each pid 1 of its own pid namespace (so SIGTERM is ignored,
+SIGKILL is needed), had piled up on this VM from one day's runs.
+Fixed: the holder is now `sh -c 'read _ <&3'` on fd 3, the read end of
+a pipe (`os.Pipe`) whose write end (`Namespace.holderW`) this process
+keeps open for as long as it runs and never writes to. Losing that fd
+for any reason — `Close` closing it explicitly, or this process dying
+for any reason including SIGKILL, which the kernel closes every fd for
+on its own — ends the holder's read, so the holder (pid 1) exits and
+the kernel tears the namespace down with it; no code in this process
+has to run for that to happen. `internal/sandbox/namespace.go`. Live
+check, SIGKILL: start a node, `kill -9` it, `readlink /proc/<pid>/ns/
+user` on every exedev process immediately after — none differs from
+the shell's own (before this fix, `sleep infinity`'s did). Same for
+SIGINT. `hack/smoke.sh`'s orphaned-sandboxes section now runs this
+exact check (`assert_no_userns_leak`) right after both the SIGINT and
+the SIGKILL-and-restart cases, alongside the existing runsc check.
+
+**2. `hack/smoke.sh` failed once in review, exit 1, no message**, right
+after the counter's suspend. Cause: `got=$(curl ... | memoryCount)`
+under `set -e`+`pipefail` — when `memoryCount`'s own `grep` found
+nothing, the whole pipeline's nonzero status killed the script at that
+assignment, before the `[[ "$got" == "3" ]] || …` line ever ran, so
+nothing printed. Every such assignment in the script (the counter
+demo, the G4 `lastResult` checks, G5's `got`/`c1`/`c2`) now ends in
+`|| true`, so a failed pipeline leaves `got` empty instead of killing
+the script, and the existing comparison reports it. Every `FAILED`
+site now goes through one `fail` helper that also tails the relevant
+node's log (40 lines) and copies it to `/tmp/ate-ish-smoke-last.log` so
+it survives the cleanup trap. Ran `hack/smoke.sh` 20-odd times across
+this stage. It reproduced twice before the real fix below: once dying
+silently (confirming the diagnosed cause), once with the new
+diagnostics printing "counter request after suspend returned '', want
+3" and the node log's own "write: broken pipe" — which is defect found
+next, not a smoke.sh bug. The final check (below) was 4/5 PASS, 1
+failure, same symptom, no double-execution; diagnostics, not a full
+fix, for that residual case.
+
+**3. `hack/gate.sh` required `ATE_URL` and refused to run standalone.**
+`ATE_URL` now defaults to `http://127.0.0.1:8080`; if nothing answers
+`/admin/workers` there, `gate.sh` builds and starts its own node in a
+scratch dir the same way `hack/smoke.sh` does, tears it down on exit,
+and — since it is a plain forked child — inherits `AI_GATEWAY_API_KEY`
+from this process's own environment, which the demo policies now read
+via `ate-secret://env/AI_GATEWAY_API_KEY`. Verified: `AI_GATEWAY_API_KEY=…
+hack/gate.sh` from a clean shell, no `ATE_URL` set, PASS end to end
+(real model, suspend, tag, fork, both DNS-refusal checks, the 401
+check), its own node torn down on exit, nothing left running.
+
+### A fourth bug found chasing #2: the ingress pool race, and a near-miss
+
+The node log for #2's reproduction showed, right after a restore:
+`actor started` (readiness probe already passed), then `http: proxy
+error: write unix …/ingress.sock->@: write: broken pipe`. Cause: gVisor
+restore resumes the *previous* generation's outforwarder workers
+(`init.go`) as part of the restored process tree before this node's
+own SIGUSR2 ever reaches init's handler to kill and replace them; a
+resumed worker can dial back into the node's (already-listening, same
+generation's) `ingressBridge` and get pooled, then die moments later
+when the kill does land, leaving a connection in the pool that looks
+fine but is already dead on the far end.
+
+First attempt retried the whole request on any pooled-connection
+error. It fixed the write-side case, but at the cost of a real one:
+`hack/gate.sh`-style, it can also fail with "unexpected EOF" *reading*
+the response, after the write already succeeded — and retrying that
+blind re-ran the request, observed live as `hack/smoke.sh`'s counter
+demo jumping from 3 straight to 4 (one request, two increments).
+Caught by review before landing.
+
+Fixed instead at the source: `ingressBridge.Restarted`, called right
+after `Namespace.Restore` succeeds and before the SIGUSR2 that tells
+init to kill the old workers, bumps a generation counter and drains
+every connection already queued, so a straggler accepted in that
+narrow window is dropped rather than handed to a real request.
+`RoundTrip` keeps exactly one narrow retry on top of that: a
+write-side EPIPE/ECONNRESET, where nothing was ever delivered, never a
+failure while reading the response. `internal/atelet/worker.go`.
+
+Verified: `hack/smoke.sh` five times in a row (the review's own ask),
+after this fix: 4/5 PASS. The one failure reproduced the residual,
+intentionally-unretried case — a straggler's write lands, the far end
+is already gone, the response read gets "unexpected EOF" — with full
+diagnostics (node log, `/tmp/ate-ish-smoke-last.log`) now capturing it
+instead of dying silently, and no double-execution. `hack/gate.sh`
+with the real model, from a clean shell per #3 above: PASS.

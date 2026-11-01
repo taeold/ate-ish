@@ -27,10 +27,48 @@ if [[ "$FAKE" == 1 ]]; then
 else
   POLICY=${POLICY:-demo/pi-durable/egress-policy-gateway.yaml}
 fi
-: "${ATE_URL:?set ATE_URL}"
+ATE_URL="${ATE_URL:-http://127.0.0.1:8080}"
 export ATE_URL
 work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+GATE_NODE_PID=""
+cleanup() {
+  if [[ -n "$GATE_NODE_PID" ]]; then
+    kill "$GATE_NODE_PID" 2>/dev/null || true
+    wait "$GATE_NODE_PID" 2>/dev/null || true
+  fi
+  rm -rf "$work"
+}
+trap cleanup EXIT
+
+# nodeUp prints /admin/workers's own http code against $ATE_URL, or ""
+# on a connection refused/timeout (curl's own exit nonzero, caught so
+# `set -e` does not end the script on the common "nothing there yet"
+# case).
+nodeUp() { curl -s -o /dev/null -m 2 -w '%{http_code}' "$ATE_URL/admin/workers" 2>/dev/null || true; }
+
+if [[ "$(nodeUp)" != "200" ]]; then
+  echo "== no node answering at $ATE_URL: starting one (same as hack/smoke.sh) =="
+  CGO_ENABLED=0 go build -o bin/ate-ish ./cmd/ate-ish
+  export ATE_DIR="$work/ate-node"
+  export ATE_STORE="dir:$work/ate-store"
+  export ATE_LISTEN="${ATE_URL#http://}"
+  # AI_GATEWAY_API_KEY, and under --fake ATE_EGRESS_RESOLVE/
+  # ATE_EGRESS_TEST_CA, are already in this process's own environment
+  # when the caller set them; bin/ate-ish inherits them as any forked
+  # child does. The demo policies resolve their credential from
+  # ate-secret://env/AI_GATEWAY_API_KEY, i.e. from this node's own
+  # environment, never a file or Secret Manager, so this is the only
+  # thing that needs to carry over.
+  bin/ate-ish >"$work/node.log" 2>&1 &
+  GATE_NODE_PID=$!
+  for _ in $(seq 1 200); do
+    [[ "$(nodeUp)" == "200" ]] && break
+    sleep 0.1
+  done
+  [[ "$(nodeUp)" == "200" ]] || { echo "FAILED: node never answered $ATE_URL: $(tail -c 2000 "$work/node.log")"; exit 1; }
+  echo "  node up at $ATE_URL (pid $GATE_NODE_PID), log at $work/node.log"
+fi
+
 sed "s|atespace: ate-demo-pi|atespace: $AS|" "$TEMPLATE" > "$work/template.yaml"
 
 ms() { echo $(( ($(date +%s%N) - $1) / 1000000 )); }

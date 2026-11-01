@@ -2,6 +2,7 @@ package atelet
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -19,6 +20,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/taeold/ate-ish/internal/apierr"
@@ -391,6 +393,13 @@ func (w *Worker) boot(ctx context.Context, h *hosted, rec records.Actor) error {
 		}
 		bootErr = w.ns.Restore(ctx, w.runscPath, bundle.Dir, dirs.checkpointDir, h.actorUID, limits)
 		if bootErr == nil {
+			// The restored process tree resumes the previous
+			// generation's outforwarder workers before this node ever
+			// sends SIGUSR2 below; h.ingress.Restarted (ingressBridge's
+			// own doc comment) drops whatever either one has already
+			// left queued, before SIGUSR2 tells init to kill them and
+			// start fresh ones.
+			h.ingress.Restarted()
 			// Suspend's SIGUSR1 left every egress forwarder's listener
 			// closed (gVisor refuses to checkpoint a bound host socket);
 			// SIGUSR2 reopens them, matching the signal Namespace.Checkpoint's
@@ -744,14 +753,34 @@ func mustExecutable() string {
 // own outforwarder dials out to (never one the sandbox binds), pools the
 // connections that arrive, and replays each HTTP request over one of
 // them, exactly as the spike's nodebridge did.
+//
+// Restore races this pool against the sandbox's own outforwarder.restart
+// (init.go): gVisor's restore resumes the previous generation's
+// outforwarder workers as part of the restored process tree before this
+// node ever sends the SIGUSR2 that tells init to kill them and start
+// fresh ones, so for a short window a worker that is about to die can
+// still dial in and get Accept()ed here, leaving a connection in pool
+// that looks fine but is already dead, or dying, on the other end.
+// Restarted (called right after Restore succeeds) tags every connection
+// with a generation number and drops whatever is already queued, so a
+// straggler from that window is never handed to a real request; the one
+// case that can still slip through (a straggler dials in after the
+// drain but before the real kill lands) is covered by RoundTrip's own
+// narrow write-side retry below, not by widening what this drops.
 type ingressBridge struct {
 	sockPath string
 	ln       net.Listener
-	pool     chan net.Conn
+	pool     chan pooledConn
+	gen      atomic.Uint64
+}
+
+type pooledConn struct {
+	conn net.Conn
+	gen  uint64
 }
 
 func newIngressBridge(sockPath string) *ingressBridge {
-	return &ingressBridge{sockPath: sockPath, pool: make(chan net.Conn, 8)}
+	return &ingressBridge{sockPath: sockPath, pool: make(chan pooledConn, 8)}
 }
 
 func (b *ingressBridge) Listen() error {
@@ -767,10 +796,27 @@ func (b *ingressBridge) Listen() error {
 			if err != nil {
 				return
 			}
-			b.pool <- c
+			b.pool <- pooledConn{c, b.gen.Load()}
 		}
 	}()
 	return nil
+}
+
+// Restarted bumps the pool's generation and discards every connection
+// already queued: see ingressBridge's own doc comment for why a
+// connection queued before a restore's own SIGUSR2 kill lands cannot be
+// trusted. Call this once, right after Namespace.Restore succeeds, and
+// before sending that SIGUSR2.
+func (b *ingressBridge) Restarted() {
+	b.gen.Add(1)
+	for {
+		select {
+		case pc := <-b.pool:
+			pc.conn.Close()
+		default:
+			return
+		}
+	}
 }
 
 func (b *ingressBridge) Close() {
@@ -781,15 +827,68 @@ func (b *ingressBridge) Close() {
 }
 
 // RoundTrip implements http.RoundTripper over the pooled connections,
-// for httputil.ReverseProxy.
+// for httputil.ReverseProxy. The one thing it retries is a connection
+// that fails outright (EPIPE/ECONNRESET) while this process is still
+// writing the request to it: at that point nothing has been delivered
+// to the actor to run twice, unlike a failure while reading the
+// response, which this never retries, deliberately: a straggler
+// connection's write can succeed into the kernel's own socket buffer
+// even though the process on the other end is already gone, so an
+// "unexpected EOF" while reading the response does not prove the actor
+// never saw the request. Retrying there risks running it twice (seen
+// live: an earlier, broader version of this retry that did not draw
+// that line turned one counter-demo request into two, observed as the
+// counter jumping from 3 to 4); failing the request outright instead
+// is the safe side of that tradeoff. See ingressBridge's own doc
+// comment for the race (a pre-restart outforwarder straggler) this is
+// a backstop for, not the primary fix — Restarted handles the common
+// case; this residual window can still surface as an occasional
+// request failing right after a restore, same as before this fix, just
+// never as a duplicate.
 func (b *ingressBridge) RoundTrip(req *http.Request) (*http.Response, error) {
+	var body []byte
+	if req.Body != nil {
+		var err error
+		if body, err = io.ReadAll(req.Body); err != nil {
+			req.Body.Close()
+			return nil, err
+		}
+		req.Body.Close()
+	}
+	resp, err := b.roundTripOnce(req, body)
+	if isWriteSideStaleConn(err) {
+		resp, err = b.roundTripOnce(req, body)
+	}
+	return resp, err
+}
+
+// writeSideError marks an error that happened while writing the request,
+// before any response byte was read: the only kind RoundTrip retries,
+// and only for the specific syscall errors isWriteSideStaleConn checks.
+type writeSideError struct{ err error }
+
+func (e *writeSideError) Error() string { return e.err.Error() }
+func (e *writeSideError) Unwrap() error { return e.err }
+
+func isWriteSideStaleConn(err error) bool {
+	var wse *writeSideError
+	if !errors.As(err, &wse) {
+		return false
+	}
+	return errors.Is(wse.err, syscall.EPIPE) || errors.Is(wse.err, syscall.ECONNRESET)
+}
+
+func (b *ingressBridge) roundTripOnce(req *http.Request, body []byte) (*http.Response, error) {
 	c, err := b.take(req.Context(), 10*time.Second)
 	if err != nil {
 		return nil, err
 	}
+	if body != nil {
+		req.Body = io.NopCloser(bytes.NewReader(body))
+	}
 	if err := req.Write(c); err != nil {
 		c.Close()
-		return nil, err
+		return nil, &writeSideError{err}
 	}
 	resp, err := http.ReadResponse(bufio.NewReader(c), req)
 	if err != nil {
@@ -801,13 +900,27 @@ func (b *ingressBridge) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 func (b *ingressBridge) take(ctx context.Context, timeout time.Duration) (net.Conn, error) {
-	select {
-	case c := <-b.pool:
-		return c, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	case <-time.After(timeout):
-		return nil, fmt.Errorf("ingress bridge %s: no connection from the sandbox's outforwarder within %s", b.sockPath, timeout)
+	deadline := time.Now().Add(timeout)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, fmt.Errorf("ingress bridge %s: no connection from the sandbox's outforwarder within %s", b.sockPath, timeout)
+		}
+		select {
+		case pc := <-b.pool:
+			if pc.gen < b.gen.Load() {
+				// Queued before the last Restarted() drained the pool
+				// (the narrow race Restarted's own doc comment names);
+				// discard and keep waiting rather than hand it out.
+				pc.conn.Close()
+				continue
+			}
+			return pc.conn, nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(remaining):
+			return nil, fmt.Errorf("ingress bridge %s: no connection from the sandbox's outforwarder within %s", b.sockPath, timeout)
+		}
 	}
 }
 

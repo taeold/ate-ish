@@ -11,6 +11,51 @@ cd "$(dirname "$0")/.."
 t_start=$(date +%s%N)
 ms() { echo $(( ($(date +%s%N) - $1) / 1000000 )); }
 
+# my_userns is this shell's own user namespace, the baseline the leak
+# check (assert_no_userns_leak, item 1's review fix) compares every
+# other exedev-owned process against.
+my_userns=$(readlink /proc/$$/ns/user)
+
+# CURRENT_NODE_LOG is whichever node's log is relevant right now; fail
+# (below) tails it on any assertion failure. Each section that starts a
+# node points this at that node's own log right after starting it.
+CURRENT_NODE_LOG=""
+
+# fail prints $1, then (found once in review: smoke.sh died on an
+# intermittent resume failure with exit 1 and no message at all, because
+# `got=$(...)` under `set -e´+pipefail exits silently when the command
+# substitution's own pipeline fails) the last 40 lines of
+# CURRENT_NODE_LOG, copied first to /tmp/ate-ish-smoke-last.log so they
+# survive the cleanup trap's own teardown of $work.
+fail() { # message
+  echo "FAILED: $1"
+  if [[ -n "$CURRENT_NODE_LOG" && -f "$CURRENT_NODE_LOG" ]]; then
+    cp -f "$CURRENT_NODE_LOG" /tmp/ate-ish-smoke-last.log 2>/dev/null || true
+    echo "  last 40 lines of $CURRENT_NODE_LOG (copied to /tmp/ate-ish-smoke-last.log):"
+    tail -n 40 "$CURRENT_NODE_LOG" | sed 's/^/    /'
+  fi
+  exit 1
+}
+
+# assert_no_userns_leak fails if any process this user owns sits in a
+# user namespace other than this shell's own. The namespace holder used
+# to leak this way (item 1's review fix): "sleep infinity", pid 1 of its
+# own pid namespace, outlived its node under both SIGINT and SIGKILL and
+# needed SIGKILL by hand since it ignores SIGTERM.
+assert_no_userns_leak() { # message
+  local pid ns leaked=()
+  for pid in $(pgrep -u "$(id -u)" 2>/dev/null); do
+    ns=$(readlink "/proc/$pid/ns/user" 2>/dev/null) || continue
+    [[ "$ns" == "$my_userns" ]] && continue
+    leaked+=("pid=$pid ns=$ns cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || echo '?')")
+  done
+  if [[ ${#leaked[@]} -gt 0 ]]; then
+    echo "FAILED: $1"
+    printf '  %s\n' "${leaked[@]}"
+    exit 1
+  fi
+}
+
 work=$(mktemp -d)
 NODE_PID=""
 FAKE_PID=""
@@ -102,7 +147,7 @@ for _ in $(seq 1 50); do
   [[ -s "$work/fakeupstream.ready" ]] && break
   sleep 0.1
 done
-[[ -s "$work/fakeupstream.ready" ]] || { echo "FAILED: fakeupstream never became ready: $(cat "$work/fakeupstream.log")"; exit 1; }
+[[ -s "$work/fakeupstream.ready" ]] || fail "fakeupstream never became ready: $(cat "$work/fakeupstream.log")"
 read -r FAKE_ADDR FAKE_CA < "$work/fakeupstream.ready"
 
 # A second stub stands in for a plain host-side test server behind a
@@ -114,7 +159,7 @@ for _ in $(seq 1 50); do
   [[ -s "$work/internal.ready" ]] && break
   sleep 0.1
 done
-[[ -s "$work/internal.ready" ]] || { echo "FAILED: internal.test stub never became ready: $(cat "$work/internal.log")"; exit 1; }
+[[ -s "$work/internal.ready" ]] || fail "internal.test stub never became ready: $(cat "$work/internal.log")"
 read -r INTERNAL_ADDR INTERNAL_CA < "$work/internal.ready"
 cat "$FAKE_CA" "$INTERNAL_CA" > "$work/combined-ca.pem"
 echo "  ai-gateway.vercel.sh stub $FAKE_ADDR, internal.test stub $INTERNAL_ADDR [$(ms "$t0") ms]"
@@ -130,13 +175,14 @@ export INTERNAL_TEST_KEY="$INTERNAL_KEY"
 export ATE_CAPACITY=8 # counter + gate.sh's 3 pi-durable actors + this script's 2 more
 bin/ate-ish >"$work/node.log" 2>&1 &
 NODE_PID=$!
+CURRENT_NODE_LOG="$work/node.log"
 export ATE_URL=http://127.0.0.1:8080
 for _ in $(seq 1 200); do
   code=$(curl -s -o /dev/null -w '%{http_code}' "$ATE_URL/admin/workers" || true)
   [[ "$code" == "200" ]] && break
   sleep 0.1
 done
-[[ "$code" == "200" ]] || { echo "FAILED: node never answered /admin/workers: $(tail -c 2000 "$work/node.log")"; exit 1; }
+[[ "$code" == "200" ]] || fail "node never answered /admin/workers: $(tail -c 2000 "$work/node.log")"
 echo "  up [$(ms "$t0") ms]"
 
 echo "== counter demo =="
@@ -146,12 +192,12 @@ bin/ate-ish create actor-template -f demo/counter/template.yaml
 bin/ate-ish create actor counter1 --template counter -a ate-demo-counter
 memoryCount() { grep -oE 'memory count: [0-9]+' | grep -oE '[0-9]+'; }
 for want in 1 2; do
-  got=$(curl -s -H "ate-target-actor: ate-demo-counter/counter1" "$ATE_URL/" | memoryCount)
-  [[ "$got" == "$want" ]] || { echo "FAILED: counter request $want returned '$got'"; exit 1; }
+  got=$(curl -s -H "ate-target-actor: ate-demo-counter/counter1" "$ATE_URL/" | memoryCount || true)
+  [[ "$got" == "$want" ]] || fail "counter request $want returned '$got'"
 done
 bin/ate-ish suspend actor counter1 -a ate-demo-counter
-got=$(curl -s -H "ate-target-actor: ate-demo-counter/counter1" "$ATE_URL/" | memoryCount)
-[[ "$got" == "3" ]] || { echo "FAILED: counter request after suspend returned '$got', want 3"; exit 1; }
+got=$(curl -s -H "ate-target-actor: ate-demo-counter/counter1" "$ATE_URL/" | memoryCount || true)
+[[ "$got" == "3" ]] || fail "counter request after suspend returned '$got', want 3"
 echo "  ok: 1, 2, suspend, 3 [$(ms "$t0") ms]"
 
 echo "== pi-durable turn against fakeupstream (hack/gate.sh --fake) =="
@@ -180,32 +226,32 @@ lastResult() { jq -r '[.view.messages[] | select(.role == "toolResult") | .conte
 cmd() { echo "Run this exact command with the bash tool and reply with its output only: $1"; }
 
 out=$(run g4-rules "$(cmd "node -e \"fetch('http://example.com/').then(r => console.log('status', r.status))\"")")
-echo "$out" | grep -q '"status":"done"' || { echo "FAILED: http rule turn did not settle: $out"; exit 1; }
-got=$(echo "$out" | lastResult)
-echo "$got" | grep -q '^status 200' || { echo "FAILED: http rule to example.com: $got"; exit 1; }
+echo "$out" | grep -q '"status":"done"' || fail "http rule turn did not settle: $out"
+got=$(echo "$out" | lastResult || true)
+echo "$got" | grep -q '^status 200' || fail "http rule to example.com: $got"
 echo "  ok: http rule reaches http://example.com/: $got"
 
 out=$(run g4-rules "$(cmd "node -e \"fetch('https://internal.test:8443/v1/chat/completions', {method: 'POST', headers: {'x-api-key': 'placeholder', 'content-type': 'application/json'}, body: '{}'}).then(r => console.log('status', r.status), e => console.log('failed:', e.cause?.message || e.message))\"")")
-got=$(echo "$out" | lastResult)
-echo "$got" | grep -q '^status 200' || { echo "FAILED: https non-443 rule to internal.test:8443: $got"; exit 1; }
+got=$(echo "$out" | lastResult || true)
+echo "$got" | grep -q '^status 200' || fail "https non-443 rule to internal.test:8443: $got"
 echo "  ok: https rule on a non-443 port reaches internal.test:8443, key replaced: $got"
 
 out=$(run g4-rules "$(cmd "node -e \"fetch('https://ai-gateway.vercel.sh/v1/chat/completions', {method: 'POST', headers: {'x-api-key': 'ate-placeholder-key', 'content-type': 'application/json'}, body: JSON.stringify({model: 'x', messages: []})}).then(r => console.log('status', r.status))\"")")
-got=$(echo "$out" | lastResult)
-echo "$got" | grep -q '^status 200' || { echo "FAILED: *.vercel.sh wildcard with key replaced: $got"; exit 1; }
+got=$(echo "$out" | lastResult || true)
+echo "$got" | grep -q '^status 200' || fail "*.vercel.sh wildcard with key replaced: $got"
 echo "  ok: *.vercel.sh matches ai-gateway.vercel.sh, placeholder key replaced: $got"
 
 out=$(run g4-star "$(cmd "node -e \"fetch('https://example.com').then(r => console.log('status', r.status))\"")")
-got=$(echo "$out" | lastResult)
-echo "$got" | grep -q '^status 200' || { echo "FAILED: bare * to example.com: $got"; exit 1; }
+got=$(echo "$out" | lastResult || true)
+echo "$got" | grep -q '^status 200' || fail "bare * to example.com: $got"
 out=$(run g4-star "$(cmd "node -e \"fetch('https://example.org').then(r => console.log('status', r.status))\"")")
-got=$(echo "$out" | lastResult)
-echo "$got" | grep -q '^status 200' || { echo "FAILED: bare * to example.org: $got"; exit 1; }
+got=$(echo "$out" | lastResult || true)
+echo "$got" | grep -q '^status 200' || fail "bare * to example.org: $got"
 echo "  ok: bare * reaches example.com and example.org with no key"
 
 out=$(run g4-rules "$(cmd "node -e \"fetch('https://example.org').then(r => console.log('status', r.status), e => console.log('failed:', e.cause?.message || e.message))\"")")
-got=$(echo "$out" | lastResult)
-echo "$got" | grep -q '^failed' || { echo "FAILED: example.org should be unlisted under g4-rules's policy: $got"; exit 1; }
+got=$(echo "$out" | lastResult || true)
+echo "$got" | grep -q '^failed' || fail "example.org should be unlisted under g4-rules's policy: $got"
 echo "  ok: under g4-rules's specific policy (no bare *), an unlisted name still fails: $got"
 echo "  [$(ms "$t0") ms]"
 
@@ -214,13 +260,11 @@ t0=$(date +%s%N)
 
 assert_no_runsc() { # state_dir
   if pgrep -af 'runsc-sandbox|runsc-gofer' | grep -qF -- "$1"; then
-    echo "FAILED: a runsc process still has root dir $1"
-    pgrep -af 'runsc-sandbox|runsc-gofer' | grep -F -- "$1"
-    exit 1
+    fail "a runsc process still has root dir $1: $(pgrep -af 'runsc-sandbox|runsc-gofer' | grep -F -- "$1")"
   fi
 }
 assert_runsc_present() { # state_dir, message
-  pgrep -af 'runsc-sandbox|runsc-gofer' | grep -qF -- "$1" || { echo "FAILED: $2"; exit 1; }
+  pgrep -af 'runsc-sandbox|runsc-gofer' | grep -qF -- "$1" || fail "$2"
 }
 
 echo "-- SIGINT: every sandbox this node runs stops, node exits with none left --"
@@ -228,20 +272,26 @@ kill -INT "$NODE_PID"
 wait "$NODE_PID" 2>/dev/null || true
 NODE_PID=""
 assert_no_runsc "$work/ate-node/runsc-state"
-echo "  ok: SIGINT suspended/stopped every sandbox, no runsc process remains"
+# Item 1's review fix: the held namespace's own holder used to outlive
+# SIGINT (it ignored SIGTERM, being pid 1 of its own pid namespace) and
+# pile up as an orphan. Confirm none of this user's processes is left
+# behind in a user namespace other than this shell's own.
+assert_no_userns_leak "a namespace holder outlived SIGINT of the node"
+echo "  ok: SIGINT suspended/stopped every sandbox, no runsc process remains, no namespace holder leaked"
 
 echo "-- SIGKILL: the next node start with the same state dir reaps what it left behind --"
 g2c_dir="$work/ate-g2c"
 G2C_URL=http://127.0.0.1:8082
 ATE_DIR="$g2c_dir" ATE_STORE="dir:$g2c_dir-store" ATE_LISTEN=127.0.0.1:8082 ATE_CAPACITY=2 bin/ate-ish >"$work/g2c-1.log" 2>&1 &
 G2C_PID=$!
+CURRENT_NODE_LOG="$work/g2c-1.log"
 track_node "$G2C_PID" "$g2c_dir"
 for _ in $(seq 1 100); do
   code=$(curl -s -o /dev/null -w '%{http_code}' "$G2C_URL/admin/workers" || true)
   [[ "$code" == "200" ]] && break
   sleep 0.1
 done
-[[ "$code" == "200" ]] || { echo "FAILED: g2c node never came up: $(tail -c 1000 "$work/g2c-1.log")"; exit 1; }
+[[ "$code" == "200" ]] || fail "g2c node never came up: $(tail -c 1000 "$work/g2c-1.log")"
 # demo/counter/template.yaml's own metadata.atespace is
 # ate-demo-counter; the actor must be created under that atespace, not
 # a new one, or create actor 404s looking for the template there.
@@ -257,20 +307,25 @@ echo "  ok: SIGKILL leaves the sandbox running with no ate-ish process alive"
 
 ATE_DIR="$g2c_dir" ATE_STORE="dir:$g2c_dir-store" ATE_LISTEN=127.0.0.1:8082 ATE_CAPACITY=2 bin/ate-ish >"$work/g2c-2.log" 2>&1 &
 G2C_PID=$!
+CURRENT_NODE_LOG="$work/g2c-2.log"
 track_node "$G2C_PID" "$g2c_dir"
 for _ in $(seq 1 100); do
   code=$(curl -s -o /dev/null -w '%{http_code}' "$G2C_URL/admin/workers" || true)
   [[ "$code" == "200" ]] && break
   sleep 0.1
 done
-[[ "$code" == "200" ]] || { echo "FAILED: g2c restart never came up: $(tail -c 1000 "$work/g2c-2.log")"; exit 1; }
-grep -q "reaped orphaned sandbox" "$work/g2c-2.log" || { echo "FAILED: restart did not log reaping the orphan: $(tail -c 1000 "$work/g2c-2.log")"; exit 1; }
+[[ "$code" == "200" ]] || fail "g2c restart never came up: $(tail -c 1000 "$work/g2c-2.log")"
+grep -q "reaped orphaned sandbox" "$work/g2c-2.log" || fail "restart did not log reaping the orphan: $(tail -c 1000 "$work/g2c-2.log")"
 assert_no_runsc "$g2c_dir/runsc-state"
 echo "  ok: restart with the same state dir found, killed and deleted the orphan, logged one line: $(grep "reaped orphaned sandbox" "$work/g2c-2.log")"
 
 kill -TERM "$G2C_PID"
 wait "$G2C_PID" 2>/dev/null || true
 assert_no_runsc "$g2c_dir/runsc-state"
+# Same check as after SIGINT above, now after a node that was itself
+# SIGKILLed (the g2c node, above) and the node that reaped its orphan:
+# neither one's namespace holder should still be around.
+assert_no_userns_leak "a namespace holder outlived SIGKILL of the node, or its restart's reap"
 echo "  [$(ms "$t0") ms]"
 
 echo "== G5 non-root images =="
@@ -283,20 +338,21 @@ g5_dir="$work/ate-g5a"
 G5_URL=http://127.0.0.1:8083
 ATE_SANDBOX_FORCE_ROOT_ONLY_MAPPING=1 ATE_DIR="$g5_dir" ATE_STORE="dir:$g5_dir-store" ATE_LISTEN=127.0.0.1:8083 ATE_CAPACITY=2 bin/ate-ish >"$work/g5a.log" 2>&1 &
 G5_PID=$!
+CURRENT_NODE_LOG="$work/g5a.log"
 track_node "$G5_PID" "$g5_dir"
 for _ in $(seq 1 100); do
   code=$(curl -s -o /dev/null -w '%{http_code}' "$G5_URL/admin/workers" || true)
   [[ "$code" == "200" ]] && break
   sleep 0.1
 done
-[[ "$code" == "200" ]] || { echo "FAILED: g5 root-only node never came up: $(tail -c 1000 "$work/g5a.log")"; exit 1; }
-grep -q "non-root images will fail" "$work/g5a.log" || { echo "FAILED: missing the root-only fallback log line: $(tail -c 1000 "$work/g5a.log")"; exit 1; }
+[[ "$code" == "200" ]] || fail "g5 root-only node never came up: $(tail -c 1000 "$work/g5a.log")"
+grep -q "non-root images will fail" "$work/g5a.log" || fail "missing the root-only fallback log line: $(tail -c 1000 "$work/g5a.log")"
 echo "  ok: $(grep "held namespace maps" "$work/g5a.log")"
 ATE_URL="$G5_URL" bin/ate-ish create atespace ate-demo-nonroot >/dev/null
 ATE_URL="$G5_URL" bin/ate-ish create actor-template -f demo/g5-nonroot/template.yaml >/dev/null
 ATE_URL="$G5_URL" bin/ate-ish create actor nonroot1 --template nonroot -a ate-demo-nonroot >/dev/null
-got=$(curl -s -m 15 -H "ate-target-actor: ate-demo-nonroot/nonroot1" "$G5_URL/")
-echo "$got" | grep -q '"write":"failed' || { echo "FAILED: expected the USER node image's write to fail under root-only mapping: $got"; exit 1; }
+got=$(curl -s -m 15 -H "ate-target-actor: ate-demo-nonroot/nonroot1" "$G5_URL/" || true)
+echo "$got" | grep -q '"write":"failed' || fail "expected the USER node image's write to fail under root-only mapping: $got"
 echo "  ok: the USER node image boots but its own write fails under root-only mapping: $got"
 kill -TERM "$G5_PID"
 wait "$G5_PID" 2>/dev/null || true
@@ -308,36 +364,37 @@ if command -v newuidmap >/dev/null 2>&1 && command -v newgidmap >/dev/null 2>&1;
   G5_URL2=http://127.0.0.1:8084
   ATE_DIR="$g5_dir2" ATE_STORE="dir:$g5_dir2-store" ATE_LISTEN=127.0.0.1:8084 ATE_CAPACITY=4 bin/ate-ish >"$work/g5b.log" 2>&1 &
   G5_PID=$!
+  CURRENT_NODE_LOG="$work/g5b.log"
   track_node "$G5_PID" "$g5_dir2"
   for _ in $(seq 1 100); do
     code=$(curl -s -o /dev/null -w '%{http_code}' "$G5_URL2/admin/workers" || true)
     [[ "$code" == "200" ]] && break
     sleep 0.1
   done
-  [[ "$code" == "200" ]] || { echo "FAILED: g5 multi-ID node never came up: $(tail -c 1000 "$work/g5b.log")"; exit 1; }
-  grep -q "non-root actor images work" "$work/g5b.log" || { echo "FAILED: missing the multi-ID mapping log line: $(tail -c 1000 "$work/g5b.log")"; exit 1; }
+  [[ "$code" == "200" ]] || fail "g5 multi-ID node never came up: $(tail -c 1000 "$work/g5b.log")"
+  grep -q "non-root actor images work" "$work/g5b.log" || fail "missing the multi-ID mapping log line: $(tail -c 1000 "$work/g5b.log")"
   echo "  ok: $(grep "held namespace maps" "$work/g5b.log")"
 
   ATE_URL="$G5_URL2" bin/ate-ish create atespace ate-demo-nonroot >/dev/null
   ATE_URL="$G5_URL2" bin/ate-ish create actor-template -f demo/g5-nonroot/template.yaml >/dev/null
   ATE_URL="$G5_URL2" bin/ate-ish create actor nonroot1 --template nonroot -a ate-demo-nonroot >/dev/null
-  got=$(curl -s -m 15 -H "ate-target-actor: ate-demo-nonroot/nonroot1" "$G5_URL2/")
-  echo "$got" | grep -q '"write":"ok"' || { echo "FAILED: USER node image should work under multi-ID mapping: $got"; exit 1; }
-  echo "$got" | grep -q 'uid=1000(node)' || { echo "FAILED: id should report uid=1000(node): $got"; exit 1; }
+  got=$(curl -s -m 15 -H "ate-target-actor: ate-demo-nonroot/nonroot1" "$G5_URL2/" || true)
+  echo "$got" | grep -q '"write":"ok"' || fail "USER node image should work under multi-ID mapping: $got"
+  echo "$got" | grep -q 'uid=1000(node)' || fail "id should report uid=1000(node): $got"
   echo "  ok: the USER node image writes its own home and reports its own uid: $got"
 
   ATE_URL="$G5_URL2" bin/ate-ish create actor-template -f demo/g5-gosu/template.yaml >/dev/null
   ATE_URL="$G5_URL2" bin/ate-ish create actor gosu1 --template gosu-nobody -a ate-demo-nonroot >/dev/null
-  got=$(curl -s -m 15 -H "ate-target-actor: ate-demo-nonroot/gosu1" "$G5_URL2/")
-  echo "$got" | grep -q 'uid=65534(nobody)' || { echo "FAILED: gosu to nobody should report uid=65534: $got"; exit 1; }
+  got=$(curl -s -m 15 -H "ate-target-actor: ate-demo-nonroot/gosu1" "$G5_URL2/" || true)
+  echo "$got" | grep -q 'uid=65534(nobody)' || fail "gosu to nobody should report uid=65534: $got"
   echo "  ok: a root-starting actor's own gosu drops to nobody: $got"
 
   ATE_URL="$G5_URL2" bin/ate-ish create atespace ate-demo-counter >/dev/null
   ATE_URL="$G5_URL2" bin/ate-ish create actor-template -f demo/counter/template.yaml >/dev/null
   ATE_URL="$G5_URL2" bin/ate-ish create actor counter1 --template counter -a ate-demo-counter >/dev/null
-  c1=$(curl -s -m 15 -H "ate-target-actor: ate-demo-counter/counter1" "$G5_URL2/" | memoryCount)
-  c2=$(curl -s -m 15 -H "ate-target-actor: ate-demo-counter/counter1" "$G5_URL2/" | memoryCount)
-  [[ "$c1" == "1" && "$c2" == "2" ]] || { echo "FAILED: counter under multi-ID mapping returned '$c1' then '$c2'"; exit 1; }
+  c1=$(curl -s -m 15 -H "ate-target-actor: ate-demo-counter/counter1" "$G5_URL2/" | memoryCount || true)
+  c2=$(curl -s -m 15 -H "ate-target-actor: ate-demo-counter/counter1" "$G5_URL2/" | memoryCount || true)
+  [[ "$c1" == "1" && "$c2" == "2" ]] || fail "counter under multi-ID mapping returned '$c1' then '$c2'"
   echo "  ok: the counter (a root-run image) still runs under multi-ID mapping"
 
   kill -TERM "$G5_PID"
@@ -357,20 +414,21 @@ bin/fakeupstream -listen 127.0.0.1:0 -hostname ai-gateway.vercel.sh -api-key g6k
 G6_FAKE_PID=$!
 track_pid "$G6_FAKE_PID"
 for _ in $(seq 1 50); do [[ -s "$work/g6-fake.ready" ]] && break; sleep 0.1; done
-[[ -s "$work/g6-fake.ready" ]] || { echo "FAILED: G6 fakeupstream never became ready: $(cat "$work/g6-fake.log")"; exit 1; }
+[[ -s "$work/g6-fake.ready" ]] || fail "G6 fakeupstream never became ready: $(cat "$work/g6-fake.log")"
 read -r G6_FAKE_ADDR G6_FAKE_CA < "$work/g6-fake.ready"
 ATE_DIR="$g6_dir" ATE_STORE="dir:$g6_dir-store" ATE_LISTEN=127.0.0.1:8087 ATE_CAPACITY=2 \
   ATE_EGRESS_RESOLVE="ai-gateway.vercel.sh=$G6_FAKE_ADDR" ATE_EGRESS_TEST_CA="$G6_FAKE_CA" \
   AI_GATEWAY_API_KEY=g6key \
   bin/ate-ish >"$work/g6-node.log" 2>&1 &
 G6_PID=$!
+CURRENT_NODE_LOG="$work/g6-node.log"
 track_node "$G6_PID" "$g6_dir"
 for _ in $(seq 1 100); do
   code=$(curl -s -o /dev/null -w '%{http_code}' "$G6_URL/admin/workers" || true)
   [[ "$code" == "200" ]] && break
   sleep 0.1
 done
-[[ "$code" == "200" ]] || { echo "FAILED: G6 node never came up: $(tail -c 1000 "$work/g6-node.log")"; exit 1; }
+[[ "$code" == "200" ]] || fail "G6 node never came up: $(tail -c 1000 "$work/g6-node.log")"
 sed "s|atespace: ate-demo-pi|atespace: ate-demo-g6|" demo/pi-durable/template-gateway.yaml > "$work/g6-template.yaml"
 ATE_URL="$G6_URL" bin/ate-ish create atespace ate-demo-g6 >/dev/null
 ATE_URL="$G6_URL" bin/ate-ish create actor-template -f "$work/g6-template.yaml" >/dev/null
@@ -415,20 +473,21 @@ bin/fakeupstream -listen 127.0.0.1:0 -hostname ai-gateway.vercel.sh -api-key g7k
 G7_FAKE_PID=$!
 track_pid "$G7_FAKE_PID"
 for _ in $(seq 1 50); do [[ -s "$work/g7-fake.ready" ]] && break; sleep 0.1; done
-[[ -s "$work/g7-fake.ready" ]] || { echo "FAILED: G7 fakeupstream never became ready: $(cat "$work/g7-fake.log")"; exit 1; }
+[[ -s "$work/g7-fake.ready" ]] || fail "G7 fakeupstream never became ready: $(cat "$work/g7-fake.log")"
 read -r G7_FAKE_ADDR G7_FAKE_CA < "$work/g7-fake.ready"
 ATE_DIR="$g7_dir" ATE_STORE="dir:$g7_dir-store" ATE_LISTEN=127.0.0.1:8088 ATE_CAPACITY=2 \
   ATE_EGRESS_RESOLVE="ai-gateway.vercel.sh=$G7_FAKE_ADDR" ATE_EGRESS_TEST_CA="$G7_FAKE_CA" \
   AI_GATEWAY_API_KEY=g7key \
   bin/ate-ish >"$work/g7-node.log" 2>&1 &
 G7_PID=$!
+CURRENT_NODE_LOG="$work/g7-node.log"
 track_node "$G7_PID" "$g7_dir"
 for _ in $(seq 1 100); do
   code=$(curl -s -o /dev/null -w '%{http_code}' "$G7_URL/admin/workers" || true)
   [[ "$code" == "200" ]] && break
   sleep 0.1
 done
-[[ "$code" == "200" ]] || { echo "FAILED: G7 node never came up: $(tail -c 1000 "$work/g7-node.log")"; exit 1; }
+[[ "$code" == "200" ]] || fail "G7 node never came up: $(tail -c 1000 "$work/g7-node.log")"
 sed "s|atespace: ate-demo-pi|atespace: ate-demo-g7|" demo/pi-durable/template-gateway.yaml > "$work/g7-template.yaml"
 ATE_URL="$G7_URL" bin/ate-ish create atespace ate-demo-g7 >/dev/null
 ATE_URL="$G7_URL" bin/ate-ish create actor-template -f "$work/g7-template.yaml" >/dev/null
@@ -437,9 +496,9 @@ ATE_URL="$G7_URL" bin/ate-ish create egress-policy g7agent -a ate-demo-g7 -f dem
 curl -s -m 15 -X POST -H 'Content-Type: application/json' -H "ate-target-actor: ate-demo-g7/g7agent" -d '{"prompt":"hello"}' "$G7_URL/submit" -o /dev/null
 ATE_URL="$G7_URL" bin/ate-ish suspend actor g7agent -a ate-demo-g7 >/dev/null
 tr0=$(date +%s%N)
-code=$(curl -s -m 15 -X POST -H 'Content-Type: application/json' -H "ate-target-actor: ate-demo-g7/g7agent" -d '{"prompt":"hello again"}' "$G7_URL/submit" -o /dev/null -w '%{http_code}')
+code=$(curl -s -m 15 -X POST -H 'Content-Type: application/json' -H "ate-target-actor: ate-demo-g7/g7agent" -d '{"prompt":"hello again"}' "$G7_URL/submit" -o /dev/null -w '%{http_code}' || true)
 restore_ms=$(( ($(date +%s%N)-tr0)/1000000 ))
-[[ "$code" == "200" ]] || { echo "FAILED: first request after restore returned $code"; exit 1; }
+[[ "$code" == "200" ]] || fail "first request after restore returned $code"
 echo "  first request after restore: ${restore_ms} ms total (restore + boot + the turn itself), code $code"
 # Before the SIGUSR2 redial fix (init.go's outforwarder.restart), this
 # measured 10000+ ms: the sandboxed ingress outforwarder's restored
@@ -448,7 +507,7 @@ echo "  first request after restore: ${restore_ms} ms total (restore + boot + th
 # precise bar (docs/ROOTLESS.md's own 1s is about the redial itself,
 # not this full round trip's fake-model turn on top of it); see
 # docs/PROGRESS-ROOTLESS.md's stage C section for the measured number.
-[[ "$restore_ms" -lt 5000 ]] || { echo "FAILED: first request after restore took ${restore_ms} ms"; exit 1; }
+[[ "$restore_ms" -lt 5000 ]] || fail "first request after restore took ${restore_ms} ms"
 kill "$G7_PID" 2>/dev/null || true
 wait "$G7_PID" 2>/dev/null || true
 assert_no_runsc "$g7_dir/runsc-state"

@@ -30,7 +30,11 @@ import (
 // wrapped around that runsc call (scope.go), not from this namespace.
 type Namespace struct {
 	holder   *exec.Cmd
-	pid      int // the held namespace's own pid, i.e. the "sleep infinity" process's
+	holderW  *os.File // write end of the pipe the holder blocks reading (see openHolder);
+	// closing it, or this process dying for any reason including SIGKILL (which makes the
+	// kernel close every fd it still holds on its own), is what makes the holder's read
+	// return and the holder exit, tearing the namespace it is pid 1 of down with it.
+	pid      int // the held namespace's own pid, i.e. the holder process's
 	stateDir string
 	multiID  bool // Open's own idmap.go result; see MultiIDMapping
 }
@@ -86,7 +90,9 @@ func unshareBinary() string {
 const noUsernsEnv = "ATE_SANDBOX_NO_USERNS"
 
 // Open unshares a fresh user+mount+network+pid namespace and holds it
-// open with a sleep placeholder exactly as the spike's holder_start did.
+// open with a holder process blocked reading a pipe this process keeps
+// the write end of (openHolder); see Close for why that, not a bare
+// "sleep infinity", is what makes the held namespace actually go away.
 // stateDir is where runsc keeps its own --root state (container
 // metadata); it must be resolved inside the held mount namespace, so
 // every runsc call that enters this namespace sees the same one.
@@ -137,22 +143,50 @@ func Open(stateDir, runscPath string) (*Namespace, error) {
 	return n, nil
 }
 
-// openHolder starts the "sleep infinity" placeholder and waits for its
-// pid, mapping only root itself (via unshare --map-root-user) when
-// mapping.multi is false, or leaving the id map empty and pending
-// (Open's own applyIDMapping call writes it) when true.
+// openHolder starts the holder and waits for its pid, mapping only root
+// itself (via unshare --map-root-user) when mapping.multi is false, or
+// leaving the id map empty and pending (Open's own applyIDMapping call
+// writes it) when true.
+//
+// The holder used to be a bare "sleep infinity": SIGTERM/SIGINT of the
+// node called Close, which killed the wrong process (the unshare
+// wrapper that had already exited once it forked, not the "sleep
+// infinity" --fork left behind as pid 1 of the new pid namespace), and
+// a SIGKILL of the node called nothing at all. Either way "sleep
+// infinity" outlived the node, pinning its user+mount+net namespace
+// open as an orphan that ignores SIGTERM (pid 1 of its own pid
+// namespace) and needs SIGKILL by hand.
+//
+// The holder is now `sh -c 'read -r _ <&3; exit 0'`, blocked reading fd
+// 3, the read end of a pipe whose write end (holderW) this process
+// keeps open for as long as it runs and never writes to. That fd table
+// entry, not any code path in this process, is what ties the holder's
+// life to the node's: when this process dies for any reason, including
+// SIGKILL, the kernel closes every fd it still holds on its own,
+// including holderW, which the holder's read sees as EOF. It then
+// returns, the holder (pid 1 of the namespace) exits, and the kernel
+// tears the namespace down with it. Close also closes holderW
+// explicitly so a graceful shutdown does not wait on any of this.
 func openHolder(mapping idMapping) (*Namespace, error) {
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		return nil, fmt.Errorf("creating the holder's pipe: %w", err)
+	}
 	args := []string{"--user"}
 	if !mapping.multi {
 		args = append(args, "--map-root-user")
 	}
-	args = append(args, "--net", "--mount", "--pid", "--fork", "--propagation=private", "sleep", "infinity")
+	args = append(args, "--net", "--mount", "--pid", "--fork", "--propagation=private", "sh", "-c", "read -r _ <&3; exit 0")
 	holder := exec.Command(unshareBinary(), args...)
 	holder.Stderr = os.Stderr
+	holder.ExtraFiles = []*os.File{pr} // becomes fd 3 in the child (0-2 are stdin/stdout/stderr)
 	if err := holder.Start(); err != nil {
+		pr.Close()
+		pw.Close()
 		return nil, fmt.Errorf("unshare: %w\n%s", err, unprivilegedHint)
 	}
-	n := &Namespace{holder: holder}
+	pr.Close() // this process's own copy; the child kept its own at exec
+	n := &Namespace{holder: holder, holderW: pw}
 	pid, err := waitForHeldPID(holder.Process.Pid, 5*time.Second)
 	if err != nil {
 		n.Close()
@@ -163,11 +197,13 @@ func openHolder(mapping idMapping) (*Namespace, error) {
 }
 
 // holderPIDFile is where Open records the held namespace's own pid
-// (n.pid, the "sleep infinity" placeholder), so a later Open against the
-// same stateDir can tell a holder a SIGKILLed node never closed from one
-// this package itself is about to replace. Sibling to stateDir rather
-// than inside it, so it is never mistaken for one of runsc's own
-// per-sandbox state entries.
+// (n.pid, the holder process), so a later Open against the same
+// stateDir can tell a holder a SIGKILLed node never closed from one
+// this package itself is about to replace. In practice the holder's own
+// pipe read (openHolder) already makes a SIGKILLed node's holder exit
+// on its own; this stays as the safety net for whatever that misses.
+// Sibling to stateDir rather than inside it, so it is never mistaken for
+// one of runsc's own per-sandbox state entries.
 func holderPIDFile(stateDir string) string {
 	return filepath.Join(filepath.Dir(stateDir), "holder.pid")
 }
@@ -214,13 +250,13 @@ func reapOrphans(stateDir, runscPath string) {
 	os.Remove(holderPIDFile(stateDir))
 }
 
-// waitForHeldPID polls unsharePID's own child list for the "sleep
-// infinity" process unshare's --fork created: that process, not unshare
-// itself, is the one whose /proc/<pid>/ns/* are the namespaces to enter
-// (matching the spike's node.sh holder_start, which looked the same
-// process up by name). Reading unsharePID's own children, rather than a
-// system-wide pgrep by command name, keeps this correct with more than
-// one node (and so more than one held namespace) on the same host.
+// waitForHeldPID polls unsharePID's own child list for the holder
+// process unshare's --fork created: that process, not unshare itself, is
+// the one whose /proc/<pid>/ns/* are the namespaces to enter (matching
+// the spike's node.sh holder_start, which looked the same process up by
+// name). Reading unsharePID's own children, rather than a system-wide
+// pgrep by command name, keeps this correct with more than one node
+// (and so more than one held namespace) on the same host.
 func waitForHeldPID(unsharePID int, timeout time.Duration) (int, error) {
 	deadline := time.Now().Add(timeout)
 	childrenFile := fmt.Sprintf("/proc/%d/task/%d/children", unsharePID, unsharePID)
@@ -256,15 +292,22 @@ func logUIDMappingOnce(mapping idMapping, fallbackReason string) {
 	fmt.Fprintf(os.Stderr, "ate-ish: held namespace maps root only (%s); non-root images will fail\n", fallbackReason)
 }
 
-// Close tears the held namespace down. The holder is pid 1 of its own pid
-// namespace, so it ignores SIGTERM; the spike's own holder_stop used
-// SIGKILL for the same reason.
+// Close tears the held namespace down. Closing holderW is what actually
+// does it (see openHolder): it unblocks the holder's read with EOF, and
+// the holder, pid 1 of its own pid namespace, exits and takes the
+// namespace with it. The explicit Kill below is belt-and-suspenders for
+// a holder that is not yet blocked on that read for some reason; the
+// holder is otherwise pid 1 of its own pid namespace and so ignores
+// SIGTERM, same as the spike's own holder_stop found.
 func (n *Namespace) Close() error {
 	if n == nil || n.holder == nil || n.holder.Process == nil {
 		return nil
 	}
 	if n.stateDir != "" {
 		os.Remove(holderPIDFile(n.stateDir))
+	}
+	if n.holderW != nil {
+		n.holderW.Close()
 	}
 	err := n.holder.Process.Kill()
 	n.holder.Wait()
