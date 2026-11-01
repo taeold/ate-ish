@@ -23,6 +23,7 @@ import (
 	"github.com/taeold/ate-ish/internal/cli"
 	"github.com/taeold/ate-ish/internal/envutil"
 	"github.com/taeold/ate-ish/internal/ingress"
+	"github.com/taeold/ate-ish/internal/sandbox"
 	"github.com/taeold/ate-ish/internal/store"
 
 	// Root certificates for images without them, such as node:24-slim.
@@ -30,14 +31,22 @@ import (
 )
 
 func main() {
+	// Hidden: the in-sandbox programs (init, the egress forwarder, the
+	// ingress dial-out forwarder) are this same binary, copied into each
+	// actor's bundle at /.ate/ate-ish and invoked with one of these
+	// args. Not part of the kubectl-ate CLI surface, checked before any
+	// of it runs.
+	if handled, err := sandbox.Dispatch(os.Args[1:]); handled {
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "ate-ish:", err)
+			os.Exit(1)
+		}
+		return
+	}
 	var err error
 	switch cmd := append(os.Args[1:], "")[0]; cmd {
 	case "":
 		err = serve()
-	case "__cgroup-helper":
-		// Hidden: internal/atelet's own private-mount-namespace child,
-		// re-exec'd by its cgroup helper. Not a user-facing command.
-		err = atelet.RunCgroupHelper(os.Args[2])
 	case "fetch-runsc":
 		// Hidden: stages the pinned gVisor release at ATE_RUNSC_DIR (or
 		// its default), the same code serve() calls on worker startup.
@@ -136,9 +145,6 @@ func serve() error {
 	ctx := context.Background()
 	role := envutil.Get("ATE_ROLE", "all")
 	port := envutil.Get("ATE_LISTEN", "8080")
-	if (role == "all" || role == "worker") && os.Geteuid() != 0 {
-		return fmt.Errorf("ATE_ROLE=%s runs the vendored gVisor worker, which needs root (cgroup delegation, network namespaces): run as sudo", role)
-	}
 	if role == "all" || role == "worker" {
 		if err := atelet.EnsureRunsc(); err != nil {
 			return fmt.Errorf("fetching runsc: %w", err)

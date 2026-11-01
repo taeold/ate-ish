@@ -3,60 +3,20 @@ package atelet
 import (
 	"archive/tar"
 	"compress/gzip"
-	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/taeold/ate-ish/internal/devatelet"
 	"github.com/taeold/ate-ish/internal/records"
-	"github.com/taeold/ate-ish/internal/store"
-	"github.com/taeold/ate-ish/third_party/substrate/exported/proto/ateletpb"
-	"github.com/taeold/ate-ish/third_party/substrate/exported/proto/ateworkerpb"
 )
 
-// actorPolicyLookup reads the egress policy already stored on the actor's
-// own bucket record (the one `ate-ish create egress-policy` writes) and
-// translates it for atunnel's DNS relay and egress path, which both check
-// hostnames against the *ateletpb.EgressPolicy* shape, not ate-ish's own
-// simpler EgressPolicy JSON type. This is a hostname allow-list lookup, not
-// credential injection: the hostname just has to be the one the policy
-// names for its DNS query and its CONNECT to resolve and reach the gateway
-// at all. Replacing a placeholder API key with the real secret, inside the
-// gateway's own TLS termination, is stage 3's job.
-func actorPolicyLookup(b store.Store) devatelet.PolicyLookup {
-	return func(ctx context.Context, atespace, name string) (*ateletpb.EgressPolicy, error) {
-		var rec records.Actor
-		if _, err := b.Get(ctx, records.ActorKey(atespace, name), &rec); err != nil {
-			if errors.Is(err, store.ErrNotFound) {
-				return nil, nil
-			}
-			return nil, err
-		}
-		if rec.EgressPolicy == nil {
-			return nil, nil
-		}
-		out := &ateletpb.EgressPolicy{}
-		for _, rule := range rec.EgressPolicy.Rules {
-			if len(rule.HTTPS.Hostnames) == 0 {
-				continue
-			}
-			out.Rules = append(out.Rules, &ateletpb.EgressRule{
-				Https: &ateletpb.EgressDestinations{Hostnames: rule.HTTPS.Hostnames},
-			})
-		}
-		return out, nil
-	}
-}
-
-// actorUID returns a fresh lowercase UUID: ateworkerpb's actor_uid field and
-// nodepath.ActorSandboxAssetsDir both require a DNS-1123 label, which a
-// standard lowercase UUID already is.
+// newActorUID returns a fresh lowercase UUID: it is both the runsc
+// container id and the bundle directory name, so it must be a safe path
+// component, which a standard lowercase UUID already is.
 func newActorUID() string {
 	b := make([]byte, 16)
 	rand.Read(b)
@@ -66,12 +26,11 @@ func newActorUID() string {
 		hex.EncodeToString(b[6:8]), hex.EncodeToString(b[8:10]), hex.EncodeToString(b[10:16]))
 }
 
-// fidelityOf maps a Template's preferredFidelity to the proto enum.
-func fidelityOf(tmpl records.Template) ateworkerpb.SnapshotFidelity {
-	if strings.EqualFold(tmpl.PreferredFidelity, "MEMORY") {
-		return ateworkerpb.SnapshotFidelity_SNAPSHOT_FIDELITY_MEMORY
-	}
-	return ateworkerpb.SnapshotFidelity_SNAPSHOT_FIDELITY_VOLUMES
+// fidelityIsMemory reports whether tmpl asks for a MEMORY-fidelity
+// checkpoint (the process's own memory state, not just its durable
+// dirs).
+func fidelityIsMemory(tmpl records.Template) bool {
+	return strings.EqualFold(tmpl.PreferredFidelity, "MEMORY")
 }
 
 // containerName returns c's name, defaulting to "app" for a template that
@@ -83,39 +42,14 @@ func containerName(c records.Container) string {
 	return "app"
 }
 
-// buildSpec builds the one-container WorkloadSpec the vendored worker reads,
-// from ate-ish's own Template/Container shape.
-func buildSpec(tmpl records.Template) (*ateworkerpb.WorkloadSpec, error) {
-	c := tmpl.Containers[0]
-	name := containerName(c)
-	// The sandbox's rootfs is the node's own filesystem (see bundle.go), so
-	// the node's own PATH applies; runsc's container process otherwise
-	// starts with no PATH at all ("error finding executable ... in PATH
-	// []"), since gVisor does not consult the host environment or
-	// rootfs-image config for one.
-	cs := &ateworkerpb.ContainerSpec{
-		Args: append(append([]string{}, c.Command...), c.Args...),
-		Env:  []string{"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"},
-	}
+// actorCommandEnv builds the actor's command and environment from
+// ate-ish's own Template/Container shape.
+func actorCommandEnv(c records.Container) (command, env []string) {
+	command = append(append([]string{}, c.Command...), c.Args...)
 	for _, e := range c.Env {
-		cs.Env = append(cs.Env, e.Name+"="+e.Value)
+		env = append(env, e.Name+"="+e.Value)
 	}
-	container := &ateworkerpb.Container{Name: name, ContainerSpec: cs}
-	for _, m := range c.VolumeMounts {
-		i := indexVolume(tmpl.Volumes, m.Name)
-		if i < 0 {
-			return nil, fmt.Errorf("volumeMount %q has no volume", m.Name)
-		}
-		switch v := tmpl.Volumes[i]; {
-		case v.DurableDir != nil:
-			container.DurableDirVolumeMounts = append(container.DurableDirVolumeMounts,
-				&ateworkerpb.VolumeMount{Name: m.Name, MountPath: m.MountPath})
-		case v.SystemInfo != nil:
-			container.SystemInfoVolumeMounts = append(container.SystemInfoVolumeMounts,
-				&ateworkerpb.VolumeMount{Name: m.Name, MountPath: m.MountPath})
-		}
-	}
-	return &ateworkerpb.WorkloadSpec{Containers: []*ateworkerpb.Container{container}}, nil
+	return command, env
 }
 
 func indexVolume(vols []records.Volume, name string) int {
@@ -145,10 +79,28 @@ func durableVolumeNames(tmpl records.Template) (durable, systemInfo []string) {
 	return durable, systemInfo
 }
 
-// writeSystemInfoFiles writes the trust-bundle file(s) a systemInfo volume's
-// dataSources ask for. ate-ish is not MITMing egress yet (stage 3), so the
-// content does not need to be a trust anchor the actor's TLS actually needs;
-// it only needs to exist, so NODE_EXTRA_CA_CERTS does not fail to load it.
+// volumeMounts returns the actor's durable-dir and system-info volume
+// mounts as host-dir -> container-path maps, ready for
+// sandbox.ActorSpec.
+func volumeMounts(d *actorDirs, tmpl records.Template) (durable, systemInfo map[string]string, err error) {
+	durable, systemInfo = map[string]string{}, map[string]string{}
+	for _, m := range tmpl.Containers[0].VolumeMounts {
+		i := indexVolume(tmpl.Volumes, m.Name)
+		if i < 0 {
+			return nil, nil, fmt.Errorf("volumeMount %q has no volume", m.Name)
+		}
+		switch v := tmpl.Volumes[i]; {
+		case v.DurableDir != nil:
+			durable[filepath.Join(d.durableRoot, m.Name)] = m.MountPath
+		case v.SystemInfo != nil:
+			systemInfo[filepath.Join(d.systemInfoRoot, m.Name)] = m.MountPath
+		}
+	}
+	return durable, systemInfo, nil
+}
+
+// writeSystemInfoFiles writes the trust-bundle file(s) a systemInfo
+// volume's dataSources ask for.
 func writeSystemInfoFiles(d *actorDirs, tmpl records.Template, pemBytes []byte) error {
 	for _, m := range tmpl.Containers[0].VolumeMounts {
 		i := indexVolume(tmpl.Volumes, m.Name)
@@ -168,8 +120,27 @@ func writeSystemInfoFiles(d *actorDirs, tmpl records.Template, pemBytes []byte) 
 	return nil
 }
 
-// tarDir writes dir's contents as a gzipped tar at tarPath.
-func tarDir(dir, tarPath string) error {
+// snapshotDirs names the two directories a suspended actor's uploaded
+// snapshot must carry, as sibling top-level entries in the tarball: the
+// runsc checkpoint runsc itself produced (process/memory state), and the
+// durable-dir volumes' own content. Both matter for a resume on any
+// worker in the fleet, not just the one that suspended it: suspend()
+// deletes the actor's whole on-disk directory once the upload succeeds
+// (another worker's disk has no reason to agree with this one's actor
+// UIDs), so anything not in the tarball does not survive. A plain
+// runsc-checkpoint-only tarball (this package's shape before this
+// comment) silently dropped durable-dir content on every restore; the
+// counter demo's own file counter caught it (resets to 1 across a
+// suspend/resume instead of continuing).
+const (
+	snapshotCheckpointPrefix  = "checkpoint"
+	snapshotDurablePrefix     = "durable-dirs"
+	snapshotRootfsUpperPrefix = "rootfs-upper"
+)
+
+// tarDirs writes a gzipped tar at tarPath holding each dirs[prefix]
+// directory's contents under that top-level prefix.
+func tarDirs(dirs map[string]string, tarPath string) error {
 	f, err := os.Create(tarPath)
 	if err != nil {
 		return err
@@ -179,19 +150,35 @@ func tarDir(dir, tarPath string) error {
 	defer gz.Close()
 	tw := tar.NewWriter(gz)
 	defer tw.Close()
+	for prefix, dir := range dirs {
+		if err := tarInto(tw, dir, prefix); err != nil {
+			return fmt.Errorf("archiving %s: %w", dir, err)
+		}
+	}
+	return nil
+}
+
+func tarInto(tw *tar.Writer, dir, prefix string) error {
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		return nil
+	}
 	return filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
 		rel, err := filepath.Rel(dir, path)
-		if err != nil || rel == "." {
+		if err != nil {
 			return err
+		}
+		name := prefix
+		if rel != "." {
+			name = prefix + "/" + rel
 		}
 		hdr, err := tar.FileInfoHeader(info, "")
 		if err != nil {
 			return err
 		}
-		hdr.Name = rel
+		hdr.Name = name
 		if err := tw.WriteHeader(hdr); err != nil {
 			return err
 		}
@@ -208,8 +195,9 @@ func tarDir(dir, tarPath string) error {
 	})
 }
 
-// untarDir extracts a gzipped tar written by tarDir into dir.
-func untarDir(tarPath, dir string) error {
+// untarDirs extracts a gzipped tar written by tarDirs, routing each
+// top-level prefix in dirs to its matching destination directory.
+func untarDirs(tarPath string, dirs map[string]string) error {
 	f, err := os.Open(tarPath)
 	if err != nil {
 		return err
@@ -229,7 +217,15 @@ func untarDir(tarPath, dir string) error {
 		if err != nil {
 			return err
 		}
-		target := filepath.Join(dir, hdr.Name)
+		prefix, rest, _ := strings.Cut(hdr.Name, "/")
+		dest, ok := dirs[prefix]
+		if !ok {
+			continue
+		}
+		target := dest
+		if rest != "" {
+			target = filepath.Join(dest, rest)
+		}
 		switch hdr.Typeflag {
 		case tar.TypeDir:
 			if err := os.MkdirAll(target, 0o755); err != nil {

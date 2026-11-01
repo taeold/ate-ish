@@ -57,26 +57,6 @@ The CLI's verbs work the same way against either node: `--endpoint` (default `ht
 
 Point several nodes at the same bucket (`ATE_BUCKET=<name>` on each) and they form a fleet: any node accepts ingress for any actor, and placement goes through the same conditional writes a single node uses. A worker's lease in the bucket names its address and capacity; the ingress on whichever node a request reaches picks a worker with a free slot (or the actor's current owner, if it still holds the lease) and routes there. There is no membership protocol beyond the leases themselves.
 
-## Cloud Run
-
-```bash
-gcloud beta run instances create ate-ish \
-  --image=<your image> \
-  --cpu=2 --memory=4Gi \
-  --port=8080 \
-  --add-volume=name=state,type=in-memory,size-limit=2Gi \
-  --add-volume-mount=volume=state,mount-path=/ate-ish-state \
-  --set-env-vars=ATE_DIR=/ate-ish-state,ATE_BUCKET=<your bucket>
-```
-
-What differs on Cloud Run gen2:
-
-- Cloud Run gen2's own root filesystem is already an overlay, so ate-ish copies the node's filesystem once per instance onto a real (non-overlay) volume and uses that copy as every actor's rootfs base, adding memory and startup time at every instance start; see `docs/measurements.md`. This is why the command above gives it an in-memory volume to land in.
-- gen2 exposes only the `hugetlb` cgroup controller to the container; `memory` and `cpu` are bound to cgroup v1 hierarchies the container cannot reach. ate-ish detects this and runs the worker with `--ignore-cgroups` plus a one-line patch to substrate's own code (`third_party/substrate/VENDOR.md`'s Patch 1), so actors on gen2 get no cpu, memory, or pids accounting or limit at all.
-- One instance is one node. A fleet on Cloud Run is more instances, each with the same `--set-env-vars=ATE_BUCKET=<same bucket>`.
-- Credentials for egress policies come from Secret Manager through the instance's service account; grant it `secretAccessor` on each secret the policy names.
-- gen2 gives the container root and all of the worker's capability set except `MKNOD`. Cloud Run does not document this, so it can change.
-
 ## Compatibility
 
 | Demo | Runs here | Why |
