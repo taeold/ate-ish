@@ -1,80 +1,99 @@
 # ate-ish
 
-ate-ish runs [Agent Substrate](https://github.com/agent-substrate/substrate) actors without a Kubernetes cluster. One binary runs on a directory or a bucket, on a Linux box, in Docker, on a VM, or on Cloud Run, using the same templates, egress policies, and actor contract as Agent Substrate.
+ate-ish runs [Agent Substrate](https://github.com/agent-substrate/substrate) actors on your own machine, celld's shape, one binary over a directory or a bucket, as an ordinary user with no sudo.
 
 ## How it works
 
-ate-ish is one binary with one daemon and a `kubectl-ate`-style CLI. The daemon runs as a node: an ingress that routes requests by the `ate-target-actor` header and serves the admin API, a worker that runs actors, or both (the default). All control-plane state, an atespace, its templates, its actors' records, their snapshots and tags, and worker leases, lives as JSON and tar objects in one store: a local directory by default, or one GCS bucket when `ATE_BUCKET` names one. There is no database. Every record write is conditional on the generation it read, so two nodes sharing a store never clobber each other's writes.
+ate-ish is one binary: a node, and a `kubectl-ate`-style CLI against it. The node runs as both an ingress (routes a request by its `ate-target-actor` header, serves the admin API) and a worker (runs actors), or either role alone. All control-plane state, an atespace, its templates, its actors' records, their snapshots and tags, and worker leases, lives as JSON and tar objects in one store: a local directory by default, or one GCS bucket when `ATE_BUCKET` names one. There is no database. Every record write is conditional on the generation it read, so two nodes sharing a store never clobber each other's writes.
 
-Each actor runs under Agent Substrate's own `ateworker-gvisor`, vendored unmodified except one documented patch (`third_party/substrate/VENDOR.md`). The worker starts the actor's command inside a gVisor sandbox, with the sandbox's own network, filesystem overlay, and checkpoint/restore. `ate-ish suspend actor` asks the worker to checkpoint the sandbox and uploads the result to the store as the actor's snapshot; the next request for that actor resumes it on a worker with a free slot. A tag is a copy of a suspended actor's snapshot, and an actor created with `--tag` starts as a fork of it, sharing history up to that point and diverging from there.
-
-## What runs on it
-
-An actor is a `template.yaml` plus, optionally, an `egress-policy.yaml`, the same files Agent Substrate itself reads. ate-ish honors `containers[0].image` (the actor's rootfs, pulled from a local Docker daemon when one is reachable, otherwise from the registry the template names), `command`, `args`, `env`, `wakeupProbe`, `volumeMounts`, `volumes` (`durableDir` and the `systemInfo` trust bundle), and the top-level `preferredFidelity`. It stores every other field and ignores it. `preferredFidelity: MEMORY` gets a real checkpoint of the sandbox's process memory on suspend, not just its durable directories; `ROOTFS` adds the sandbox's writable layer; the default, `VOLUMES`, snapshots the durable directories only.
-
-An egress policy names the hosts an actor may reach and the credential each gets, resolved from Secret Manager (`ate-secret://secretmanager.googleapis.com/<project>/<secret>`) or a plain environment variable (`ate-secret://env/<VAR>`). The worker enforces it at the sandbox's own network: every actor TCP connection is routed through the policy regardless of any proxy environment variable the actor's own process sets or ignores. Requests to it carry the `ate-target-actor: <atespace>/<actor>` header, and the actor itself can bind port 80.
+Each actor runs in its own gVisor sandbox, under a user, mount and network namespace the node holds for itself with no root. The sandbox gets no network of its own: every outbound connection it opens goes through the node's egress gateway over a per-destination Unix socket, which enforces the actor's egress policy and can replace a header (such as an API key) before forwarding. `ate-ish suspend actor` checkpoints the sandbox and uploads the result to the store as the actor's snapshot; the next request for that actor resumes it on a worker with a free slot. At `preferredFidelity: MEMORY`, the snapshot includes the sandbox's process memory, not just its durable directories, so an in-process counter or an open connection's state survives suspend and resume. A tag is a copy of a suspended actor's snapshot, and an actor created with `--tag` starts as a fork of it, sharing history up to that point and diverging from there.
 
 ## Install
 
 ```bash
-go install github.com/taeold/ate-ish/cmd/ate-ish@latest github.com/taeold/ate-ish/third_party/substrate/cmd/ateworker-gvisor@latest
+go install github.com/taeold/ate-ish/cmd/ate-ish@latest
 ```
 
-No release binary is built yet; `go install` or building from source are the only paths today. The node fetches gVisor's `runsc` itself on first start, into `/var/lib/ate-ish/runsc` when run as root or `$XDG_STATE_HOME/ate-ish/runsc` otherwise; `ATE_RUNSC_DIR` overrides that location. The node image builds with a plain `docker build .` from the repo root; it carries the `ate-ish` binary, the vendored `ateworker-gvisor`, and a staged `runsc` release, with no Docker CLI or socket of its own.
+Verify it from outside the repo, with a throwaway `GOBIN`:
+
+```bash
+GOBIN=$(mktemp -d) go install ./cmd/ate-ish
+```
+
+The node fetches gVisor's `runsc` itself on first start, into `$XDG_STATE_HOME/ate-ish/runsc` or `~/.local/state/ate-ish/runsc`; `ATE_RUNSC_DIR` overrides that location.
 
 ## Run it
 
-On Linux, run a node as root (the worker needs cgroup delegation, network namespaces, and nftables), keeping your environment so the node can use your gcloud credentials for Secret Manager, and drive it with the CLI in another shell:
+As yourself, no sudo:
 
 ```bash
-sudo -E ate-ish &
+ate-ish &
 
-export ATE_URL=http://localhost:8080
+export ATE_URL=http://127.0.0.1:8080
+ate-ish create atespace ate-demo-counter
+ate-ish create actor-template -f demo/counter/template.yaml
+ate-ish create actor counter1 --template counter -a ate-demo-counter
+curl -H "ate-target-actor: ate-demo-counter/counter1" $ATE_URL/
+```
+
+Each request bumps the counter's in-process, file, and rootfs-overlay counts; `ate-ish suspend actor counter1 -a ate-demo-counter` checkpoints it, and the next request resumes it where it left off.
+
+pi-durable, the quickstart coding-agent actor:
+
+```bash
 ate-ish create atespace ate-demo-pi
-ate-ish create actor-template -f demo/pi-durable/template.yaml
+ate-ish create actor-template -f demo/pi-durable/template-gateway.yaml
 ate-ish create actor demo-agent --template pi-durable-data -a ate-demo-pi
-ate-ish create egress-policy demo-agent -a ate-demo-pi -f demo/pi-durable/egress-policy.yaml
+ate-ish create egress-policy demo-agent -a ate-demo-pi -f demo/pi-durable/egress-policy-gateway.yaml
 
 curl -X POST $ATE_URL/submit -H "ate-target-actor: ate-demo-pi/demo-agent" \
   -H "Content-Type: application/json" \
   -d '{"prompt": "Create app.js with add(a, b) and a test.js that verifies it."}'
 ```
 
-Export `GEMINI_API_KEY` before starting the node, or point the policy's `credentialUri` at `ate-secret://env/<VAR>`. `demo/pi-durable` also ships a gateway variant (`server-gateway.ts`, `template-gateway.yaml`, `egress-policy-gateway.yaml`) that uses `AI_GATEWAY_API_KEY` and `ai-gateway.vercel.sh`; `hack/gate.sh` uses that one. `ate-ish suspend actor demo-agent -a ate-demo-pi`, `ate-ish create tag`, `ate-ish get actors|tags|workers`, and creating a second actor with `--tag` run the same way against the same node; `hack/gate.sh` runs the whole sequence, including a fork and an egress check, end to end.
+An egress policy's `credentialUri` can name a Secret Manager secret, as the committed `egress-policy-gateway.yaml` does, or `ate-secret://env/GEMINI_API_KEY` or `ate-secret://env/AI_GATEWAY_API_KEY` to read the key from the node's own environment instead; either way the actor's own process never sees the real key, only the gateway that replaces it on the way out. `ate-ish suspend actor demo-agent -a ate-demo-pi`, `ate-ish create tag`, `ate-ish get actors|tags|workers`, and creating a second actor with `--tag` run the same way against the same node; `hack/gate.sh` runs the whole sequence end to end, including a fork and an egress check.
 
-On macOS, run the node image in a privileged container instead, with no Docker socket mounted (the node image needs none: it exports an already-pulled image's filesystem, not a local build):
+## Requirements
 
-```bash
-docker build -t ate-ish .
-docker run --privileged -p 8080:8080 ate-ish
+Linux, with unprivileged user namespaces enabled. Ubuntu 23.10 and later restrict them by default through AppArmor; the node's own error names the fix, which needs `sudo` once, to install a profile for the `unshare` binary it calls:
+
+```
+abi <abi/4.0>,
+include <tunables/global>
+
+profile ate-ish-unshare /usr/bin/unshare flags=(unconfined) {
+  userns,
+
+  include if exists <local/ate-ish-unshare>
+}
 ```
 
-The node inside the container pulls actor images from a registry, not from the host's Docker daemon: a local Docker daemon is not visible from inside the container, so the actor image must be pushed somewhere the container can reach.
+Load it with `apparmor_parser -r` against the profile file, then `systemctl reload apparmor`; this lifts the restriction for every user's `unshare`, not only ate-ish's own invocations, since the node calls the system binary rather than a private copy.
 
-The CLI's verbs work the same way against either node: `--endpoint` (default `http://localhost:8080`) or `$ATE_URL` points them at it, and no `gcloud` login is needed locally.
+An actor image whose Dockerfile declares a non-root `USER` needs `newuidmap`/`newgidmap` (the `uidmap` package) and an `/etc/subuid`/`/etc/subgid` range for your user; without them, the node maps only root and logs that non-root images will fail. Per-actor memory/CPU/task limits need a systemd user session (`systemd-run --user --scope`); without one, the node runs actors without limits and logs that once. macOS has no unprivileged Linux namespaces at all, so it runs the node image in a privileged container instead (`docker build -t ate-ish .`, then `docker run --privileged -p 8080:8080 ate-ish`).
 
 ## Operate a fleet
 
-Point several nodes at the same bucket (`ATE_BUCKET=<name>` on each) and they form a fleet: any node accepts ingress for any actor, and placement goes through the same conditional writes a single node uses. A worker's lease in the bucket names its address and capacity; the ingress on whichever node a request reaches picks a worker with a free slot (or the actor's current owner, if it still holds the lease) and routes there. There is no membership protocol beyond the leases themselves.
+The node listens on `127.0.0.1:8080` by default; it has no authentication, so keep that port on a private network if you widen it. `ATE_LISTEN` overrides the listen address, for example `ATE_LISTEN=0.0.0.0:8080` to serve a fleet. `ATE_ADVERTISE` sets the address this node puts in its lease for other nodes to forward to; without it, the node advertises its own listen address when that names a specific host, or its machine's first non-loopback IPv4 address when the listen address is a wildcard. Point several nodes at the same bucket (`ATE_BUCKET=<name>` on each) and they form a fleet: any node accepts ingress for any actor, and placement goes through the same conditional writes a single node uses. A worker's lease in the bucket names its advertised address and capacity; the ingress on whichever node a request reaches picks a worker with a free slot (or the actor's current owner, if it still holds the lease) and routes there. There is no membership protocol beyond the leases themselves.
 
 ## Compatibility
 
-| Demo | Runs here | Why |
-|---|---|---|
-| `demo/pi-durable` | Yes | ate-ish's own quickstart actor; ships both a plain-Gemini and an AI-Gateway server variant, picked by the template. |
-| `demo/counter` | Yes, at `preferredFidelity: MEMORY` | Needs a real checkpoint of process memory to keep its in-process counter across suspend/resume; the default `VOLUMES` fidelity would only keep its file counter. |
-| coding-agents-on-substrate's `pi-durable` port | Yes | Runs as written; the actor's own model key is the user's to supply. |
-| coding-agents-on-substrate's `libfx` port | Yes | Runs as written. |
-| coding-agents-on-substrate's `cursor-agent-sdk` port | Up to the first model call | Needs a Cursor API key; none was supplied in the runs behind this table. |
+| Works as on substrate | Evidence |
+|---|---|
+| Unprivileged start, `runsc` fetch, clear error when user namespaces are refused | G1 |
+| MEMORY fidelity: in-process, file, and rootfs state all survive suspend/resume and a full node restart | G2 |
+| A real model turn through the AI Gateway, suspend, tag, fork, divergent turns after the fork | G3 |
+| `http` rules, `https` on a non-443 port, wildcard hostnames (`*.vercel.sh`, bare `*`), an unlisted hostname refused under a specific policy | G4 |
+| A non-root actor image (`USER node`), both under multi-ID mapping and the root-only fallback | G5 |
+| An in-flight request during checkpoint: the checkpoint itself succeeds | G6 |
+| The first request after restore, measured end to end | G7 |
 
-See `docs/CODING-AGENTS-PORTS.md` for the ported demos and `docs/demos.md` for full walkthroughs.
+Not supported yet: `tls_passthrough` rules and `actorJwt` (both parse but do nothing; the node logs one line per rule that uses either). An in-flight request does not survive its own actor's suspend: G6 found the checkpoint succeeds, but that original request ends in an error, not a resumed response. The first request after a restore can take 1 to 3 seconds (G7) rather than resuming instantly. An actor sees no network of its own, only loopback inside its sandbox; every outbound connection goes through the gateway, and a program that bypasses the system resolver (hardcoding a raw IP, say) gets no route at all.
 
 ## Limits
 
-ate-ish does not promise substrate's control-plane scale, its Postgres-backed consistency, or its per-actor edge identity to external systems. Its scale target is one machine to a few, not millions of actors. A template's `resources` field is accepted and stored but never enforced; a worker counts actors against a flat slot count (`ATE_CAPACITY`, default 4), not against a cgroup limit, on any host.
-
-Running the worker needs Linux, root (or the specific capability set substrate's worker pool declares: `NET_ADMIN`, `SYS_ADMIN`, `SYS_CHROOT`, `SYS_PTRACE`, `NET_RAW`, `DAC_OVERRIDE`, `FOWNER`, `CHOWN`, `MKNOD`), nftables in the kernel, and `runsc` on the systrap platform, which needs no KVM. `ATE_ISH_NO_CGROUP_PATH=1` skips assigning a per-container cgroup path for hosts whose cgroup v2 root exposes none of the controllers runsc wants; ate-ish sets it automatically where it detects that case. `ATE_ROOTFS_EXPORT=crane` forces the no-daemon image export path even when a local Docker daemon is reachable.
+ate-ish does not promise substrate's control-plane scale, its Postgres-backed consistency, or its per-actor edge identity to external systems. Its scale target is one machine to a few, not millions of actors.
 
 ## Contributing and License
 
-Everything in this repository is Apache-2.0 (`LICENSE`), except `third_party/substrate`, which carries Agent Substrate's own upstream Apache-2.0 license unmodified; see `third_party/substrate/VENDOR.md` and its own `LICENSE` file for the vendored commit and the one patch applied on top of it. Contributions are welcome as pull requests; keep a change small enough to review against the files it touches, and run `hack/gate.sh` against a local node before sending one that touches the worker, the ingress, or egress.
+Everything in this repository is Apache-2.0 (`LICENSE`). Contributions are welcome as pull requests; keep a change small enough to review against the files it touches, and run `hack/smoke.sh` (and `hack/gate.sh` against a real model, where the change touches the worker, the ingress, or egress) before sending one.

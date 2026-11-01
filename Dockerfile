@@ -20,7 +20,7 @@ RUN /ate-ish fetch-runsc
 
 FROM debian:trixie-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates util-linux nsenter systemd \
+    ca-certificates util-linux systemd uidmap \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /ate-ish /usr/local/bin/ate-ish
 COPY --from=build /runsc /ate-ish/bin/runsc

@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -73,7 +74,8 @@ type node struct {
 
 // startNode builds the ingress/worker/http.Server for role against store b,
 // but does not call ListenAndServe: serve() drives that (and shutdown).
-func startNode(ctx context.Context, role, port string, b store.Store, dir string, capacity int) (*node, error) {
+// listen is a host:port, as ATE_LISTEN sets it (default 127.0.0.1:8080).
+func startNode(ctx context.Context, role, listen string, b store.Store, dir string, capacity int) (*node, error) {
 	mux := http.NewServeMux()
 	n := &node{}
 	if role == "all" || role == "ingress" {
@@ -81,15 +83,22 @@ func startNode(ctx context.Context, role, port string, b store.Store, dir string
 		n.in.Routes(mux)
 	}
 	if role == "all" || role == "worker" {
-		addr := "127.0.0.1:" + port
+		_, port, err := net.SplitHostPort(listen)
+		if err != nil {
+			return nil, fmt.Errorf("parsing ATE_LISTEN %q: %w", listen, err)
+		}
+		addr := listen
 		if role == "worker" {
 			ip, err := metadata("instance/network-interfaces/0/ip")
 			if err != nil {
 				return nil, err
 			}
 			addr = ip + ":" + port
+		} else {
+			if addr, err = advertiseAddr(listen, port); err != nil {
+				return nil, err
+			}
 		}
-		var err error
 		if n.w, err = atelet.New(ctx, b, addr, capacity, dir); err != nil {
 			return nil, err
 		}
@@ -99,7 +108,7 @@ func startNode(ctx context.Context, role, port string, b store.Store, dir string
 		idle := envutil.Get("ATE_IDLE_SECONDS", "600")
 		go reapLoop(ctx, n.in, idle)
 	}
-	n.srv = &http.Server{Addr: ":" + port, Handler: http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+	n.srv = &http.Server{Addr: listen, Handler: http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		if n.in != nil && r.Header.Get("ate-target-actor") != "" {
 			n.in.Route(rw, r)
 			return
@@ -107,6 +116,47 @@ func startNode(ctx context.Context, role, port string, b store.Store, dir string
 		mux.ServeHTTP(rw, r)
 	})}
 	return n, nil
+}
+
+// advertiseAddr is the address this node puts in its lease, for another
+// node's ingress to forward to: ATE_ADVERTISE if set, else listen itself
+// when its host is not a wildcard, else the machine's first non-loopback
+// IPv4 address with the listen port.
+func advertiseAddr(listen, port string) (string, error) {
+	if v := envutil.Get("ATE_ADVERTISE", ""); v != "" {
+		return v, nil
+	}
+	host, _, err := net.SplitHostPort(listen)
+	if err != nil {
+		return "", err
+	}
+	if host != "" && host != "0.0.0.0" && host != "::" {
+		return listen, nil
+	}
+	ip, err := firstNonLoopbackIPv4()
+	if err != nil {
+		return "", fmt.Errorf("ATE_LISTEN %q listens on every interface and ATE_ADVERTISE is not set: %w", listen, err)
+	}
+	return ip + ":" + port, nil
+}
+
+// firstNonLoopbackIPv4 is the fallback advertise host when ATE_LISTEN is a
+// wildcard address and ATE_ADVERTISE is not set.
+func firstNonLoopbackIPv4() (string, error) {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return "", err
+	}
+	for _, a := range addrs {
+		ipnet, ok := a.(*net.IPNet)
+		if !ok || ipnet.IP.IsLoopback() {
+			continue
+		}
+		if ip4 := ipnet.IP.To4(); ip4 != nil {
+			return ip4.String(), nil
+		}
+	}
+	return "", fmt.Errorf("no non-loopback IPv4 address found")
 }
 
 func reapLoop(ctx context.Context, in *ingress.Ingress, idleSeconds string) {
@@ -144,7 +194,7 @@ func defaultDir() string {
 func serve() error {
 	ctx := context.Background()
 	role := envutil.Get("ATE_ROLE", "all")
-	port := envutil.Get("ATE_LISTEN", "8080")
+	listen := envutil.Get("ATE_LISTEN", "127.0.0.1:8080")
 	if role == "all" || role == "worker" {
 		if err := atelet.EnsureRunsc(); err != nil {
 			return fmt.Errorf("fetching runsc: %w", err)
@@ -156,7 +206,7 @@ func serve() error {
 	}
 	capacity, _ := strconv.Atoi(envutil.Get("ATE_CAPACITY", "4"))
 	dir := envutil.Get("ATE_DIR", defaultDir())
-	n, err := startNode(ctx, role, port, b, dir, capacity)
+	n, err := startNode(ctx, role, listen, b, dir, capacity)
 	if err != nil {
 		return err
 	}
@@ -166,7 +216,7 @@ func serve() error {
 		<-stop
 		n.shutdown(ctx)
 	}()
-	slog.Info("serving", "role", role, "port", port)
+	slog.Info("serving", "role", role, "listen", listen)
 	if err := n.srv.ListenAndServe(); err != http.ErrServerClosed {
 		return err
 	}

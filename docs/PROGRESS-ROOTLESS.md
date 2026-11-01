@@ -487,3 +487,96 @@ DNS-refusal checks, the 401 check. PASS, no regression.
 ```
 
 `go build ./...`, `go vet ./...`, `gofmt -l .` all clean.
+
+## Stage D: G8, G9, the README
+
+### Advertise address fix
+
+`startNode`'s role-`all` path hardcoded `127.0.0.1:<port>` as the
+address a node puts in its own lease, which only works when every node
+on a shared bucket runs on the same host. `ATE_LISTEN` is now a full
+`host:port` (default `127.0.0.1:8080`, no authentication), and a new
+`advertiseAddr` picks the lease address: `ATE_ADVERTISE` if set, else
+`ATE_LISTEN` itself when its host is not a wildcard, else the
+machine's first non-loopback IPv4 address with the listen port.
+`hack/smoke.sh`'s bare-port `ATE_LISTEN=8082` style calls were updated
+to `127.0.0.1:8082` to match.
+
+### G8 — two nodes, one bucket, both as exedev, no sudo
+
+`gs://ate-ish-rootless-twonode-daniel-junk` (`us-west1`, created and
+deleted by this stage). Node A (`ATE_DIR=/tmp/g8-a`,
+`ATE_LISTEN=127.0.0.1:8180`) and node B (`ATE_DIR=/tmp/g8-b`,
+`ATE_LISTEN=127.0.0.1:8181`), both `ATE_BUCKET=` the same bucket: each
+advertised its own address correctly (no `ATE_ADVERTISE` needed, since
+neither `ATE_LISTEN` is a wildcard), and `get workers` against either
+node's endpoint listed both leases.
+
+```
+create atespace/actor-template/actor via node B (--endpoint :8181)
+request via node A (--endpoint :8180): memory count 1 (placed on A, the
+  node that received the request)
+request via node A: count 2
+suspend actor counter1 via node A: generation 1
+kill -INT node B: "lease deleted", clean exit, no process left
+request via node A: count 3, worker w-2965a4fb (node A), generation 2
+```
+The actor resumed on node A with the counter continuing, after node B
+(never the actor's own host in this run) was gone. `kill -INT` on node
+A afterward suspended on shutdown and deleted its lease cleanly; no
+`ate-ish` process remained. PASS. Bucket deleted and confirmed gone
+(`gcloud storage buckets list` returned 0 items).
+
+### G9 — the node image
+
+The Dockerfile already built one binary with no vendored worker
+(stage A/B/C's own work); this stage added the `uidmap` package
+(`newuidmap`/`newgidmap` for non-root actor images) and removed
+`nsenter` from the apt list, which does not exist as a separate
+Debian trixie package (`util-linux` already provides the binary) and
+made `docker build` fail outright before this fix.
+
+```
+$ docker build -t ate-ish .                     # succeeds
+$ docker run --rm --privileged -p 8090:8080 \
+    -e ATE_LISTEN=0.0.0.0:8080 ate-ish           # serves; advertises
+                                                  # 172.17.0.2:8080 (its
+                                                  # own non-loopback
+                                                  # IPv4, ATE_LISTEN
+                                                  # being a wildcard)
+```
+The counter's rootfs (`counter-demo:latest`) is only on this host's
+local Docker daemon, which the container's own design deliberately
+does not reach (no docker CLI or socket baked in); this run mounted
+the host's `docker.sock` and copied the host's `docker` CLI into the
+running container as a one-time test step (not a Dockerfile change) so
+`ate-ish create actor` could resolve the image. From the host, via the
+CLI's `--endpoint http://127.0.0.1:8090`: two requests (counts 1, 2),
+`suspend actor`, a third request (count 3, resumed). PASS.
+
+### README
+
+Rewritten for the rootless product in celld's outline (`docs/
+WHAT.md`'s one-sentence shape, How it works, Install, Run it,
+Requirements, Operate a fleet, Compatibility, Limits, Contributing and
+License), 1,184 words. Every command in "Run it" and the Install
+section's verify step ran for real this stage, including a real-model
+pi-durable turn (`template-gateway.yaml`/`egress-policy-gateway.yaml`,
+`AI_GATEWAY_API_KEY` from Secret Manager). The non-gateway pi-durable
+demo (`egress-policy.yaml`) was dropped from the README: its committed
+`credentialUri` names a Secret Manager secret
+(`daniel-junk/gemini-api-key`) that does not exist in this project
+(404), a pre-existing gap unrelated to this stage; the gateway variant
+is what `hack/gate.sh` itself runs and is what this stage verified.
+`docs/WHAT.md`'s promises section no longer says the actor runs under
+Agent Substrate's own worker; it now says ate-ish's own gVisor driver,
+built to the same contract.
+
+### hack/smoke.sh and hack/gate.sh, real model, end of stage
+
+`hack/smoke.sh`: PASS, 82.9 s, nothing left running. `hack/gate.sh`
+with no `--fake`, `AI_GATEWAY_API_KEY` from `gcloud secrets versions
+access latest --secret ai-gateway-token --project daniel-junk` into
+the environment only: every step green, a real model turn, suspend,
+tag, fork, divergent turns, both DNS-refusal checks, the 401 check.
+PASS, no regression.

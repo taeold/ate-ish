@@ -233,7 +233,7 @@ echo "  ok: SIGINT suspended/stopped every sandbox, no runsc process remains"
 echo "-- SIGKILL: the next node start with the same state dir reaps what it left behind --"
 g2c_dir="$work/ate-g2c"
 G2C_URL=http://127.0.0.1:8082
-ATE_DIR="$g2c_dir" ATE_STORE="dir:$g2c_dir-store" ATE_LISTEN=8082 ATE_CAPACITY=2 bin/ate-ish >"$work/g2c-1.log" 2>&1 &
+ATE_DIR="$g2c_dir" ATE_STORE="dir:$g2c_dir-store" ATE_LISTEN=127.0.0.1:8082 ATE_CAPACITY=2 bin/ate-ish >"$work/g2c-1.log" 2>&1 &
 G2C_PID=$!
 track_node "$G2C_PID" "$g2c_dir"
 for _ in $(seq 1 100); do
@@ -255,7 +255,7 @@ wait "$G2C_PID" 2>/dev/null || true
 assert_runsc_present "$g2c_dir/runsc-state" "the sandbox should still be running with no ate-ish process alive right after SIGKILL (the G2 bug, reproduced)"
 echo "  ok: SIGKILL leaves the sandbox running with no ate-ish process alive"
 
-ATE_DIR="$g2c_dir" ATE_STORE="dir:$g2c_dir-store" ATE_LISTEN=8082 ATE_CAPACITY=2 bin/ate-ish >"$work/g2c-2.log" 2>&1 &
+ATE_DIR="$g2c_dir" ATE_STORE="dir:$g2c_dir-store" ATE_LISTEN=127.0.0.1:8082 ATE_CAPACITY=2 bin/ate-ish >"$work/g2c-2.log" 2>&1 &
 G2C_PID=$!
 track_node "$G2C_PID" "$g2c_dir"
 for _ in $(seq 1 100); do
@@ -281,7 +281,7 @@ docker build -q -t ate-ish-g5-gosu:latest demo/g5-gosu >/dev/null
 echo "-- root-only fallback (ATE_SANDBOX_FORCE_ROOT_ONLY_MAPPING): the log line, then the USER node image fails --"
 g5_dir="$work/ate-g5a"
 G5_URL=http://127.0.0.1:8083
-ATE_SANDBOX_FORCE_ROOT_ONLY_MAPPING=1 ATE_DIR="$g5_dir" ATE_STORE="dir:$g5_dir-store" ATE_LISTEN=8083 ATE_CAPACITY=2 bin/ate-ish >"$work/g5a.log" 2>&1 &
+ATE_SANDBOX_FORCE_ROOT_ONLY_MAPPING=1 ATE_DIR="$g5_dir" ATE_STORE="dir:$g5_dir-store" ATE_LISTEN=127.0.0.1:8083 ATE_CAPACITY=2 bin/ate-ish >"$work/g5a.log" 2>&1 &
 G5_PID=$!
 track_node "$G5_PID" "$g5_dir"
 for _ in $(seq 1 100); do
@@ -306,7 +306,7 @@ if command -v newuidmap >/dev/null 2>&1 && command -v newgidmap >/dev/null 2>&1;
   echo "-- multi-ID mapping (newuidmap/newgidmap plus a subuid/subgid range on this host): the same image works --"
   g5_dir2="$work/ate-g5b"
   G5_URL2=http://127.0.0.1:8084
-  ATE_DIR="$g5_dir2" ATE_STORE="dir:$g5_dir2-store" ATE_LISTEN=8084 ATE_CAPACITY=4 bin/ate-ish >"$work/g5b.log" 2>&1 &
+  ATE_DIR="$g5_dir2" ATE_STORE="dir:$g5_dir2-store" ATE_LISTEN=127.0.0.1:8084 ATE_CAPACITY=4 bin/ate-ish >"$work/g5b.log" 2>&1 &
   G5_PID=$!
   track_node "$G5_PID" "$g5_dir2"
   for _ in $(seq 1 100); do
@@ -359,7 +359,7 @@ track_pid "$G6_FAKE_PID"
 for _ in $(seq 1 50); do [[ -s "$work/g6-fake.ready" ]] && break; sleep 0.1; done
 [[ -s "$work/g6-fake.ready" ]] || { echo "FAILED: G6 fakeupstream never became ready: $(cat "$work/g6-fake.log")"; exit 1; }
 read -r G6_FAKE_ADDR G6_FAKE_CA < "$work/g6-fake.ready"
-ATE_DIR="$g6_dir" ATE_STORE="dir:$g6_dir-store" ATE_LISTEN=8087 ATE_CAPACITY=2 \
+ATE_DIR="$g6_dir" ATE_STORE="dir:$g6_dir-store" ATE_LISTEN=127.0.0.1:8087 ATE_CAPACITY=2 \
   ATE_EGRESS_RESOLVE="ai-gateway.vercel.sh=$G6_FAKE_ADDR" ATE_EGRESS_TEST_CA="$G6_FAKE_CA" \
   AI_GATEWAY_API_KEY=g6key \
   bin/ate-ish >"$work/g6-node.log" 2>&1 &
@@ -417,7 +417,7 @@ track_pid "$G7_FAKE_PID"
 for _ in $(seq 1 50); do [[ -s "$work/g7-fake.ready" ]] && break; sleep 0.1; done
 [[ -s "$work/g7-fake.ready" ]] || { echo "FAILED: G7 fakeupstream never became ready: $(cat "$work/g7-fake.log")"; exit 1; }
 read -r G7_FAKE_ADDR G7_FAKE_CA < "$work/g7-fake.ready"
-ATE_DIR="$g7_dir" ATE_STORE="dir:$g7_dir-store" ATE_LISTEN=8088 ATE_CAPACITY=2 \
+ATE_DIR="$g7_dir" ATE_STORE="dir:$g7_dir-store" ATE_LISTEN=127.0.0.1:8088 ATE_CAPACITY=2 \
   ATE_EGRESS_RESOLVE="ai-gateway.vercel.sh=$G7_FAKE_ADDR" ATE_EGRESS_TEST_CA="$G7_FAKE_CA" \
   AI_GATEWAY_API_KEY=g7key \
   bin/ate-ish >"$work/g7-node.log" 2>&1 &

@@ -29,9 +29,10 @@ ate-ish runs it. When they outgrow ate-ish, the same files go to substrate.
 
 ## What it promises
 
-- The actor runs under Agent Substrate's own gVisor worker, vendored
-  unmodified except one documented patch. Snapshots, memory fidelity,
-  per-actor network isolation and egress enforcement are substrate's.
+- The actor runs under ate-ish's own gVisor driver, built to Agent
+  Substrate's actor contract rather than vendoring substrate's worker.
+  Snapshots, memory fidelity, per-actor network isolation and egress
+  enforcement are ate-ish's own, to that same contract.
 - The template, the egress policy, the `ate-target-actor` header and the
   CLI verbs are substrate's. A template that works here works there.
 - No database. State is a local directory or one GCS bucket (S3 later).
