@@ -95,6 +95,12 @@ An actor has no network of its own, only loopback; every outbound connection goe
 
 ate-ish does not promise substrate's control-plane scale, its Postgres-backed consistency, or its per-actor edge identity to external systems. Its scale target is one machine to a few, not millions of actors.
 
+The node caches each exported actor image under `~/.cache/ate-ish` and does not prune it, so the cache grows with every new image digest. Files from images with a non-root `USER` belong to your subordinate IDs there, so remove the cache through a user namespace rather than with plain `rm`:
+
+```bash
+unshare --user --map-auto --map-root-user rm -rf ~/.cache/ate-ish
+```
+
 ## Contributing and License
 
 Everything in this repository is Apache-2.0 (`LICENSE`). Contributions are welcome as pull requests; keep a change small enough to review against the files it touches, and run `hack/smoke.sh` (and `hack/gate.sh` against a real model, where the change touches the worker, the ingress, or egress) before sending one.
