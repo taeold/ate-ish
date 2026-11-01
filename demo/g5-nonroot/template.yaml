@@ -1,0 +1,26 @@
+metadata:
+  atespace: ate-demo-nonroot
+  name: nonroot
+workerSelector:
+  matchLabels:
+    workload: nonroot
+containers:
+- name: nonroot
+  image: ate-ish-g5-nonroot:latest
+  command:
+  - node
+  - /home/node/server.js
+  env:
+  - name: HOME
+    value: /home/node
+  wakeupProbe:
+    httpGet:
+      path: /readyz
+      port: 8080
+    timeoutSeconds: 30
+resources:
+  limits:
+  - name: cpu
+    quantity: "1"
+  - name: memory
+    quantity: 256Mi

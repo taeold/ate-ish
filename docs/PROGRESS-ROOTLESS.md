@@ -310,3 +310,180 @@ suspend/tag/fork, divergent turns, both DNS-refusal checks, and the
 ```
 32593 ms total (counter+gate.sh --fake section 18650 ms, G4 section 8434 ms)
 ```
+
+## Stage C: orphaned sandboxes, non-root images, in-flight suspend, restore latency
+
+### Orphaned sandboxes
+
+Reproduced the G2-node-restart bug first: start a node, start the
+counter, (a) `SIGINT` it — every sandbox stopped, node exited with
+none left (`SuspendAll`, already correct); (b) `SIGKILL` a second
+node — its `runsc-sandbox`/`runsc-gofer` processes and its held
+namespace's own `unshare ... sleep infinity` holder kept running,
+found by plain `pgrep`, with no `ate-ish` process alive. The sandbox
+is a plain host process either way: `Namespace.Enter` never joins the
+holder's own pid namespace (only user/mount/net), so a sandbox this
+package starts is never inside any pid namespace the holder created.
+
+Fix, in `Namespace.Open` (`namespace.go`'s `reapOrphans`, `idmap.go`
+untouched by this part): before creating its own holder, run
+`runsc --root=<stateDir> list -quiet -sandbox` directly (no nsenter
+needed, for the same plain-host-process reason) and `delete -force`
+whatever it finds, one `slog.Warn` line per id. The holder's own pid
+is now recorded next to `--root` (`holder.pid`) so a stale one gets
+killed too. Chose kill-and-delete over restore: an orphan's checkpoint
+belongs to the generation record, not to the runsc process left
+behind, so restoring here would race whatever actually owns that
+record next.
+
+`hack/smoke.sh`'s own "orphaned sandboxes" section reproduces both
+paths for real (a separate node+dir, `SIGINT` then `SIGKILL` then
+restart) and asserts `pgrep` for `runsc-sandbox`/`runsc-gofer` finds
+nothing at each checkpoint. PASS.
+
+### G5 — non-root images
+
+First surprise: `buildConfig`'s OCI `process.user` was hardcoded
+`0,0` for every actor regardless of the image's own `USER` directive,
+despite a comment claiming otherwise — nothing ever actually dropped
+privilege. Fixed by always keeping the sandbox's own init (pid 1) at
+root (it needs real access to the host-backed ingress/egress sockets
+throughout) and having `RunInit` start the *actor's* child process
+with `ATE_ACTOR_UID`/`GID` as a `Credential`, the same gosu/tini
+pattern a real root-starting entrypoint uses; `CAP_SETUID`/
+`CAP_SETGID` were already in `bundleCaps`.
+
+Second surprise: `docker export`+`tar -xpf` extracting as this plain
+host process (outside any namespace) can't chown anything — every
+exported file lands owned by this node's own real uid no matter what
+the image declares. Fixed by running the extraction's `tar` *inside*
+the held namespace (`extractCmd`, via `Namespace.Enter`) as that
+namespace's own mapped root, which can chown to any id its own
+mapping covers. This made `imageRootfsDir`'s per-digest export cache
+wrong, too: a root-only node's export and a multi-ID node's export of
+the same image are not interchangeable, so the cache directory now
+also keys on the id-mapping mode (`cacheSuffix`). A root-only node's
+tar still can't chown to an unmapped id (`Cannot change ownership...
+Invalid argument`, GNU tar's own fatal exit 2); `tarExtractErr`
+downgrades that specific, expected failure to one logged warning
+instead of failing the whole export, since the file's own bytes still
+land fine either way.
+
+Multi-ID mapping itself (`internal/sandbox/idmap.go`): `Open` checks
+for `newuidmap`/`newgidmap` on `PATH` and a `/etc/subuid`/`/etc/subgid`
+entry for this user. Present: the held namespace unshares with *no*
+mapping of its own, and `applyIDMapping` writes it after the fact —
+namespace id 0 to this process's own real id (always allowed), plus
+1..range to the real subuid/subgid range — exactly rootless Podman's
+own two-entry map. Missing either: falls back to `unshare
+--map-root-user` (root only), logged once either way.
+`ATE_SANDBOX_FORCE_ROOT_ONLY_MAPPING=1` forces the fallback for
+testing on a host that actually has the real thing (this VM, once
+`uidmap` was installed).
+
+Run for real, in order, on this VM (no `newuidmap`/`newgidmap`
+present yet):
+
+```
+ate-ish: held namespace maps root only (no newuidmap (install the uidmap package)); non-root images will fail
+{"home":"/home/node","write":"failed: EACCES: permission denied, open '/home/node/hello.txt'","id":"uid=1000(node) gid=1000(node) groups=1000(node)"}
+```
+
+Then the one approved host-prep `sudo` (same standing as the Ubuntu
+AppArmor profile): `sudo apt-get install -y uidmap`. Rerun, same
+image, same VM, nothing else changed:
+
+```
+ate-ish: held namespace maps root plus subuid 100000-165535, subgid 100000-165535 (rootless Podman's own approach); non-root actor images work
+{"home":"/home/node","write":"ok","id":"uid=1000(node) gid=1000(node) groups=1000(node)"}
+```
+
+Also reran, under the multi-ID mapping: the counter (a root-run image,
+unaffected either way) and a root-starting actor's own `gosu nobody`
+(`demo/g5-gosu`, FROM node:24-slim with no `USER`, apt-get installs
+gosu):
+
+```
+{"root_id":"uid=0(root) gid=0(root) groups=0(root)","gosu_nobody_id":"uid=65534(nobody) gid=65534(nogroup) groups=65534(nogroup)"}
+ok: the counter (a root-run image) still runs under multi-ID mapping
+```
+
+All of this is `hack/smoke.sh`'s "G5 non-root images" section now:
+the fallback path forced via the env switch (so the gate is
+deterministic once `uidmap` is installed for good), then the real
+multi-ID path when `newuidmap`/`newgidmap` are actually present.
+
+### G6 — suspend during a request
+
+Built a host-side test server (`hack/fakeupstream -delay 20s`) and a
+dedicated pi-durable actor pointed at it through the usual resolve
+override. Posted `/submit` (the actor's own `server-gateway.ts`
+handler making the outbound LLM call, not a `runsc exec`), waited for
+the egress forwarder's own "listening" log line to confirm the call
+was actually in flight, then ran `ate-ish suspend actor` concurrently.
+
+Result, recorded exactly as asked (either answer was acceptable):
+**the checkpoint itself succeeds** (`sandbox checkpoint ... took_ms=266`,
+`actor suspended ...`), **but the original request does not survive
+it** — the sandbox is torn down right after the checkpoint completes
+(today's `suspend` has no `--leave-running`), so the node-side proxy's
+connection to it drops mid-flight (`http: proxy error: unexpected
+EOF`) and the client gets a 502, well before the 20 s delay would
+have answered. No code change; `hack/smoke.sh`'s "G6 in-flight
+suspend" section reproduces this and records both halves
+(`checkpoint while the actor's own outbound call was in flight:
+rc=0`, `the original in-flight request: {"status":502}`) every run.
+
+### G7 — restore latency
+
+Chasing G6's own restore led straight to the real bug this gate was
+named for. A first request right after a plain (not in-flight) suspend
+and restore hung past the ingress bridge's own 10 s wait for a
+connection from the sandbox's outforwarder — every time, reproducibly.
+
+Cause: the ingress dial-out forwarder's open connection to the node's
+`ingress.sock` is restored as part of the sandbox's own checkpointed
+process state, but the *node-side* listener it was connected to is
+gone — a restored generation gets a brand-new bundle, a brand-new
+actor UID, and so a brand-new `ingress.sock` path under a brand-new
+bind mount. The restored connection is simply stale, and (unlike the
+egress forwarders, whose listener close/reopen around checkpoint
+already gets a signal) nothing about it errors or notices on its own
+until something actually tries to use it — which, empirically, took
+over 10 s to surface as a hang, not a quick error.
+
+Fix (`internal/sandbox/init.go`): wrapped the outforwarder's
+`exec.Cmd` in a small `outforwarder` type and had `RunInit` call its
+`restart` (kill the old process, start a fresh one) on `SIGUSR2` — the
+same signal that already reopens every egress forwarder's listener
+after restore — instead of leaving it to rediscover the problem on
+its own. Measured before/after on the same clean boot→suspend→restore
+→request sequence: before, the first post-restore request never
+completed inside a 15 s client timeout; after, `ate-ish`'s own log
+shows restore (`took_ms=354`) and boot (`boot_ms=209`) completing in
+under a second, and the full first-request round trip (restore + boot
++ the fake turn itself) at 1.2 s, then 3.1 s on a second, independent
+run through `hack/smoke.sh`'s own "G7 restore latency" section (a
+regression guard at 5 s there, not a precise SLA, since that number
+also includes the fake model's own turn, not just the redial).
+
+### G2/G3 rerun, to show nothing regressed
+
+G2, as its own node (`/tmp/g2-regress`, not `hack/smoke.sh`'s
+ephemeral one): 1, 2, suspend, 3, `SIGINT` the node, start it again,
+next request 4 — all correct, and (new this stage) nothing left
+running afterward. G3: `hack/gate.sh` with no `--fake`,
+`AI_GATEWAY_API_KEY` from `gcloud secrets versions access latest
+--secret ai-gateway-token --project daniel-junk` into the environment
+only (confirmed absent from every log file written), `POLICY=demo/
+pi-durable/egress-policy-gateway-wildcard.yaml`: every step green,
+real model answers, suspend/tag/fork, divergent turns, both
+DNS-refusal checks, the 401 check. PASS, no regression.
+
+### hack/smoke.sh total, with G5/G6/G7
+
+```
+80979 ms total
+```
+
+`go build ./...`, `go vet ./...`, `gofmt -l .` all clean.

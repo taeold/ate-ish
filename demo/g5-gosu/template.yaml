@@ -1,0 +1,23 @@
+metadata:
+  atespace: ate-demo-nonroot
+  name: gosu-nobody
+workerSelector:
+  matchLabels:
+    workload: gosu-nobody
+containers:
+- name: gosu-nobody
+  image: ate-ish-g5-gosu:latest
+  command:
+  - node
+  - /actor/server.js
+  wakeupProbe:
+    httpGet:
+      path: /readyz
+      port: 8080
+    timeoutSeconds: 30
+resources:
+  limits:
+  - name: cpu
+    quantity: "1"
+  - name: memory
+    quantity: 256Mi

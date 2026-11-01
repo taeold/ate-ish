@@ -37,6 +37,16 @@ type ActorSpec struct {
 	DurableMounts    map[string]string // host dir -> container mount path, rw (includes any workspace volume a template declares)
 	SystemInfoMounts map[string]string // host dir -> container mount path, ro (trust-bundle files already written under it)
 
+	// UID and GID are the actor process's own identity inside the
+	// sandbox, resolved from the image's USER directive (empty means
+	// root, uid/gid 0, every template before this one used). A non-root
+	// value only actually works when Namespace.Open mapped more than
+	// root (idmap.go); under a root-only mapping the gofer's own
+	// setfsuid for this uid resolves to the host's overflow id and the
+	// actor's writes fail with EACCES, by design (see Open's doc
+	// comment).
+	UID, GID uint32
+
 	Egress              []EgressDestination
 	EgressSocketsDir    string // host dir holding every Egress[].SocketName, bind-mounted read-only at /run/ate-ish/egress
 	EgressControlSocket string // host path to a wildcard rule's control socket (internal/egress's ListenControl), bind-mounted at /run/ate-ish/egress-control.sock; empty when the policy has no wildcard hostname
@@ -313,6 +323,12 @@ func buildConfig(spec ActorSpec, bundleDir, egressEnv string) ociSpec {
 	if spec.IngressSocket != "" {
 		env = append(env, "ATE_INGRESS_TARGET="+spec.IngressTarget)
 	}
+	if spec.UID != 0 || spec.GID != 0 {
+		// RunInit (init.go) reads these to start the actor's own
+		// process under that uid/gid, instead of this spec's own
+		// always-root Process.User above.
+		env = append(env, fmt.Sprintf("ATE_ACTOR_UID=%d", spec.UID), fmt.Sprintf("ATE_ACTOR_GID=%d", spec.GID))
+	}
 	mounts := []ociMount{
 		{Destination: "/proc", Type: "proc", Source: "proc"},
 		{Destination: "/dev", Type: "tmpfs", Source: "tmpfs"},
@@ -345,6 +361,15 @@ func buildConfig(spec ActorSpec, bundleDir, egressEnv string) ociSpec {
 	return ociSpec{
 		OCIVersion: "1.0.0",
 		Process: ociProcess{
+			// Always root: the sandbox's pid 1 is this package's own
+			// init (RunInit, init.go), which needs real access to the
+			// host-backed sockets bind-mounted under /run/ate-ish
+			// (ingress, egress) for as long as it runs, regardless of
+			// what uid the actor's own image declares. RunInit itself
+			// drops the *actor child process* to spec.UID/GID (passed
+			// through ATE_ACTOR_UID/ATE_ACTOR_GID below) before
+			// starting it, the same pattern gosu or tini use, not this
+			// OCI field.
 			User:         ociUser{UID: 0, GID: 0},
 			Args:         append([]string{"/.ate/ate-ish", sandboxInitArg}, spec.Command...),
 			Env:          env,

@@ -44,6 +44,7 @@ func main() {
 	apiKey := flag.String("api-key", "test-fake-key", "x-api-key value that gets a 200 instead of a 401")
 	certOut := flag.String("cert-out", "", "write the self-signed CA's PEM here (defaults to a temp file)")
 	readyFile := flag.String("ready-file", "", "write 'addr capath' here once listening, for a caller to poll instead of scraping stdout")
+	delay := flag.Duration("delay", 0, "hold every /v1/messages reply this long before answering (G6: a slow outbound call the actor's own handler is waiting on)")
 	flag.Parse()
 
 	cert, caPEM, err := selfSignedLeaf(*hostname)
@@ -75,11 +76,14 @@ func main() {
 		}
 	}
 
-	h := &handler{apiKey: *apiKey}
+	h := &handler{apiKey: *apiKey, delay: *delay}
 	log.Fatal(http.Serve(ln, h))
 }
 
-type handler struct{ apiKey string }
+type handler struct {
+	apiKey string
+	delay  time.Duration
+}
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if got := r.Header.Get("x-api-key"); got != h.apiKey {
@@ -139,6 +143,9 @@ func (h *handler) messages(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
+	}
+	if h.delay > 0 {
+		time.Sleep(h.delay)
 	}
 	text, blocks := replyFor(req)
 

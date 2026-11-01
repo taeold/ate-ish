@@ -129,7 +129,8 @@ func New(ctx context.Context, b store.Store, addr string, capacity int, dir stri
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, err
 	}
-	ns, err := sandbox.Open(filepath.Join(dir, "runsc-state"))
+	runscPath := filepath.Join(runscReleaseDir(), "runsc")
+	ns, err := sandbox.Open(filepath.Join(dir, "runsc-state"), runscPath)
 	if err != nil {
 		return nil, fmt.Errorf("opening the held namespace: %w", err)
 	}
@@ -141,7 +142,7 @@ func New(ctx context.Context, b store.Store, addr string, capacity int, dir stri
 
 	w := &Worker{
 		id: "w-" + randomHex(4), addr: addr, dir: dir, store: b,
-		ns: ns, gateway: gateway, runscPath: filepath.Join(runscReleaseDir(), "runsc"),
+		ns: ns, gateway: gateway, runscPath: runscPath,
 		slots: make([]*hosted, capacity),
 	}
 	if err := w.writeLease(ctx); err != nil {
@@ -325,7 +326,7 @@ func (w *Worker) boot(ctx context.Context, h *hosted, rec records.Actor) error {
 		return err
 	}
 
-	lowerDir, err := imageRootfsDir(rootfsCacheDir(), tmpl.Containers[0].Image)
+	lowerDir, actorUID32, actorGID32, err := imageRootfsDir(rootfsCacheDir(), tmpl.Containers[0].Image, w.ns)
 	if err != nil {
 		return fmt.Errorf("preparing %s's rootfs: %w", tmpl.Containers[0].Image, err)
 	}
@@ -350,6 +351,7 @@ func (w *Worker) boot(ctx context.Context, h *hosted, rec records.Actor) error {
 	spec := sandbox.ActorSpec{
 		ID: h.actorUID, Hostname: containerName(tmpl.Containers[0]),
 		Command: command, Env: cenv, RootfsLower: lowerDir,
+		UID: actorUID32, GID: actorGID32,
 		DurableMounts: durableMounts, SystemInfoMounts: systemInfoMounts,
 		Egress:              egressDests,
 		EgressSocketsDir:    filepath.Join(dirs.root, "egress"),

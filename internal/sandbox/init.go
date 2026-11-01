@@ -86,16 +86,29 @@ func RunInit(args []string) error {
 		go runDNSResponder(fwds)
 	}
 
+	var ing *outforwarder
 	if target := os.Getenv("ATE_INGRESS_TARGET"); target != "" {
-		ing := exec.Command(self, outforwarderArg, "/run/ate-ish/ingress.sock", "2", target)
-		ing.Stdout, ing.Stderr = os.Stdout, os.Stderr
-		if err := ing.Start(); err != nil {
+		ing = &outforwarder{self: self, target: target}
+		if err := ing.start(); err != nil {
 			return fmt.Errorf("starting ingress forwarder: %w", err)
 		}
 	}
 
 	actor := exec.Command(args[0], args[1:]...)
 	actor.Stdin, actor.Stdout, actor.Stderr = os.Stdin, os.Stdout, os.Stderr
+	// init itself (this process, pid 1) stays root throughout: it is
+	// the one thing in the sandbox that needs real access to the
+	// host-backed ingress/egress sockets bind-mounted under
+	// /run/ate-ish, for as long as the sandbox runs. The actor's own
+	// process is what an image's USER directive names, dropped here
+	// (bundle.go's buildConfig sets these only when the resolved uid/gid
+	// is non-root), the same gosu or tini pattern a real root-starting
+	// entrypoint uses, via Go's own Credential rather than a second
+	// binary: CAP_SETUID/CAP_SETGID are already in this sandbox's
+	// bounding set (bundle.go's bundleCaps).
+	if uid, gid, ok := actorCredential(); ok {
+		actor.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uid, Gid: gid}}
+	}
 	if err := actor.Start(); err != nil {
 		return fmt.Errorf("starting %s: %w", args[0], err)
 	}
@@ -105,6 +118,9 @@ func RunInit(args []string) error {
 	for s := range sigs {
 		if s == syscall.SIGUSR1 || s == syscall.SIGUSR2 {
 			fwds.signal(s)
+			if s == syscall.SIGUSR2 && ing != nil {
+				ing.restart()
+			}
 			continue
 		}
 		if s != syscall.SIGCHLD {
@@ -129,6 +145,20 @@ const (
 	forwarderArg    = "__sandbox_forwarder__"
 	outforwarderArg = "__sandbox_outforwarder__"
 )
+
+// actorCredential reads ATE_ACTOR_UID/ATE_ACTOR_GID (bundle.go's
+// buildConfig, set only for a non-root image), ok false when neither is
+// set: the common case, every actor before this build's G5.
+func actorCredential() (uid, gid uint32, ok bool) {
+	u, uok := os.LookupEnv("ATE_ACTOR_UID")
+	g, gok := os.LookupEnv("ATE_ACTOR_GID")
+	if !uok && !gok {
+		return 0, 0, false
+	}
+	uid64, _ := strconv.ParseUint(u, 10, 32)
+	gid64, _ := strconv.ParseUint(g, 10, 32)
+	return uint32(uid64), uint32(gid64), true
+}
 
 // fwdSet is every egress forwarder RunInit has started, static or
 // started later by the DNS responder: SIGUSR1/SIGUSR2 must reach all
@@ -333,6 +363,48 @@ func serveForward(ln net.Listener, dnet, daddr string) {
 			io.Copy(c, d)
 			wg.Wait()
 		}()
+	}
+}
+
+// outforwarder is init's own child-process wrapper around
+// RunOutForwarder (the ATE_INGRESS_TARGET dial-out pool, started once
+// per boot): restart stops the current one and starts a fresh one. A
+// connection one of its workers already had open when checkpoint saved
+// state is itself restored as part of the sandbox's own process tree,
+// but nothing on the OTHER end survives restore: the node-side gateway
+// socket (ingressBridge) for a restored generation is a brand-new bind
+// mount at a brand-new path, so the restored connection is simply
+// stale, and nothing inside this sandbox notices until it is actually
+// used and errors or hangs. That gap (found empirically: the first
+// request after restore hung past the 10s the bridge waits for a fresh
+// connection) is G7's own "redial on restore" fix, docs/ROOTLESS.md:
+// restart forces a fresh dial immediately on SIGUSR2, the same signal
+// that reopens every egress forwarder's listener after restore, instead
+// of waiting for the stale one to fail on its own.
+type outforwarder struct {
+	self, target string
+	cmd          *exec.Cmd
+}
+
+func (o *outforwarder) start() error {
+	cmd := exec.Command(o.self, outforwarderArg, "/run/ate-ish/ingress.sock", "2", o.target)
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	o.cmd = cmd
+	return nil
+}
+
+// restart kills the previous pool (best effort; it may already be
+// gone) and starts a replacement.
+func (o *outforwarder) restart() {
+	if o.cmd != nil && o.cmd.Process != nil {
+		o.cmd.Process.Kill()
+		o.cmd.Wait()
+	}
+	if err := o.start(); err != nil {
+		log.Printf("outforwarder: restart: %v", err)
 	}
 }
 
