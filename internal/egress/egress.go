@@ -27,6 +27,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -67,7 +68,16 @@ type Gateway struct {
 	testCAs *x509.CertPool
 
 	mu  sync.Mutex
-	lns map[string]net.Listener // socket path -> listener
+	lns map[string]ownedListener // socket path -> listener
+}
+
+// ownedListener tags a listener with the actor it belongs to, so
+// CloseActor can sweep every socket an actor opened, including the
+// ones a wildcard rule's control channel allocated after boot and
+// that the caller never named up front.
+type ownedListener struct {
+	ln    net.Listener
+	actor string
 }
 
 // New creates a Gateway. secretsClient resolves ate-secret://
@@ -79,7 +89,7 @@ func New(secretsClient *http.Client) (*Gateway, error) {
 		return nil, fmt.Errorf("egress gateway MITM CA: %w", err)
 	}
 	g := &Gateway{
-		ca: ca, secrets: &secrets{client: secretsClient, cache: map[string]string{}}, lns: map[string]net.Listener{},
+		ca: ca, secrets: &secrets{client: secretsClient, cache: map[string]string{}}, lns: map[string]ownedListener{},
 		resolve: parseResolveOverride(os.Getenv("ATE_EGRESS_RESOLVE")),
 	}
 	if path := os.Getenv("ATE_EGRESS_TEST_CA"); path != "" {
@@ -115,14 +125,22 @@ func parseResolveOverride(v string) map[string]string {
 // unless a test override names d.Host, in which case that address is
 // used instead (its own port if it carries one, else d.Port).
 func (g *Gateway) dialAddr(d Destination) string {
+	addr, _ := g.dialAddrOverride(d)
+	return addr
+}
+
+// dialAddrOverride is dialAddr, plus whether ATE_EGRESS_RESOLVE is the
+// reason: handleHTTPS needs to know, since testCAs must never replace
+// the system root pool for a destination it did not override.
+func (g *Gateway) dialAddrOverride(d Destination) (addr string, overridden bool) {
 	override, ok := g.resolve[d.Host]
 	if !ok {
-		return net.JoinHostPort(d.Host, strconv.Itoa(d.Port))
+		return net.JoinHostPort(d.Host, strconv.Itoa(d.Port)), false
 	}
 	if _, _, err := net.SplitHostPort(override); err == nil {
-		return override
+		return override, true
 	}
-	return net.JoinHostPort(override, strconv.Itoa(d.Port))
+	return net.JoinHostPort(override, strconv.Itoa(d.Port)), true
 }
 
 // CAPEM is the gateway's own MITM certificate, PEM-encoded: actors get it
@@ -142,7 +160,7 @@ func (g *Gateway) Listen(d Destination) error {
 		return fmt.Errorf("listening on %s: %w", d.Socket, err)
 	}
 	g.mu.Lock()
-	g.lns[d.Socket] = ln
+	g.lns[d.Socket] = ownedListener{ln: ln, actor: d.Actor}
 	g.mu.Unlock()
 	slog.Info("egress: listening", "actor", d.Actor, "socket", d.Socket, "proto", d.Proto, "host", d.Host, "port", d.Port)
 	go func() {
@@ -161,6 +179,104 @@ func (g *Gateway) Listen(d Destination) error {
 	return nil
 }
 
+// WildcardRule is one wildcard-hostname rule (pattern is "*" or
+// "*.suffix", records.IsWildcard/MatchesWildcard), resolved per query
+// by ListenControl rather than at boot: which exact hostname the
+// pattern will match is not known until the sandbox's own DNS
+// responder sees one.
+type WildcardRule struct {
+	Pattern        string
+	Proto          string
+	Port           int
+	ReplaceHeaders []records.ReplaceHeader
+}
+
+// ListenControl opens controlSocket and answers the sandbox's DNS
+// responder (internal/sandbox's RunInit): a "RESOLVE <host>\n" line
+// gets back "OK <ip> <port> <socket>\n" when host matches one of
+// rules (allocating a fresh loopback address via nextIP and a
+// Gateway.Listen destination the first time that exact host is seen,
+// then reusing both for every later query), or "NXDOMAIN\n" when it
+// matches none. socketsDir is the same host directory the sandbox's
+// static egress sockets live under (bind-mounted into the sandbox
+// already), so a socket ListenControl creates needs no new mount to
+// become reachable from inside.
+func (g *Gateway) ListenControl(actor, controlSocket string, rules []WildcardRule, socketsDir string, nextIP func() string) error {
+	os.Remove(controlSocket)
+	ln, err := net.Listen("unix", controlSocket)
+	if err != nil {
+		return fmt.Errorf("listening on %s: %w", controlSocket, err)
+	}
+	g.mu.Lock()
+	g.lns[controlSocket] = ownedListener{ln: ln, actor: actor}
+	g.mu.Unlock()
+	resolved := &sync.Map{} // host -> "ip port socket", once resolved
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go g.serveControl(conn, actor, rules, socketsDir, nextIP, resolved)
+		}
+	}()
+	return nil
+}
+
+func (g *Gateway) serveControl(conn net.Conn, actor string, rules []WildcardRule, socketsDir string, nextIP func() string, resolved *sync.Map) {
+	defer conn.Close()
+	in := bufio.NewReader(conn)
+	for {
+		line, err := in.ReadString('\n')
+		if err != nil {
+			return
+		}
+		host, ok := strings.CutPrefix(strings.TrimSpace(line), "RESOLVE ")
+		if !ok || host == "" {
+			fmt.Fprint(conn, "NXDOMAIN\n")
+			continue
+		}
+		if v, ok := resolved.Load(host); ok {
+			fmt.Fprintf(conn, "OK %s\n", v)
+			continue
+		}
+		var match *WildcardRule
+		for i := range rules {
+			if records.MatchesWildcard(rules[i].Pattern, host) {
+				match = &rules[i]
+				break
+			}
+		}
+		if match == nil {
+			slog.Info("egress: dns", "actor", actor, "host", host, "result", "nxdomain")
+			fmt.Fprint(conn, "NXDOMAIN\n")
+			continue
+		}
+		ip := nextIP()
+		name := sanitizeSocketName(host) + ".sock"
+		if err := g.Listen(Destination{
+			Actor: actor, Socket: filepath.Join(socketsDir, name), Proto: match.Proto, Host: host, Port: match.Port,
+			ReplaceHeaders: match.ReplaceHeaders,
+		}); err != nil {
+			slog.Error("egress: dns", "actor", actor, "host", host, "err", err)
+			fmt.Fprint(conn, "NXDOMAIN\n")
+			continue
+		}
+		v := fmt.Sprintf("%s %d %s", ip, match.Port, name)
+		resolved.Store(host, v)
+		fmt.Fprintf(conn, "OK %s\n", v)
+	}
+}
+
+func sanitizeSocketName(host string) string {
+	return strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' || r == '.' {
+			return r
+		}
+		return '-'
+	}, strings.ToLower(host))
+}
+
 // Close closes every socket this destination's actor opened and removes
 // the socket files (the bundle directory removal under it, elsewhere,
 // would do the same, but an explicit Close lets a suspend free the port
@@ -169,10 +285,28 @@ func (g *Gateway) Close(sockets ...string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	for _, s := range sockets {
-		if ln, ok := g.lns[s]; ok {
-			ln.Close()
+		if o, ok := g.lns[s]; ok {
+			o.ln.Close()
 			delete(g.lns, s)
 		}
+		os.Remove(s)
+	}
+}
+
+// CloseActor closes every socket this actor opened, including ones a
+// wildcard rule's control channel allocated on demand after boot and
+// that the caller (worker.go's h.egressSockets) never named: those
+// sockets are not known until the sandbox's own DNS responder actually
+// queries a host, so Close's explicit list cannot name them either.
+func (g *Gateway) CloseActor(actor string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for s, o := range g.lns {
+		if o.actor != actor {
+			continue
+		}
+		o.ln.Close()
+		delete(g.lns, s)
 		os.Remove(s)
 	}
 }
@@ -195,7 +329,15 @@ func (g *Gateway) handleHTTPS(conn net.Conn, d Destination) {
 		return
 	}
 	addr := net.JoinHostPort(d.Host, strconv.Itoa(d.Port))
-	dialTo := g.dialAddr(d)
+	dialTo, overridden := g.dialAddrOverride(d)
+	// testCAs only trusts a stand-in's self-signed leaf; applying it to
+	// every https destination would reject a real upstream's own,
+	// properly-issued certificate, so it only ever replaces the system
+	// pool for a destination ATE_EGRESS_RESOLVE actually overrode.
+	var rootCAs *x509.CertPool
+	if overridden {
+		rootCAs = g.testCAs
+	}
 	upstream := &http.Transport{
 		TLSNextProto: map[string]func(string, *tls.Conn) http.RoundTripper{},
 		DialTLSContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
@@ -203,7 +345,7 @@ func (g *Gateway) handleHTTPS(conn net.Conn, d Destination) {
 			if err != nil {
 				return nil, err
 			}
-			tc := tls.Client(raw, &tls.Config{ServerName: d.Host, RootCAs: g.testCAs})
+			tc := tls.Client(raw, &tls.Config{ServerName: d.Host, RootCAs: rootCAs})
 			if err := tc.Handshake(); err != nil {
 				raw.Close()
 				return nil, err

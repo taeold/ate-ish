@@ -1,6 +1,7 @@
 package sandbox
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"log"
@@ -13,6 +14,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"golang.org/x/net/dns/dnsmessage"
 )
 
 // This file is the in-sandbox side of the rootless design: init (RunInit),
@@ -61,19 +64,26 @@ func RunInit(args []string) error {
 		self = "/.ate/ate-ish"
 	}
 
-	var egressFwds []*exec.Cmd
+	fwds := &fwdSet{self: self}
 	for _, entry := range strings.Fields(os.Getenv("ATE_EGRESS")) {
 		parts := strings.SplitN(entry, ":", 3)
 		if len(parts) != 3 {
 			return fmt.Errorf("bad ATE_EGRESS entry %q, want ip:port:sockpath", entry)
 		}
 		ip, port, sock := parts[0], parts[1], parts[2]
-		fwd := exec.Command(self, forwarderArg, "tcp", ip+":"+port, "unix", sock)
-		fwd.Stdout, fwd.Stderr = os.Stdout, os.Stderr
-		if err := fwd.Start(); err != nil {
+		if err := fwds.start(ip, port, sock); err != nil {
 			return fmt.Errorf("starting egress forwarder for %s: %w", entry, err)
 		}
-		egressFwds = append(egressFwds, fwd)
+	}
+
+	// A wildcard-hostname rule's control socket (egressControlPath,
+	// bundle.go's Build) is present only when the actor's egress policy
+	// named one; its DNS responder resolves names on demand and starts
+	// one more forwarder (via fwds, so its listener still closes for
+	// checkpoint and reopens after restore like every other one) the
+	// first time a name actually matches.
+	if _, err := os.Stat(egressControlPath); err == nil {
+		go runDNSResponder(fwds)
 	}
 
 	if target := os.Getenv("ATE_INGRESS_TARGET"); target != "" {
@@ -94,9 +104,7 @@ func RunInit(args []string) error {
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT, syscall.SIGCHLD, syscall.SIGUSR1, syscall.SIGUSR2)
 	for s := range sigs {
 		if s == syscall.SIGUSR1 || s == syscall.SIGUSR2 {
-			for _, f := range egressFwds {
-				f.Process.Signal(s)
-			}
+			fwds.signal(s)
 			continue
 		}
 		if s != syscall.SIGCHLD {
@@ -121,6 +129,151 @@ const (
 	forwarderArg    = "__sandbox_forwarder__"
 	outforwarderArg = "__sandbox_outforwarder__"
 )
+
+// fwdSet is every egress forwarder RunInit has started, static or
+// started later by the DNS responder: SIGUSR1/SIGUSR2 must reach all
+// of them, including ones that did not exist yet when Namespace.Build
+// first ran, or a wildcard destination's listener would still be
+// bound when gVisor tries to checkpoint.
+type fwdSet struct {
+	self string
+	mu   sync.Mutex
+	fwds []*exec.Cmd
+}
+
+func (s *fwdSet) start(ip, port, sock string) error {
+	fwd := exec.Command(s.self, forwarderArg, "tcp", ip+":"+port, "unix", sock)
+	fwd.Stdout, fwd.Stderr = os.Stdout, os.Stderr
+	if err := fwd.Start(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	s.fwds = append(s.fwds, fwd)
+	s.mu.Unlock()
+	return nil
+}
+
+func (s *fwdSet) signal(sig os.Signal) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, f := range s.fwds {
+		f.Process.Signal(sig)
+	}
+}
+
+// runDNSResponder answers every query on dnsListenIP:53 by asking the
+// host's control socket (egress.Gateway.ListenControl) whether the
+// queried name matches a wildcard rule. A match gets an A record for
+// the loopback address the host allocated, and (the first time that
+// exact name is seen) one more forwarder from that address to the
+// socket the host is now listening on; anything else gets NXDOMAIN.
+// Never returns; RunInit starts it as its own goroutine.
+func runDNSResponder(fwds *fwdSet) {
+	conn, err := net.ListenPacket("udp", dnsListenIP+":53")
+	if err != nil {
+		log.Printf("dns responder: listen %s:53: %v", dnsListenIP, err)
+		return
+	}
+	defer conn.Close()
+	started := map[string]bool{} // "ip:port" already forwarding
+	var mu sync.Mutex
+	buf := make([]byte, 512)
+	for {
+		n, addr, err := conn.ReadFrom(buf)
+		if err != nil {
+			return
+		}
+		var req dnsmessage.Message
+		if err := req.Unpack(buf[:n]); err != nil || len(req.Questions) == 0 {
+			continue
+		}
+		go func(req dnsmessage.Message, addr net.Addr) {
+			resp := resolveQuestion(req, fwds, started, &mu)
+			if out, err := resp.Pack(); err == nil {
+				conn.WriteTo(out, addr)
+			}
+		}(req, addr)
+	}
+}
+
+func resolveQuestion(req dnsmessage.Message, fwds *fwdSet, started map[string]bool, mu *sync.Mutex) dnsmessage.Message {
+	resp := dnsmessage.Message{
+		Header:    dnsmessage.Header{ID: req.Header.ID, Response: true, RecursionAvailable: true},
+		Questions: req.Questions,
+	}
+	q := req.Questions[0]
+	name := strings.TrimSuffix(q.Name.String(), ".")
+	line, err := dialControl(name)
+	if err != nil || !strings.HasPrefix(line, "OK ") {
+		resp.Header.RCode = dnsmessage.RCodeNameError
+		return resp
+	}
+	fields := strings.Fields(strings.TrimPrefix(line, "OK "))
+	if len(fields) != 3 {
+		resp.Header.RCode = dnsmessage.RCodeServerFailure
+		return resp
+	}
+	ip, port, sock := fields[0], fields[1], fields[2]
+	if q.Type != dnsmessage.TypeA {
+		// No AAAA (or anything else) support: an empty NOERROR answer
+		// tells the resolver to fall back to A rather than treat this
+		// as a hard failure, matching a resolver with IPv6 off.
+		return resp
+	}
+	key := ip + ":" + port
+	mu.Lock()
+	needStart := !started[key]
+	started[key] = true
+	mu.Unlock()
+	if needStart {
+		if err := fwds.start(ip, port, "/run/ate-ish/egress/"+sock); err != nil {
+			log.Printf("dns responder: starting forwarder for %s: %v", name, err)
+			resp.Header.RCode = dnsmessage.RCodeServerFailure
+			return resp
+		}
+		// The DNS answer races the actor's own connect against this
+		// forwarder's listen: a fresh exec.Cmd is asynchronous, so wait
+		// for the socket to actually accept before replying, instead of
+		// handing back an address nothing is listening on yet.
+		waitDial(ip + ":" + port)
+	}
+	var a [4]byte
+	for i, part := range strings.SplitN(ip, ".", 4) {
+		v, _ := strconv.Atoi(part)
+		a[i] = byte(v)
+	}
+	resp.Answers = []dnsmessage.Resource{{
+		Header: dnsmessage.ResourceHeader{Name: q.Name, Type: dnsmessage.TypeA, Class: dnsmessage.ClassINET, TTL: 1},
+		Body:   &dnsmessage.AResource{A: a},
+	}}
+	return resp
+}
+
+// waitDial blocks until addr accepts a TCP connection or 2 seconds
+// pass, whichever comes first.
+func waitDial(addr string) {
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if c, err := net.DialTimeout("tcp", addr, 50*time.Millisecond); err == nil {
+			c.Close()
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func dialControl(name string) (string, error) {
+	conn, err := net.Dial("unix", egressControlPath)
+	if err != nil {
+		return "", err
+	}
+	defer conn.Close()
+	if _, err := fmt.Fprintf(conn, "RESOLVE %s\n", name); err != nil {
+		return "", err
+	}
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	return strings.TrimSpace(line), err
+}
 
 // RunForwarder copies raw bytes between a listener and a dialed address,
 // never parsing them: ateinit runs one per ATE_EGRESS entry, each on its

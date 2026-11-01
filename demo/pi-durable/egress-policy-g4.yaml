@@ -1,0 +1,23 @@
+rules:
+# *.vercel.sh is first on purpose: when a hostname matches more than
+# one wildcard rule, worker.go's openEgress keeps the first match in
+# declaration order, so a specific pattern must be listed ahead of a
+# more general one in the same policy.
+- https:
+    hostnames:
+    - "*.vercel.sh"
+    effects:
+      replaceHeaders:
+      - header: x-api-key
+        credentialUri: ate-secret://env/AI_GATEWAY_API_KEY
+- http:
+    hostnames:
+    - "example.com"
+- https:
+    hostnames:
+    - "internal.test"
+    port: 8443
+    effects:
+      replaceHeaders:
+      - header: x-api-key
+        credentialUri: ate-secret://env/INTERNAL_TEST_KEY

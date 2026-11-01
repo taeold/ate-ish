@@ -37,10 +37,11 @@ type ActorSpec struct {
 	DurableMounts    map[string]string // host dir -> container mount path, rw (includes any workspace volume a template declares)
 	SystemInfoMounts map[string]string // host dir -> container mount path, ro (trust-bundle files already written under it)
 
-	Egress           []EgressDestination
-	EgressSocketsDir string // host dir holding every Egress[].SocketName, bind-mounted read-only at /run/ate-ish/egress
-	IngressSocket    string // host path to the node's ingress.sock (bind-mounted at /run/ate-ish/ingress.sock)
-	IngressTarget    string // "127.0.0.1:<port>" the actor's own server listens on, ATE_INGRESS_TARGET
+	Egress              []EgressDestination
+	EgressSocketsDir    string // host dir holding every Egress[].SocketName, bind-mounted read-only at /run/ate-ish/egress
+	EgressControlSocket string // host path to a wildcard rule's control socket (internal/egress's ListenControl), bind-mounted at /run/ate-ish/egress-control.sock; empty when the policy has no wildcard hostname
+	IngressSocket       string // host path to the node's ingress.sock (bind-mounted at /run/ate-ish/ingress.sock)
+	IngressTarget       string // "127.0.0.1:<port>" the actor's own server listens on, ATE_INGRESS_TARGET
 
 	AteIshBinary string // this process's own executable, copied to <bundle>/.ate/ate-ish
 }
@@ -57,6 +58,19 @@ type Bundle struct {
 // this exact string to RunInit before any normal CLI parsing.
 const sandboxInitArg = "__sandbox_init__"
 
+// dnsListenIP and egressControlPath are shared between Build (which
+// writes resolv.conf and the control-socket bind mount) and RunInit
+// (which starts the in-sandbox DNS responder and dials the control
+// socket): the fixed address and mount path a wildcard-hostname rule
+// needs, present only when ActorSpec.EgressControlSocket is set.
+// dnsListenIP sits outside 127.0.0.0/24, openEgress's own static-
+// destination range, so the two never collide no matter how many
+// static destinations an actor's policy also names.
+const (
+	dnsListenIP       = "127.0.53.53"
+	egressControlPath = "/run/ate-ish/egress-control.sock"
+)
+
 // Build writes bundleDir/config.json and every file the spec's mounts
 // name (/etc/hosts, /etc/resolv.conf, the ATE_EGRESS env value), then
 // mounts the tmpfs+overlay rootfs inside the held namespace, matching
@@ -69,7 +83,14 @@ func (n *Namespace) Build(ctx context.Context, bundleDir string, spec ActorSpec)
 			return nil, err
 		}
 	}
-	if err := os.WriteFile(filepath.Join(bundleDir, "etc", "resolv.conf"), nil, 0o644); err != nil {
+	resolvConf := []byte(nil)
+	if spec.EgressControlSocket != "" {
+		// Only set when a wildcard-hostname rule exists: a plain static
+		// policy keeps the empty resolv.conf today's actors already run
+		// with, resolving nothing but /etc/hosts.
+		resolvConf = []byte("nameserver " + dnsListenIP + "\n")
+	}
+	if err := os.WriteFile(filepath.Join(bundleDir, "etc", "resolv.conf"), resolvConf, 0o644); err != nil {
 		return nil, err
 	}
 	hosts := "127.0.0.1 localhost\n"
@@ -300,8 +321,17 @@ func buildConfig(spec ActorSpec, bundleDir, egressEnv string) ociSpec {
 		bind("/etc/hosts", filepath.Join(bundleDir, "etc", "hosts"), true),
 		bind("/etc/resolv.conf", filepath.Join(bundleDir, "etc", "resolv.conf"), true),
 	}
-	if len(spec.Egress) > 0 {
+	if len(spec.Egress) > 0 || spec.EgressControlSocket != "" {
+		// Not read-only when a control socket is in play: a wildcard
+		// match creates its socket under this same directory after
+		// boot, and the sandbox's mount of it must see that file
+		// appear, which an "ro" bind still allows (ro only blocks
+		// writes from inside the sandbox, not new entries the host
+		// side adds to the directory the bind mount points at).
 		mounts = append(mounts, bind("/run/ate-ish/egress", spec.EgressSocketsDir, true))
+	}
+	if spec.EgressControlSocket != "" {
+		mounts = append(mounts, bind(egressControlPath, spec.EgressControlSocket, false))
 	}
 	if spec.IngressSocket != "" {
 		mounts = append(mounts, bind("/run/ate-ish/ingress.sock", spec.IngressSocket, false))

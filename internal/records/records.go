@@ -5,6 +5,7 @@ package records
 
 import (
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -102,19 +103,52 @@ type Volume struct {
 	} `json:"systemInfo"`
 }
 
+// EgressPolicy is an actor's allow-list of outbound destinations.
+// docs/ROOTLESS.md's rule kinds: http and https carry a hostname list
+// (an exact name, a single-leftmost-label wildcard like "*.vercel.sh",
+// or the bare wildcard "*") and may replace one request header per
+// rule; tlsPassthrough and actorJwt parse but stay unsupported (worker.go
+// logs one line per policy that uses either and otherwise ignores them).
 type EgressPolicy struct {
-	Rules []struct {
-		HTTPS struct {
-			Hostnames []string `json:"hostnames"`
-			Effects   struct {
-				ReplaceHeaders []ReplaceHeader `json:"replaceHeaders"`
-			} `json:"effects"`
-		} `json:"https"`
-	} `json:"rules"`
+	Rules []EgressRule `json:"rules"`
+}
+
+type EgressRule struct {
+	HTTP           *EgressRuleSpec `json:"http,omitempty"`
+	HTTPS          *EgressRuleSpec `json:"https,omitempty"`
+	TLSPassthrough *EgressRuleSpec `json:"tlsPassthrough,omitempty"`
+	ActorJWT       *EgressRuleSpec `json:"actorJwt,omitempty"`
+}
+
+// EgressRuleSpec is one rule's body, shared by every kind. Port
+// defaults to 80 for an http rule and 443 for an https rule when zero.
+type EgressRuleSpec struct {
+	Hostnames []string `json:"hostnames"`
+	Port      int      `json:"port,omitempty"`
+	Effects   struct {
+		ReplaceHeaders []ReplaceHeader `json:"replaceHeaders"`
+	} `json:"effects"`
 }
 
 type ReplaceHeader struct {
 	Header        string `json:"header"`
 	Prefix        string `json:"prefix,omitempty"`
 	CredentialURI string `json:"credentialUri"`
+}
+
+// IsWildcard reports whether hostname is a pattern this build resolves
+// through the in-sandbox DNS responder (docs/ROOTLESS.md: one
+// leftmost label, "*.suffix", or the bare wildcard "*") rather than a
+// static /etc/hosts entry.
+func IsWildcard(hostname string) bool { return strings.HasPrefix(hostname, "*") }
+
+// MatchesWildcard reports whether host matches the wildcard pattern
+// ("*" or "*.suffix"). pattern is assumed to already satisfy
+// IsWildcard.
+func MatchesWildcard(pattern, host string) bool {
+	if pattern == "*" {
+		return true
+	}
+	suffix := strings.TrimPrefix(pattern, "*") // ".vercel.sh"
+	return len(host) > len(suffix) && strings.HasSuffix(host, suffix)
 }

@@ -330,7 +330,7 @@ func (w *Worker) boot(ctx context.Context, h *hosted, rec records.Actor) error {
 		return fmt.Errorf("preparing %s's rootfs: %w", tmpl.Containers[0].Image, err)
 	}
 
-	egressDests, egressSockets, err := w.openEgress(h, rec.EgressPolicy)
+	egressDests, egressSockets, egressControl, err := w.openEgress(h, rec.EgressPolicy)
 	if err != nil {
 		return fmt.Errorf("egress policy: %w", err)
 	}
@@ -351,11 +351,12 @@ func (w *Worker) boot(ctx context.Context, h *hosted, rec records.Actor) error {
 		ID: h.actorUID, Hostname: containerName(tmpl.Containers[0]),
 		Command: command, Env: cenv, RootfsLower: lowerDir,
 		DurableMounts: durableMounts, SystemInfoMounts: systemInfoMounts,
-		Egress:           egressDests,
-		EgressSocketsDir: filepath.Join(dirs.root, "egress"),
-		IngressSocket:    dirs.ingressSocket,
-		IngressTarget:    fmt.Sprintf("127.0.0.1:%d", port),
-		AteIshBinary:     mustExecutable(),
+		Egress:              egressDests,
+		EgressSocketsDir:    filepath.Join(dirs.root, "egress"),
+		EgressControlSocket: egressControl,
+		IngressSocket:       dirs.ingressSocket,
+		IngressTarget:       fmt.Sprintf("127.0.0.1:%d", port),
+		AteIshBinary:        mustExecutable(),
 	}
 
 	bundleDir := filepath.Join(dirs.ociBundleDir, h.actorUID)
@@ -418,37 +419,82 @@ func (w *Worker) boot(ctx context.Context, h *hosted, rec records.Actor) error {
 	return nil
 }
 
-// openEgress allocates one loopback address and host socket per
-// destination policy allows (round 3's design) and starts the gateway
-// listening on each.
-func (w *Worker) openEgress(h *hosted, policy *records.EgressPolicy) (dests []sandbox.EgressDestination, sockets []string, err error) {
+// openEgress allocates one loopback address and host socket per exact
+// destination policy allows (round 3's design, generalized here past
+// https-only and port-443-only), and, when any rule names a wildcard
+// hostname, one control socket the sandbox's own DNS responder uses to
+// resolve a matching name on demand (docs/ROOTLESS.md's wildcard
+// kind). tlsPassthrough and actorJwt parse but are not wired to
+// anything; a policy naming either gets one log line per rule and is
+// otherwise ignored, exactly as the spec says.
+func (w *Worker) openEgress(h *hosted, policy *records.EgressPolicy) (dests []sandbox.EgressDestination, sockets []string, control string, err error) {
 	if policy == nil {
-		return nil, nil, nil
+		return nil, nil, "", nil
+	}
+	egressDir := filepath.Join(h.dirs.root, "egress")
+	if err := os.MkdirAll(egressDir, 0o755); err != nil {
+		return nil, nil, "", err
 	}
 	n := 2 // 127.0.0.1 is reserved for localhost inside the sandbox
-	for _, rule := range policy.Rules {
-		for _, hostname := range rule.HTTPS.Hostnames {
-			name := fmt.Sprintf("%d.sock", n)
-			sock := filepath.Join(h.dirs.root, "egress", name)
-			if err := os.MkdirAll(filepath.Dir(sock), 0o755); err != nil {
-				return nil, nil, err
+	nextIP := func() string { ip := fmt.Sprintf("127.0.0.%d", n); n++; return ip }
+
+	var wildcards []egress.WildcardRule
+	addStatic := func(proto string, spec *records.EgressRuleSpec) error {
+		port := spec.Port
+		if port == 0 {
+			port = map[string]int{"http": 80, "https": 443}[proto]
+		}
+		for _, hostname := range spec.Hostnames {
+			if records.IsWildcard(hostname) {
+				wildcards = append(wildcards, egress.WildcardRule{
+					Pattern: hostname, Proto: proto, Port: port, ReplaceHeaders: spec.Effects.ReplaceHeaders,
+				})
+				continue
 			}
-			d := sandbox.EgressDestination{
-				ListenIP: fmt.Sprintf("127.0.0.%d", n), Port: 443, SocketName: name, Hostname: hostname,
-			}
+			ip := nextIP()
+			name := fmt.Sprintf("%d.sock", n-1)
+			sock := filepath.Join(egressDir, name)
 			if err := w.gateway.Listen(egress.Destination{
-				Actor: h.key(), Socket: sock, Proto: "https", Host: hostname, Port: 443,
-				ReplaceHeaders: rule.HTTPS.Effects.ReplaceHeaders,
+				Actor: h.key(), Socket: sock, Proto: proto, Host: hostname, Port: port,
+				ReplaceHeaders: spec.Effects.ReplaceHeaders,
 			}); err != nil {
-				w.gateway.Close(sockets...)
-				return nil, nil, err
+				return err
 			}
-			dests = append(dests, d)
+			dests = append(dests, sandbox.EgressDestination{ListenIP: ip, Port: port, SocketName: name, Hostname: hostname})
 			sockets = append(sockets, sock)
-			n++
+		}
+		return nil
+	}
+
+	for _, rule := range policy.Rules {
+		switch {
+		case rule.HTTP != nil:
+			if err := addStatic("http", rule.HTTP); err != nil {
+				w.gateway.Close(sockets...)
+				return nil, nil, "", err
+			}
+		case rule.HTTPS != nil:
+			if err := addStatic("https", rule.HTTPS); err != nil {
+				w.gateway.Close(sockets...)
+				return nil, nil, "", err
+			}
+		case rule.TLSPassthrough != nil:
+			slog.Info("egress: tlsPassthrough rule is not supported in this build, ignoring", "actor", h.key())
+		case rule.ActorJWT != nil:
+			slog.Info("egress: actorJwt rule is not supported in this build, ignoring", "actor", h.key())
 		}
 	}
-	return dests, sockets, nil
+
+	if len(wildcards) == 0 {
+		return dests, sockets, "", nil
+	}
+	control = filepath.Join(egressDir, "_control.sock")
+	if err := w.gateway.ListenControl(h.key(), control, wildcards, egressDir, nextIP); err != nil {
+		w.gateway.Close(sockets...)
+		return nil, nil, "", err
+	}
+	sockets = append(sockets, control)
+	return dests, sockets, control, nil
 }
 
 func (w *Worker) teardownBundle(ctx context.Context, h *hosted) {
@@ -459,6 +505,10 @@ func (w *Worker) teardownBundle(ctx context.Context, h *hosted) {
 		h.ingress.Close()
 	}
 	w.gateway.Close(h.egressSockets...)
+	// A wildcard rule's control channel may have opened sockets after
+	// boot, for hosts the sandbox's own DNS responder actually queried;
+	// h.egressSockets never names those, so sweep by actor as well.
+	w.gateway.CloseActor(h.key())
 }
 
 func (w *Worker) terminateWorkload(ctx context.Context, h *hosted) {

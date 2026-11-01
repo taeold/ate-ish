@@ -1,0 +1,8 @@
+rules:
+- https:
+    hostnames:
+    - "*.vercel.sh"
+    effects:
+      replaceHeaders:
+      - header: x-api-key
+        credentialUri: ate-secret://secretmanager.googleapis.com/daniel-junk/ai-gateway-token

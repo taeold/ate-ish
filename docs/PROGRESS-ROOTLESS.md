@@ -178,3 +178,135 @@ G4 (rule kinds, wildcards), G5 (non-root image + subuid), G6 (in-flight
 suspend), G7 (restore latency), G8 (two nodes, one host), G9 (node
 image via `docker run --privileged`) are out of this stage's gate list
 (docs/ROOTLESS.md scopes G1-G3 and G10 to stage A) and were not run.
+
+## Stage B: a fast loop, then the egress rule kinds
+
+### Part 1 — hack/fakeupstream and the shared cache
+
+`hack/fakeupstream` is a small Go program: self-signed TLS for a
+hostname given on its command line, answers both `/v1/messages`
+(Anthropic's streaming shape, which pi-ai's gateway provider turned
+out to require — a plain JSON body failed with "Anthropic stream
+ended without a stop reason" the first time this ran for real) and
+`/v1/chat/completions`, 401 unless `x-api-key` matches `-api-key`
+exactly. It never runs a real model: a plain prompt gets a canned
+"done" with no tool call (gate.sh's own `expect` checks never assert
+file contents, only that a turn settles), and a prompt of the exact
+shape "Run this exact command with the bash tool and reply with its
+output only: `<cmd>`" gets a `tool_use` for `<cmd>` so the real
+sandboxed egress checks still run for real and report what actually
+happened.
+
+`internal/egress.Gateway` gained two env overrides, read once at
+startup and never set by default: `ATE_EGRESS_RESOLVE=host=ip[:port]`
+dials that address instead of the hostname's real one for a named
+destination, and `ATE_EGRESS_TEST_CA=<pem>` trusts that stand-in's
+leaf — applied only to a destination the resolve override actually
+named, never to a real one (the first version applied it
+unconditionally, which broke every real https destination behind the
+same node: fixed by threading an `overridden bool` out of
+`dialAddrOverride`).
+
+`runsc` and exported image rootfses now share one cache directory,
+`ATE_CACHE_DIR` or `~/.cache/ate-ish` (`internal/atelet.cacheDir`).
+The old default, `~/.local/state/ate-ish`, was left root-owned by an
+earlier sudo'd run on this VM; moving the shared cache under `~/.cache`
+sidestepped that instead of chowning a directory outside this stage's
+own work.
+
+`hack/gate.sh` took a `--fake` flag: it only swaps the default egress
+policy to `demo/pi-durable/egress-policy-gateway-fake.yaml`
+(credentialUri `ate-secret://env/AI_GATEWAY_API_KEY` instead of Secret
+Manager); the caller is still the one that starts fakeupstream and
+exports `ATE_EGRESS_RESOLVE`/`ATE_EGRESS_TEST_CA`/`AI_GATEWAY_API_KEY`
+before the node itself starts.
+
+`hack/smoke.sh` builds the binary, starts a node with a dir store,
+runs the counter demo (1, 2, suspend, 3), then runs `hack/gate.sh
+--fake`'s full sequence (turn, suspend, tag, fork, divergent turns,
+all three egress checks) against fakeupstream. Measured (2026-11-01,
+`~/.cache/ate-ish` already populated from stage A for warm; moved
+aside and let `EnsureRunsc`/`imageRootfsDir` repopulate it for cold):
+
+```
+cold: 32574 ms total (build 361 ms, fakeupstream 212 ms, node up 118 ms,
+      counter 4237 ms, gate.sh --fake 24748 ms)
+warm: 23237 ms total (build 350 ms, node up 122 ms, counter 4243 ms,
+      gate.sh --fake 18406 ms)
+```
+Both well under the one-minute target.
+
+### Part 2 — the egress rule kinds (G4)
+
+`records.EgressPolicy` generalized from https-only, port-443-only,
+exact-hostname-only to `EgressRule{HTTP, HTTPS, TLSPassthrough,
+ActorJWT *EgressRuleSpec}`, each with a `Port` (defaulting 80/443) and
+a hostname list that may be an exact name, `*.suffix`, or bare `*`
+(`records.IsWildcard`/`MatchesWildcard`). `tlsPassthrough`/`actorJwt`
+parse but do nothing; `worker.go`'s `openEgress` logs one line per
+rule using either, as the spec asks, and otherwise ignores them.
+
+An exact hostname keeps the existing boot-time mechanism (a static
+`/etc/hosts` entry, a loopback address, a host socket), now for any
+`http`/`https` proto and port instead of https-443 only. A wildcard
+hostname cannot get a boot-time entry — the real hostname it will
+match is not known yet — so it goes through a new path instead: the
+sandbox's own DNS responder (`sandbox.runDNSResponder`, inside
+`RunInit`, listening on `127.0.53.53:53`, the actor's only
+nameserver when any wildcard rule exists) asks a per-actor control
+socket (`egress.Gateway.ListenControl`) to resolve each queried name;
+the host walks the actor's wildcard rules (first match in policy
+order wins, so list a specific pattern like `*.vercel.sh` ahead of a
+bare `*` in the same policy), allocates a loopback address and a
+`Gateway.Listen` destination the first time that exact name is seen,
+and remembers both for every later query. The sandbox then starts one
+more forwarder from that address to the new destination — through the
+same `fwdSet` the static ones use, so SIGUSR1/SIGUSR2 still reach it
+for checkpoint/restore — and answers the DNS query with the address.
+
+Two real bugs found running this for real, beyond the resolve-override
+one in Part 1: (1) the DNS answer initially raced the actor's own
+connect against the new forwarder's listen (a fresh `exec.Cmd` is
+asynchronous) — `fetch failed ... ECONNREFUSED` on the first wildcard
+request every time; fixed by `waitDial`, blocking the DNS reply until
+the forwarder's address actually accepts a connection. (2) the
+`internal.test` non-443 check first used a custom header name
+(`x-internal-key`) that fakeupstream's own auth check never looks at
+(it only reads `x-api-key`) — not an egress bug, just the test target
+checking the wrong header; fixed by using `x-api-key` there too, same
+as every other check.
+
+G4, run for real via `hack/smoke.sh`'s own section (two more pi-durable
+actors, policies at `demo/pi-durable/egress-policy-g4{,-star}.yaml`):
+
+```
+ok: http rule reaches http://example.com/: status 200
+ok: https rule on a non-443 port reaches internal.test:8443, key replaced: status 200
+ok: *.vercel.sh matches ai-gateway.vercel.sh, placeholder key replaced: status 200
+ok: bare * reaches example.com and example.org with no key
+ok: under g4-rules's specific policy (no bare *), an unlisted name still fails: failed: getaddrinfo ENOTFOUND example.org
+```
+`*.vercel.sh` matching the real `ai-gateway.vercel.sh` with the real
+key replaced was run once more, for real, as part of the G2/G3 rerun
+below (`demo/pi-durable/egress-policy-gateway-wildcard.yaml`, same
+rule but `ate-secret://secretmanager.googleapis.com/...`). PASS.
+
+### G2/G3 rerun, to show nothing regressed
+
+G2 (as its own node, dir store under `/tmp/g2-regress`, not
+`hack/smoke.sh`'s ephemeral one): 1, 2, suspend, 3, `SIGINT` the node,
+start it again, next request 4 — all correct. G3: `hack/gate.sh` with
+no `--fake`, `AI_GATEWAY_API_KEY` from `gcloud secrets versions access
+latest --secret ai-gateway-token --project daniel-junk` into the
+environment only, `POLICY=demo/pi-durable/egress-policy-gateway-
+wildcard.yaml` (so this same run also covers G4's real-upstream
+wildcard check): every step green, real model answers ("Successfully
+wrote to app.js", "Successfully replaced 1 block(s) in test.js", ...),
+suspend/tag/fork, divergent turns, both DNS-refusal checks, and the
+401 check. PASS, no regression.
+
+### hack/smoke.sh total, with G4
+
+```
+32593 ms total (counter+gate.sh --fake section 18650 ms, G4 section 8434 ms)
+```
