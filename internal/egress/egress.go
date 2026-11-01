@@ -56,6 +56,16 @@ type Gateway struct {
 	ca      *mitmCA
 	secrets *secrets
 
+	// resolve and testCAs are test-only overrides, both unset by
+	// default: ATE_EGRESS_RESOLVE points a hostname at a loopback
+	// stand-in (hack/fakeupstream, or a host-side test server for a
+	// non-443 https rule) instead of dialing the real upstream, and
+	// ATE_EGRESS_TEST_CA trusts that stand-in's self-signed leaf so the
+	// outbound TLS handshake does not fail on an unknown CA. Neither is
+	// ever set by production code.
+	resolve map[string]string // hostname -> "ip:port" to dial instead
+	testCAs *x509.CertPool
+
 	mu  sync.Mutex
 	lns map[string]net.Listener // socket path -> listener
 }
@@ -68,7 +78,51 @@ func New(secretsClient *http.Client) (*Gateway, error) {
 	if err != nil {
 		return nil, fmt.Errorf("egress gateway MITM CA: %w", err)
 	}
-	return &Gateway{ca: ca, secrets: &secrets{client: secretsClient, cache: map[string]string{}}, lns: map[string]net.Listener{}}, nil
+	g := &Gateway{
+		ca: ca, secrets: &secrets{client: secretsClient, cache: map[string]string{}}, lns: map[string]net.Listener{},
+		resolve: parseResolveOverride(os.Getenv("ATE_EGRESS_RESOLVE")),
+	}
+	if path := os.Getenv("ATE_EGRESS_TEST_CA"); path != "" {
+		pem, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("ATE_EGRESS_TEST_CA=%s: %w", path, err)
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, fmt.Errorf("ATE_EGRESS_TEST_CA=%s: no certificate found", path)
+		}
+		g.testCAs = pool
+	}
+	return g, nil
+}
+
+// parseResolveOverride parses "host=ip[:port][,host=ip[:port]...]" into a
+// hostname -> dial-address map. A bare ip (no port) keeps the
+// destination's own rule port; see dialAddr.
+func parseResolveOverride(v string) map[string]string {
+	m := map[string]string{}
+	for _, entry := range strings.FieldsFunc(v, func(r rune) bool { return r == ',' || r == ' ' }) {
+		host, addr, ok := strings.Cut(entry, "=")
+		if !ok || host == "" || addr == "" {
+			continue
+		}
+		m[host] = addr
+	}
+	return m
+}
+
+// dialAddr is the address this Gateway actually dials for d: d.Host:d.Port
+// unless a test override names d.Host, in which case that address is
+// used instead (its own port if it carries one, else d.Port).
+func (g *Gateway) dialAddr(d Destination) string {
+	override, ok := g.resolve[d.Host]
+	if !ok {
+		return net.JoinHostPort(d.Host, strconv.Itoa(d.Port))
+	}
+	if _, _, err := net.SplitHostPort(override); err == nil {
+		return override
+	}
+	return net.JoinHostPort(override, strconv.Itoa(d.Port))
 }
 
 // CAPEM is the gateway's own MITM certificate, PEM-encoded: actors get it
@@ -141,14 +195,15 @@ func (g *Gateway) handleHTTPS(conn net.Conn, d Destination) {
 		return
 	}
 	addr := net.JoinHostPort(d.Host, strconv.Itoa(d.Port))
+	dialTo := g.dialAddr(d)
 	upstream := &http.Transport{
 		TLSNextProto: map[string]func(string, *tls.Conn) http.RoundTripper{},
 		DialTLSContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
-			raw, err := (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, addr)
+			raw, err := (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, dialTo)
 			if err != nil {
 				return nil, err
 			}
-			tc := tls.Client(raw, &tls.Config{ServerName: d.Host})
+			tc := tls.Client(raw, &tls.Config{ServerName: d.Host, RootCAs: g.testCAs})
 			if err := tc.Handshake(); err != nil {
 				raw.Close()
 				return nil, err
@@ -162,8 +217,9 @@ func (g *Gateway) handleHTTPS(conn net.Conn, d Destination) {
 func (g *Gateway) handleHTTP(conn net.Conn, d Destination) {
 	defer conn.Close()
 	addr := net.JoinHostPort(d.Host, strconv.Itoa(d.Port))
+	dialTo := g.dialAddr(d)
 	rt := roundTripFunc(func(req *http.Request) (*http.Response, error) {
-		raw, err := (&net.Dialer{Timeout: 10 * time.Second}).Dial("tcp", addr)
+		raw, err := (&net.Dialer{Timeout: 10 * time.Second}).Dial("tcp", dialTo)
 		if err != nil {
 			return nil, err
 		}

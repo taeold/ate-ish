@@ -32,8 +32,33 @@ import (
 // env is the one ATE_* lookup every file in this package uses.
 func env(name, def string) string { return envutil.Get(name, def) }
 
+// cacheDir is the one directory runsc, exported image rootfses and
+// (via docker's own layer cache) built demo images live under, shared
+// by every node and every hack/smoke.sh run on this machine so a warm
+// run never re-fetches or re-exports anything it already has.
+// ATE_CACHE_DIR overrides it directly; otherwise XDG_CACHE_HOME/ate-ish,
+// or ~/.cache/ate-ish. Not ~/.local/state/ate-ish (stage A's old
+// default for the runsc release): that directory was left root-owned
+// by an earlier sudo'd run on this VM, so a plain exedev process can
+// stage nothing under it without sudo; moving the shared cache under
+// $HOME/.cache sidesteps that instead of fixing it.
+func cacheDir() string {
+	if dir := env("ATE_CACHE_DIR", ""); dir != "" {
+		return dir
+	}
+	base := env("XDG_CACHE_HOME", "")
+	if base == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			home = "/root"
+		}
+		base = filepath.Join(home, ".cache")
+	}
+	return filepath.Join(base, "ate-ish")
+}
+
 // runscReleaseDir is where runsc (and its gvisor-bin/ sidecars) are
-// staged: ATE_RUNSC_DIR overrides it directly, else a state directory.
+// staged: ATE_RUNSC_DIR overrides it directly, else cacheDir()/runsc.
 // The held namespace (sandbox.Open) shares this process's own mount
 // tree at the point it is created, so this one path is visible to every
 // runsc invocation inside it; no per-actor copy is needed any more (the
@@ -43,19 +68,17 @@ func runscReleaseDir() string {
 	if dir := env("ATE_RUNSC_DIR", ""); dir != "" {
 		return dir
 	}
-	return filepath.Join(runscStateDir(), "runsc")
+	return filepath.Join(cacheDir(), "runsc")
 }
 
-func runscStateDir() string {
-	base := env("XDG_STATE_HOME", "")
-	if base == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			home = "/root"
-		}
-		base = filepath.Join(home, ".local", "state")
+// rootfsCacheDir is where exported image rootfses are kept.
+// ATE_ROOTFS_DIR overrides it directly; otherwise cacheDir()/rootfs
+// (imageRootfsDir appends that "rootfs" segment itself).
+func rootfsCacheDir() string {
+	if dir := env("ATE_ROOTFS_DIR", ""); dir != "" {
+		return dir
 	}
-	return filepath.Join(base, "ate-ish")
+	return cacheDir()
 }
 
 // Worker is ate-ish acting as both atelet and worker-pool node: it holds
@@ -302,7 +325,7 @@ func (w *Worker) boot(ctx context.Context, h *hosted, rec records.Actor) error {
 		return err
 	}
 
-	lowerDir, err := imageRootfsDir(w.dir, tmpl.Containers[0].Image)
+	lowerDir, err := imageRootfsDir(rootfsCacheDir(), tmpl.Containers[0].Image)
 	if err != nil {
 		return fmt.Errorf("preparing %s's rootfs: %w", tmpl.Containers[0].Image, err)
 	}

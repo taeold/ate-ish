@@ -3,12 +3,30 @@
 # what each step returned and how long it took.
 #
 #   ATE_URL=http://localhost:8080 ./hack/gate.sh
+#
+# --fake points the same sequence at hack/fakeupstream instead of the
+# real ai-gateway.vercel.sh: the node must already be running with
+# ATE_EGRESS_RESOLVE/ATE_EGRESS_TEST_CA exported at its own startup
+# (this script only switches the egress policy's credentialUri from
+# Secret Manager to ate-secret://env/AI_GATEWAY_API_KEY, which it reads
+# from this process's own environment, same as fakeupstream's -api-key
+# must). hack/smoke.sh is the caller that sets all of this up.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+FAKE=0
+if [[ "${1:-}" == "--fake" ]]; then
+  FAKE=1
+  shift
+fi
+
 AS=${AS:-ate-demo-pi}
 TEMPLATE=${TEMPLATE:-demo/pi-durable/template-gateway.yaml}
-POLICY=${POLICY:-demo/pi-durable/egress-policy-gateway.yaml}
+if [[ "$FAKE" == 1 ]]; then
+  POLICY=${POLICY:-demo/pi-durable/egress-policy-gateway-fake.yaml}
+else
+  POLICY=${POLICY:-demo/pi-durable/egress-policy-gateway.yaml}
+fi
 : "${ATE_URL:?set ATE_URL}"
 export ATE_URL
 work=$(mktemp -d)

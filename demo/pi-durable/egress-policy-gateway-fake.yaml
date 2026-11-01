@@ -1,0 +1,8 @@
+rules:
+- https:
+    hostnames:
+    - "ai-gateway.vercel.sh"
+    effects:
+      replaceHeaders:
+      - header: x-api-key
+        credentialUri: ate-secret://env/AI_GATEWAY_API_KEY
